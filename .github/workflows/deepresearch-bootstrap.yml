@@ -29,6 +29,7 @@ jobs:
         run: |
           set -euo pipefail
           git apply /tmp/deepresearch.patch
+          rm -f .github/workflows/deepresearch.yml
           rm -rf .deepresearch-bootstrap
           rm -f .github/workflows/deepresearch-bootstrap.yml
           git config user.name "github-actions[bot]"
