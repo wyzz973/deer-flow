@@ -1,0 +1,54 @@
+name: DeepResearch full-stack checks
+on:
+  push:
+    branches: ["feat/deepresearch-v1-fullstack-20260914"]
+  pull_request:
+    paths: ["backend/deepresearch/**", "tests/deepresearch/**", "frontend/**deepresearch**", "frontend/src/**/deepresearch/**", "examples/deepresearch/**", "deepresearch.example.yaml", ".github/workflows/deepresearch.yml"]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r backend/deepresearch/requirements.txt
+      - run: python -c "import langgraph; from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver"
+      - run: PYTHONPATH=backend python -m pytest tests/deepresearch -v --junitxml=deepresearch-test-results/backend.xml
+      - run: python -m compileall -q backend/deepresearch
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: deepresearch-backend-results
+          path: deepresearch-test-results
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: corepack enable
+      - run: corepack prepare pnpm@10.26.2 --activate
+      - run: python -m pip install -r backend/deepresearch/requirements.txt
+      - run: pnpm install --frozen-lockfile
+        working-directory: frontend
+      - run: pnpm typecheck
+        working-directory: frontend
+      - run: pnpm exec playwright install --with-deps chromium
+        working-directory: frontend
+      - run: pnpm exec playwright test -c playwright.deepresearch.config.ts
+        working_directory: frontend
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: deepresearch-browser-results
+          path: |
+            frontend/playwright-deepresearch-report
+            frontend/test-results
