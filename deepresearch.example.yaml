@@ -1,0 +1,68 @@
+# Explicit synthetic demo. Never silently used when the real adapter fails.
+runner: demo
+data_dir: .deerflow/deepresearch
+skills:
+  deepresearch:
+    agent: research-planner
+    path: examples/deepresearch/skills/deepresearch/SKILL.md
+    description: 研究问题拆解与计划规范化
+  industry-trend:
+    agent: industry-researcher
+    path: examples/deepresearch/skills/industry-trend/SKILL.md
+    description: 行业现状、驱动因素与发展趋势
+  technical-route:
+    agent: technical-researcher
+    path: examples/deepresearch/skills/technical-route/SKILL.md
+    description: 技术路线、工程约束与取舍
+  report-synthesis:
+    agent: research-synthesizer
+    path: examples/deepresearch/skills/report-synthesis/SKILL.md
+    description: 基于证据池综合结构化报告
+sources:
+  - name: internal-kb
+    origin: internal
+    server: your-internal-mcp
+    tool: your-internal-mcp_search
+    level: L1
+    publisher: your-organization
+    priority: 10
+    results_path: results
+    fields:
+      title: title
+      url: url
+      source_uri: document_id
+      snippet: snippet
+      published_at: published_at
+  - name: external-web
+    origin: external
+    server: your-external-mcp
+    tool: your-external-mcp_search
+    level: L4
+    publisher: external-search-unclassified
+    priority: 20
+    results_path: results
+    fields:
+      title: title
+      url: url
+      snippet: snippet
+      published_at: published_at
+source_fallback: [internal-kb, external-web]
+max_concurrency: 3
+max_active_runs: 8
+tool_timeout_seconds: 45
+tool_retries: 1
+max_output_tokens: 4096
+require_dual_source: true
+allow_limited_report: false
+max_synthesis_repairs: 1
+budget_ceiling:
+  max_iterations: 2
+  max_units: 12
+  max_tool_calls: 60
+  max_elapsed_seconds: 900
+  max_model_tokens: 120000
+# Local testing only: values are ENV VARIABLE NAMES, never credentials.
+local_secret_env: {}
+# Production: an authenticated gateway can map dedicated headers into context.
+# Do NOT map the host's own Cookie header to an unrelated MCP service.
+request_secret_headers: {}

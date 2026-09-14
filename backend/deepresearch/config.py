@@ -1,0 +1,115 @@
+"""Configuration is local and opt-in; never modifies the host's tool registry."""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Literal
+
+import yaml
+from pydantic import Field, PrivateAttr, model_validator
+
+from .contracts import Contract, Identifier, Level, Origin, ResearchBudget
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+class SkillSpec(Contract):
+    agent: Identifier
+    path: str
+    description: str
+    model: str | None = None
+    system_prompt: str = ""
+    max_turns: int = Field(default=12, ge=1, le=60)
+    timeout_seconds: int = Field(default=180, ge=5, le=1800)
+
+
+class SourceSpec(Contract):
+    name: Identifier
+    origin: Origin
+    server: str
+    tool: str  # Exact exposed MCP tool name; no prefix guessing.
+    level: Level = "L4"
+    priority: int = 100
+    publisher: str
+    query_arg: str = "query"
+    fixed_args: dict = Field(default_factory=dict)
+    results_path: str = "results"  # dotted path in structuredContent/text JSON
+    fields: dict[str, str] = Field(default_factory=lambda: {
+        "title": "title", "url": "url", "snippet": "snippet",
+        "source_uri": "document_id", "published_at": "published_at",
+    })
+
+
+class Settings(Contract):
+    _skill_cache: dict[str, str] = PrivateAttr(default_factory=dict)
+    runner: Literal["demo", "deerflow"] = "demo"
+    runner_factory: str | None = None  # optional admin-controlled module:factory(settings, store)
+    data_dir: str = ".deerflow/deepresearch"
+    skills: dict[str, SkillSpec]
+    sources: list[SourceSpec] = Field(default_factory=list)
+    source_priority_file: str | None = None
+    source_fallback: list[str] = Field(default_factory=list)
+    max_concurrency: int = Field(default=3, ge=1, le=8)
+    max_active_runs: int = Field(default=8, ge=1, le=100)
+    tool_timeout_seconds: int = Field(default=45, ge=1, le=300)
+    tool_retries: int = Field(default=1, ge=0, le=3)
+    max_output_tokens: int = Field(default=4096, ge=128, le=32000)
+    allow_limited_report: bool = False
+    max_synthesis_repairs: int = Field(default=1, ge=0, le=3)
+    require_dual_source: bool = True
+    # Model trace callbacks are disabled for this module; its events never carry prompts/secrets.
+    budget_ceiling: ResearchBudget = Field(default_factory=ResearchBudget)
+    # Explicit, local-only fallback. These are ENVIRONMENT VARIABLE NAMES, not values.
+    local_secret_env: dict[str, str] = Field(default_factory=dict)
+    # Header -> secret context key; opt-in and never persisted or sent to the LLM.
+    request_secret_headers: dict[str, str] = Field(default_factory=dict)
+    # Optional async callable(request, run_dict) -> bool for live enterprise ACL checks.
+    access_policy: str | None = None
+
+    @model_validator(mode="after")
+    def valid_registry(self):
+        if "deepresearch" not in self.skills or "report-synthesis" not in self.skills:
+            raise ValueError("Registry needs deepresearch and report-synthesis skills")
+        names = [source.name for source in self.sources]
+        if len(names) != len(set(names)):
+            raise ValueError("Source names must be unique")
+        if self.runner == "deerflow" and {s.origin for s in self.sources} != {"internal", "external"}:
+            raise ValueError("DeerFlow mode needs explicit internal and external MCP bindings")
+        if not set(self.source_fallback).issubset(names):
+            raise ValueError("Unknown fallback source")
+        return self
+
+    def resolve(self, path: str) -> Path:
+        value = Path(path).expanduser()
+        return value.resolve() if value.is_absolute() else (ROOT / value).resolve()
+
+    def read_skill(self, name: str) -> str:
+        if name in self._skill_cache:
+            return self._skill_cache[name]
+        spec = self.skills.get(name)
+        if spec is None:
+            raise ValueError(f"Unknown skill: {name}")
+        path = self.resolve(spec.path)
+        text = path.read_text(encoding="utf-8")
+        if len(text) > 100000:
+            raise ValueError(f"Skill too large: {name}")
+        return text
+
+    def check_plan(self, plan, budget, request_sources=()):
+        if len(plan.research_units) > budget.max_units:
+            raise ValueError("Plan exceeds max_units")
+        allowed = {s.name for s in self.sources}
+        if not set(request_sources).issubset(allowed):
+            raise ValueError("Unknown requested source")
+        for unit in plan.research_units:
+            if unit.skill not in self.skills or unit.skill in {"deepresearch", "report-synthesis"}:
+                raise ValueError(f"Unsupported researcher skill: {unit.skill}")
+            if not set(unit.source_strategy.source_names).issubset(allowed):
+                raise ValueError("Plan selected an unknown source")
+            if self.require_dual_source and set(unit.source_strategy.required_origins) != {"internal", "external"}:
+                raise ValueError("This deployment requires both internal and external research")
+
+
+def load_settings(path: str | Path | None = None) -> Settings:
+    path = Path(path) if path else ROOT / "deepresearch.example.yaml"
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    return Settings.model_validate(raw)

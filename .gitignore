@@ -69,3 +69,10 @@ config.yaml.bak
 
 # Monocle agent-observability trace output (local file exporter)
 .monocle/
+
+# DeepResearch local runtime, credentials and test output
+/deepresearch.local.yaml
+/.venv-dr/
+/.deerflow/deepresearch/
+/frontend/playwright-deepresearch-report/
+/deepresearch-test-results/
