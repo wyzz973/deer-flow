@@ -1,0 +1,232 @@
++                raise ValueError("Unknown evidence id")
++            if eid not in mapping:
++                mapping[eid] = len(mapping) + 1
++    return mapping
++
++
++def plain(text):
++    return re.sub(r"([\\`*_{}\[\]()#+.!>|~-])", r"\\\1", text).replace("\n", " ")
++
++
++def citation_metadata(mapping, pool):
++    return [{"number": number, **pool[eid]} for eid, number in mapping.items()]
++
++
++def markdown(report, mapping, pool, limitations=(), demo=False):
++    def segment(s):
++        return plain(s.text) + "".join(f"[{mapping[e]}](#ref-{mapping[e]})" for e in dict.fromkeys(s.evidence_ids))
++    lines = ["# " + plain(report.title), ""]
++    if demo:
++        lines += ["> 演示模式：以下证据和结论为合成测试数据，不可用于业务决策。", ""]
++    if limitations:
++        lines += ["## 研究限制", "", *[plain(x) for x in limitations], ""]
++    lines += ["## 执行摘要", "", *[segment(s) + "\n" for s in report.executive_summary]]
++    for section in report.sections:
++        lines += ["## " + plain(section.heading), "", *[segment(s) + "\n" for s in section.segments]]
++    lines += ["## 结论", "", *[segment(s) + "\n" for s in report.conclusion], "## 参考资料", ""]
++    for ref in citation_metadata(mapping, pool):
++        target = ref.get("url") or ref["canonical_url"]
++        title = plain(ref["title"])
++        locator = f"[{title}](<{quote(target, safe=':/?=&%#@+;,~-._')}>)" if target else title + " — " + plain(ref["source_uri"] or "")
++        lines += [f'<a id="ref-{ref["number"]}"></a>', f'{ref["number"]}. {locator} · {ref["origin"]} · {ref["source_level"]}', ""]
++    return "\n".join(lines)
++
++
++def html_report(report, mapping, pool, limitations=(), demo=False):
++    esc = html.escape
++    def segment(s):
++        return "<p>" + esc(s.text) + "".join(f'<a href="#ref-{mapping[e]}">[{mapping[e]}]</a>' for e in dict.fromkeys(s.evidence_ids)) + "</p>"
++    parts = ['<!doctype html><html lang="zh"><meta charset="utf-8"><title>' + esc(report.title) + '</title><body><article>', '<h1>' + esc(report.title) + '</h1>']
++    if demo:
++        parts += ['<aside>演示模式：合成测试数据，不可用于业务决策。</aside>']
++    parts += ['<aside>' + esc(x) + '</aside>' for x in limitations]
++    parts += ['<h2>执行摘要</h2>', *map(segment, report.executive_summary)]
++    for section in report.sections:
++        parts += ['<h2>' + esc(section.heading) + '</h2>', *map(segment, section.segments)]
++    parts += ['<h2>结论</h2>', *map(segment, report.conclusion), '<h2>参考资料</h2><ol>']
++    for ref in citation_metadata(mapping, pool):
++        label = esc(ref['title'])
++        target = ref.get('url') or ref['canonical_url']
++        if target:
++            label = '<a rel="noreferrer noopener" href="' + esc(target, quote=True) + '">' + label + '</a>'
++        else:
++            label += ' — ' + esc(ref['source_uri'] or '')
++        parts += [f'<li id="ref-{ref["number"]}">{label}</li>']
++    return ''.join(parts) + '</ol></article></body></html>'
++
++
++def docx_report(value):
++    """Export the same verified AST; no Markdown reparsing or model formatting."""
++    from io import BytesIO
++    from docx import Document
++    from docx.shared import Pt
++    from docx.oxml.ns import qn
++    report = StructuredReport.model_validate(value["report"])
++    doc = Document()
++    normal = doc.styles["Normal"]
++    normal.font.name = "Calibri"
++    normal.font.size = Pt(11)
++    normal.paragraph_format.space_after = Pt(8)
++    normal.paragraph_format.line_spacing = 1.15
++    normal.element.get_or_add_rPr().rFonts.set(qn("w:eastAsia"), "Microsoft YaHei")
++    doc.add_heading(report.title, 0)
++    if value["demo"]:
++        doc.add_paragraph("演示模式：合成测试数据，不可用于业务决策。")
++    if value["limitations"]:
++        doc.add_heading("研究限制", 1)
++        for text in value["limitations"]:
++            doc.add_paragraph(text)
++    mapping = value["citation_map"]
++    def segments(items):
++        for item in items:
++            doc.add_paragraph(item.text + "".join(f"[{mapping[e]}]" for e in dict.fromkeys(item.evidence_ids)))
++    doc.add_heading("执行摘要", 1)
++    segments(report.executive_summary)
++    for section in report.sections:
++        doc.add_heading(section.heading, 1)
++        segments(section.segments)
++    doc.add_heading("结论", 1)
++    segments(report.conclusion)
++    doc.add_heading("参考资料", 1)
++    for ref in value["citations"]:
++        doc.add_paragraph(f'[{ref["number"]}] {ref["title"]}\n{ref.get("url") or ref["canonical_url"] or ref["source_uri"]}')
++    # Stable core metadata avoids exposing local usernames.
++    doc.core_properties.author = "DeepResearch"
++    doc.core_properties.title = report.title
++    out = BytesIO()
++    doc.save(out)
++    return out.getvalue()
+diff --git a/backend/deepresearch/requirements.txt b/backend/deepresearch/requirements.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..70ee6628ca978a4deb42b1df062d2000445c0a75
+--- /dev/null
++++ b/backend/deepresearch/requirements.txt
+@@ -0,0 +1,12 @@
++# Isolated demo/tests. Real mode uses the repository's `uv sync` harness workspace.
++fastapi>=0.115,<1
++uvicorn>=0.34,<1
++pydantic>=2.10,<3
++PyYAML>=6,<7
++langgraph>=1.2.9,<1.3
++langgraph-checkpoint-sqlite>=3.1.1,<3.2
++langsmith>=0.4,<1
++python-docx>=1.1,<2
++httpx>=0.28,<1
++pytest>=8,<10
++pytest-asyncio>=0.24,<2
+diff --git a/backend/deepresearch/runner.py b/backend/deepresearch/runner.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..edd8f5ab53492d1f4330f085e0e8c725ef78d0ec
+--- /dev/null
++++ b/backend/deepresearch/runner.py
+@@ -0,0 +1,272 @@
++"""Agent execution adapters. Demo is explicit; real failures never use demo data."""
++from __future__ import annotations
++
++import asyncio
++import json
++from contextlib import asynccontextmanager
++from typing import Protocol
++
++from pydantic import Field
++
++from .contracts import (Contract, Finding, RawEvidence, ResearchError, ResearchPlan,
++                        ResearchResult, ResearchUnit, StructuredReport)
++from .evidence import digest, normalize_mcp, ordered_sources
++
++
++class ResearchAnalysis(Contract):
++    findings: list[Finding] = Field(default_factory=list)
++    open_questions: list[str] = Field(default_factory=list)
++    confidence: float = Field(ge=0, le=1)
++
++
++class AgentRunner(Protocol):
++    async def plan(self, run, proposed=None) -> ResearchPlan: ...
++    async def research(self, run, unit, dependencies) -> ResearchResult: ...
++    async def synthesize(self, run, plan, findings, pool, errors=()) -> StructuredReport: ...
++
++
++class DemoRunner:
++    """Synthetic, deterministic integration fixture, not a search implementation."""
++    def __init__(self, settings, store):
++        self.settings, self.store = settings, store
++
++    async def plan(self, run, proposed=None):
++        if proposed:
++            return ResearchPlan.model_validate(proposed)
++        names = [name for name in self.settings.skills if name not in {"deepresearch", "report-synthesis"}]
++        return ResearchPlan(goal=run["query"], constraints=run["constraints"], research_units=[
++            ResearchUnit(id=f"R{i+1}", skill=name, objective=f'{run["query"]}：{self.settings.skills[name].description}')
++            for i, name in enumerate(names[:min(2, run["budget"]["max_units"])])])
++
++    async def research(self, run, unit, dependencies):
++        evidences = []
++        for origin in ("internal", "external"):
++            await self.store.reserve(run["run_id"], tool_calls=1)
++            evidences.append(RawEvidence(
++                raw_id=f'{unit.id}-{origin}', title=f'演示来源：{unit.skill} / {origin}',
++                url=f'https://example.invalid/demo/{unit.skill}' if origin == "external" else None,
++                source_uri=f'demo://internal/{unit.skill}' if origin == "internal" else None,
++                origin=origin, source_name=f'demo-{origin}', source_level="L2", publisher=f'demo-{origin}',
++                snippet=f'合成测试证据，仅用于验证 {unit.objective} 的流程和引用，不代表真实研究结论。'))
++        return ResearchResult(unit_id=unit.id, raw_evidences=evidences, confidence=0.5,
++            findings=[Finding(claim=f'演示发现：{unit.objective}。该内容只用于功能测试。',
++                              raw_evidence_refs=[e.raw_id for e in evidences], confidence=0.5)],
++            searched_origins=["internal", "external"])
++
++    async def synthesize(self, run, plan, findings, pool, errors=()):
++        def seg(f):
++            return {"text": f["claim"], "evidence_ids": f["evidence_ids"], "segment_type": "fact"}
++        first = next(iter(findings), None)
++        sections = []
++        for unit in plan.research_units:
++            selected = [f for f in findings if f["unit_id"] == unit.id]
++            sections.append({"heading": self.settings.skills[unit.skill].description, "unit_ids": [unit.id],
++                "segments": [seg(f) for f in selected] or [{"text": "该维度暂无有效证据。", "evidence_ids": [], "segment_type": "analysis"}]})
++        return StructuredReport.model_validate({"title": "演示研究报告：" + run["query"][:180],
++            "executive_summary": [seg(first)] if first else [{"text": "暂无有效证据。", "evidence_ids": [], "segment_type": "analysis"}],
++            "sections": sections, "conclusion": [{"text": "请切换真实 DeerFlow/MCP 适配器后再开展业务研究。", "evidence_ids": [], "segment_type": "recommendation"}]})
++
++
++class DeerFlowRunner:
++    """Uses this fork's Custom Agent config, SDK factory and MCP interceptors.
++
++    All credentials travel on Runtime.context only. SDK children are ephemeral;
++    only sanitized structured results enter the parent checkpoint/store.
++    """
++    def __init__(self, settings, store):
++        self.settings, self.store = settings, store
++
++    async def _agent_config(self, skill_name):
++        from deerflow.subagents.registry import get_subagent_config
++        spec = self.settings.skills[skill_name]
++        agent = await asyncio.to_thread(get_subagent_config, spec.agent)
++        if agent is None:
++            raise ResearchError("AGENT_NOT_CONFIGURED", f"未配置 Custom Agent: {spec.agent}", recoverable=False)
++        if agent.skills is not None and skill_name not in agent.skills:
++            raise ResearchError("SKILL_DENIED", f"Agent 未授权 Skill: {skill_name}", recoverable=False)
++        return spec, agent
++
++    async def _json(self, run, skill_name, payload, schema, tools=None, agent=None):
++        from deerflow.agents import create_deerflow_agent
++        from deerflow.models import create_chat_model
++        from langchain.agents.middleware import AgentMiddleware
++        from langgraph.runtime import get_runtime
++        from langsmith import tracing_context
++
++        spec, configured = await self._agent_config(skill_name)
++        agent = agent or configured
++        skill = await asyncio.to_thread(self.settings.read_skill, skill_name)
++        model_name = spec.model or (agent.model if agent.model != "inherit" else None)
++        model = await asyncio.to_thread(create_chat_model, name=model_name, attach_tracing=False,
++                                       model_overrides={"max_tokens": self.settings.max_output_tokens})
++        store, settings = self.store, self.settings
++
++        class Meter(AgentMiddleware):
++            async def awrap_model_call(self, request, handler):
++                # Conservative admission reservation, not a claim of exact billing.
++                data = [getattr(m, "content", "") for m in request.messages]
++                data += [getattr(request.system_message, "content", "")]
++                size = len(json.dumps(data, ensure_ascii=False).encode("utf-8"))
++                size += sum(len(json.dumps(t.args).encode("utf-8")) for t in (tools or []))

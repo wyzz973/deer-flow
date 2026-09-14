@@ -1,0 +1,172 @@
++name: industry-trend
++description: 不限定行业的现状、驱动、趋势和反证研究方法。
++---
++# Industry Trend
++只回答分派 objective。先定义对象和时间尺度，区分已发生的变化、公开规划与预测。
++结合内部证据识别真实需求、存量约束和适用性；结合外部证据识别技术、市场、供需、组织和竞争驱动。两路互补，不互相替代。
++按 source strategy 的优先级检索，不把搜索服务自身误判为资料发布者。量化数据保留统计口径、年份、适用范围，缺失则说明。
++寻找主趋势、分歧和反例。对每个趋势说明支持证据、反证、成立条件、潜在影响和不确定性。不得用转载数量代替独立来源数量。
++只返回 findings、raw_evidence_refs、open_questions、confidence。raw_id 必须来自工具。不得造 URL、发布日期、Evidence ID 或引用编号；不写最终报告。
+diff --git a/examples/deepresearch/skills/product-benchmark/SKILL.md b/examples/deepresearch/skills/product-benchmark/SKILL.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..6e1df198f52537b1d1dcc092ad379965cdb4221b
+--- /dev/null
++++ b/examples/deepresearch/skills/product-benchmark/SKILL.md
+@@ -0,0 +1,8 @@
++---
++name: product-benchmark
++description: 产品能力、适用场景与落地约束的证据驱动比较示例。
++---
++# Product Benchmark (extension example; not registered by default)
++围绕 objective 选择可比较的产品与共同口径。分清已发布能力、测试版本、路线图和营销主张。
++用内部资料建立需求和约束，用外部一手资料验证产品能力、限制及适用场景。版本、日期、部署形态和定价口径缺失时写为缺口。
++输出按需求维度组织的 findings，每条绑定工具返回的 raw_id。建议要说明条件和不确定性。遵循运行时 ResearchAnalysis 契约，不造来源或最终引用。
+diff --git a/examples/deepresearch/skills/report-synthesis/SKILL.md b/examples/deepresearch/skills/report-synthesis/SKILL.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..eb69befa6baf925c00fd0a1631c2d019c09962c4
+--- /dev/null
++++ b/examples/deepresearch/skills/report-synthesis/SKILL.md
+@@ -0,0 +1,11 @@
++---
++name: report-synthesis
++description: 只基于 Findings 与 Evidence Pool 生成可确定性渲染的报告 AST。
++---
++# Report Synthesis
++先列研究目标覆盖情况，再组织执行摘要、正文各章节和结论，合并重复观点但保留冲突、适用范围和研究限制。
++严格输出 StructuredReport。sections.unit_ids 覆盖原始 ResearchPlan 中每个单元；不得用补研单元 ID 替代原始目标。
++以独立事实或紧密相关事实为 Segment。事实用 fact 且必须有支持它的 evidence_ids；分析用 analysis；建议用 recommendation。分析与建议涉及可检验事实时也应绑定证据。
++证据只有弱相关、摘要不足、日期不明或相互冲突时，明确表达不确定性，不把其包装为已证实结论。
++不搜索、不调用 MCP、不引入 Evidence Pool 之外的新来源。不要输出 Markdown、HTML、URL 或 [1] 引用编号；引用绑定由代码执行。
++收到 validation_errors_to_fix 时仅修正相应局部问题，保留其他正确内容。
+diff --git a/examples/deepresearch/skills/technical-route/SKILL.md b/examples/deepresearch/skills/technical-route/SKILL.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..81de79d243fab62c91e9aaa373cad2b112f70838
+--- /dev/null
++++ b/examples/deepresearch/skills/technical-route/SKILL.md
+@@ -0,0 +1,10 @@
++---
++name: technical-route
++description: 不限定技术领域的方案原理、边界和工程取舍研究方法。
++---
++# Technical Route
++将 objective 转成可以比较的技术问题，识别负载、数据量、延迟、一致性、安全、部署和成本约束；用户未提供的参数明确列为未知，不编造现状。
++比较候选路线的机制、关键组件、工程复杂度、可扩展边界、失效模式、成熟度和迁移代价。区分理论上限、基准测量和真实部署数据。
++内部资料用于约束与落地适配，外部一手资料用于机制和公开实践，两路都需要有效证据。
++相同术语或指标仅在口径一致时比较。容量上限、性能倍数、成本节省属于高风险量化结论，应标记 high_risk 并寻找两个独立发布方交叉核验；没有就留为缺口。
++补研任务只处理列出的缺口，不重跑全部问题。返回运行时 JSON 契约，引用工具给出的 raw_id，不直接编写最终报告。
+diff --git a/frontend/playwright.deepresearch.config.ts b/frontend/playwright.deepresearch.config.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..415724d095c73a9e28bef5ede0cdf48459b22469
+--- /dev/null
++++ b/frontend/playwright.deepresearch.config.ts
+@@ -0,0 +1,12 @@
++import { defineConfig } from "@playwright/test";
++
++export default defineConfig({
++  testDir: "./tests/deepresearch",
++  timeout: 60_000,
++  use: { baseURL: "http://127.0.0.1:3000", trace: "retain-on-failure" },
++  reporter: [["list"], ["html", { outputFolder: "playwright-deepresearch-report", open: "never" }]],
++  webServer: [
++    { command: "python -m uvicorn deepresearch.demo:app --app-dir ../backend --host 127.0.0.1 --port 8022", url: "http://127.0.0.1:8022/docs", timeout: 60_000, reuseExistingServer: false },
++    { command: "pnpm exec next dev --hostname 127.0.0.1 --port 3000", url: "http://127.0.0.1:3000/deepresearch-demo", timeout: 180_000, reuseExistingServer: false, env: { SKIP_ENV_VALIDATION: "1" } },
++  ],
++});
+diff --git a/frontend/src/app/deepresearch-demo/page.tsx b/frontend/src/app/deepresearch-demo/page.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..a3d5f9d26ea9f830ebc21e774bcfc6f727cf6ad2
+--- /dev/null
++++ b/frontend/src/app/deepresearch-demo/page.tsx
+@@ -0,0 +1,6 @@
++import { ResearchWorkbench } from "@/components/deepresearch/workbench";
++
++// Independent of workspace authentication; backend explicitly accepts only loopback demo traffic.
++export default function DeepResearchDemoPage() {
++  return <ResearchWorkbench apiBase="http://127.0.0.1:8022" />;
++}
+diff --git a/frontend/src/app/workspace/deepresearch/page.tsx b/frontend/src/app/workspace/deepresearch/page.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..8f17f138154e07a17ea00b0f3b1e170f130e238a
+--- /dev/null
++++ b/frontend/src/app/workspace/deepresearch/page.tsx
+@@ -0,0 +1,5 @@
++import { ResearchWorkbench } from "@/components/deepresearch/workbench";
++
++export default function DeepResearchPage() {
++  return <ResearchWorkbench />;
++}
+diff --git a/frontend/src/components/deepresearch/workbench.tsx b/frontend/src/components/deepresearch/workbench.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..6d36052bfe7ace8ba3f02a4dccd4a412a50c5636
+--- /dev/null
++++ b/frontend/src/components/deepresearch/workbench.tsx
+@@ -0,0 +1,190 @@
++"use client";
++
++import { useCallback, useEffect, useMemo, useRef, useState } from "react";
++import { ArrowRight, Check, Download, FlaskConical, Loader2, Plus, RefreshCw, Square, Trash2, X } from "lucide-react";
++import { researchApi } from "@/core/deepresearch/api";
++import { mergeEvents, terminal, type Budget, type Capabilities, type Evidence, type Plan, type ResearchEvent, type Run, type Segment, type Unit } from "@/core/deepresearch/types";
++
++const input = "w-full rounded-xl border border-black/10 bg-transparent px-3 py-2 text-sm outline-none focus:border-black/40 dark:border-white/15 dark:focus:border-white/40";
++const button = "inline-flex items-center justify-center gap-2 rounded-xl border border-black/10 px-3 py-2 text-sm transition hover:bg-black/5 disabled:cursor-not-allowed disabled:opacity-40 dark:border-white/15 dark:hover:bg-white/10";
++const primary = `${button} bg-neutral-900 text-white hover:bg-neutral-700 dark:bg-neutral-100 dark:text-neutral-900 dark:hover:bg-white`;
++const labels: Record<string, string> = { CREATED: "已创建", PLANNING: "正在规划", AWAITING_PLAN_CONFIRMATION: "等待你确认计划", RESEARCHING: "正在研究", VALIDATING: "检查研究覆盖", GAP_FOUND: "发现待补充证据", RESEARCH_COMPLETE: "研究资料就绪", SYNTHESIZING: "综合研究结论", CITATION_BINDING: "绑定引用", FINAL_VALIDATING: "校验报告", RENDERING: "生成报告", COMPLETED: "已完成", FAILED: "执行失败", CANCELLED: "已取消" };
++const eventLabels: Record<string, string> = { "run.created": "研究已创建", "plan.created": "计划已生成", "plan.updated": "计划已更新", "plan.waiting_confirmation": "等待确认", "research.source_policy": "已应用来源优先级", "research.unit.started": "开始研究单元", "research.unit.completed": "研究单元完成", "research.tool.started": "正在检索", "research.tool.completed": "检索已完成", "evidence.pool.updated": "证据池已更新", "validator.gap_found": "发现证据缺口", "validator.passed": "研究校验通过", "report.synthesizing": "正在综合报告", "citation.bound": "引用已绑定", "report.completed": "报告已完成", "run.failed": "执行失败", "run.cancelled": "已取消" };
++
++export function ResearchWorkbench({ apiBase = "" }: { apiBase?: string }) {
++  const api = useMemo(() => researchApi(apiBase), [apiBase]);
++  const [cap, setCap] = useState<Capabilities | null>(null);
++  const [history, setHistory] = useState<Run[]>([]);
++  const [runId, setRunId] = useState<string | null>(null);
++  const [run, setRun] = useState<Run | null>(null);
++  const [plan, setPlan] = useState<Plan | null>(null);
++  const [query, setQuery] = useState("");
++  const [constraints, setConstraints] = useState("");
++  const [budget, setBudget] = useState<Budget | null>(null);
++  const [sourceNames, setSourceNames] = useState<string[]>([]);
++  const [events, setEvents] = useState<ResearchEvent[]>([]);
++  const [selected, setSelected] = useState<Evidence | null>(null);
++  const [error, setError] = useState("");
++  const [busy, setBusy] = useState(false);
++  const [connection, setConnection] = useState("");
++  const [streamEpoch, setStreamEpoch] = useState(0);
++  const planKey = useRef("");
++  const selectedId = useRef(runId); selectedId.current = runId;
++  const creationKey = useRef<{ body: string; key: string } | null>(null);
++  const loadHistory = useCallback(async () => setHistory(await api.list()), [api]);
++
++  useEffect(() => {
++    let alive = true;
++    void Promise.all([api.capabilities(), api.list()]).then(([c, h]) => {
++      if (!alive) return;
++      setCap(c); setBudget(c.budget_ceiling); setHistory(h);
++      const saved = new URLSearchParams(window.location.search).get("run");
++      if (saved) setRunId(saved);
++    }).catch((e: unknown) => { if (alive) setError(String(e)); });
++    return () => { alive = false; };
++  }, [api]);
++
++  useEffect(() => {
++    if (!runId) return;
++    let alive = true;
++    let timer: ReturnType<typeof setTimeout> | undefined;
++    let source: EventSource | undefined;
++    setEvents([]); setSelected(null); setConnection("连接中");
++    const refresh = async () => {
++      const value = await api.get(runId);
++      if (alive) setRun(value);
++      return value;
++    };
++    void refresh().then(() => {
++      if (!alive) return;
++
++      source = new EventSource(`${api.root}/${encodeURIComponent(runId)}/events`, { withCredentials: true });
++      source.onopen = () => { if (alive) setConnection("实时连接"); };
++      source.onmessage = (event: MessageEvent<string>) => {
++        if (!alive) return;
++        let item: ResearchEvent;
++        try { item = JSON.parse(event.data) as ResearchEvent; } catch { return; }
++        if (item.run_id !== runId) return;
++        setEvents((old) => mergeEvents(old, item));
++        if (timer) clearTimeout(timer);

@@ -1,0 +1,37 @@
+name: Bootstrap DeepResearch payload
+
+on:
+  push:
+    branches: ["feat/deepresearch-v1-fullstack-20260914"]
+    paths:
+      - ".deepresearch-bootstrap/**"
+
+permissions:
+  contents: write
+
+jobs:
+  apply-payload:
+    if: startsWith(github.event.head_commit.message, 'chore: bootstrap deepresearch payload')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Reconstruct and verify patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .deepresearch-bootstrap/part-* > /tmp/deepresearch.patch
+          echo "f07cd4e264f3668b410e719d5a44e5b44d6d662148b5acb67060af217ef6a325  /tmp/deepresearch.patch" | sha256sum -c -
+          git apply --check /tmp/deepresearch.patch
+      - name: Apply implementation and commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply /tmp/deepresearch.patch
+          rm -rf .deepresearch-bootstrap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat(deepresearch): implement v1 full-stack workflow"
+          git push origin "HEAD:${GITHUB_REF_NAME}"

@@ -1,0 +1,185 @@
++      semantic_critic.py
++    api/
++      routes.py
++      stream.py
++    evals/
++      cases.json
++      judge.py
++      metrics.py
++
++skills/custom/
++  deepresearch/SKILL.md
++  deepresearch-suite/
++    industry-trend/SKILL.md
++    technical-route/SKILL.md
++    report-synthesis/SKILL.md
++
++agents/
++  planner/config.yaml
++  industry-researcher/config.yaml
++  technical-researcher/config.yaml
++  research-synthesizer/config.yaml
++```
++
++## 23. 分阶段实施
++
++### Phase 0：基线确认
++先完成现有 `/deepresearch` E2E，确认 internal/external 双源、MCP 白名单、认证透传、2 个 SubAgent Output Contract 正常；保存一批 baseline 报告。
++
++### Phase 1：稳定“数据流”，暂不迁 Graph
++定义 4 个核心 Contract；SubAgent 改为返回 ResearchResult；新增 Evidence Manager/Pool；新增 Synthesizer + StructuredReport；Citation Binder/Renderer 代码化。此阶段仍可由现有 DeerFlow Lead 触发。
++
++### Phase 2：稳定“控制流”
++引入 LangGraph：Planner -> Plan Review -> Dispatch -> Validate -> Gap Loop -> Synthesis；接 checkpointer，实现 interrupt/resume、节点级重试和状态事件流。
++
++### Phase 3：生产增强
++增加多 Skill、动态复杂度预算、异步批任务、对象存储、审计、Eval CI、灰度/版本化 Prompt 与 Skill。
++
++## 24. 验收标准（建议）
++
++机制类（硬门禁）：
++- ResearchPlan/ResearchResult/Evidence/StructuredReport Schema parse 成功率 100%；
++- 无不存在的 citation id；同一 Evidence 编号全文一致；URL 不被模型重写；
++- 适用任务 internal + external 双源覆盖率 100%；
++- Planner 能停在确认态并在 edit/approve 后用同一 run/thread 恢复；
++- 单个 SubAgent/MCP 失败可从 checkpoint 局部恢复；
++- Renderer 输出固定格式，重复输入得到相同引用编号和结构。
++
++质量类（初始目标，需用 baseline 校准）：Citation Accuracy ≥ 0.90、关键 Claim Citation Coverage ≥ 0.95、用户要求维度 Coverage ≥ 0.90、L1/L2 高质量来源占比达到当前业务定义阈值。
++
++## 25. 关键设计决策（ADR 摘要）
++
++1. **不把每个节点做成 Agent**：只有需要独立模型上下文、工具或 Skill 边界的节点才建 Agent。
++2. **Evidence ID 后端唯一生成**：SubAgent 不拥有最终编号权。
++3. **Synthesizer 不直接生成最终 Markdown**：先生成结构化 AST，再由 Renderer 输出。
++4. **Citation 以 Segment/Claim 为最小绑定粒度**：支持句中/段中引用和前端来源卡片。
++5. **LangGraph 后置迁移**：先稳定 Contract/Data Flow，再迁移 Control Flow。
++6. **专业 Skill 保留并扩展**：当前 industry/technical 不动，未来产品基准/客户案例/落地规划可新增 Skill，而不是扩大一个超级 Prompt。
++
++## 26. 风险与待决问题
++
++- Planner 是否独立 Custom Agent，还是复用 DeerFlow Lead 的模型实例；建议逻辑角色独立，物理模型可复用。
++- Citation 的“证据选择”由 Synthesizer 一次完成还是再加 Citation Critic；V1 由 Synthesizer 输出 evidence_ids + 规则 Binder，质量不足再增加 Critic。
++- Evidence 原文存储的版权、大小和内部 ACL 方案；建议对象存储引用而非数据库全量复制。
++- 当前两个 Skill 的 Output Contract 与新 ResearchResult 的字段如何映射；优先做 adapter，避免一次改动太大。
++- LangGraph 与 DeerFlow 已有 runtime/checkpointer 的边界需以你们 fork 的实际包结构落地，避免重复持久化。
++
++## 27. 完整运行示例（CodeHub）
++
++用户：研究 CodeHub 海量代码仓库存储与检索未来趋势。
++
++1. Planner 生成 R1 行业趋势、R2 存储技术路线、R3 语义检索三个 ResearchUnit；状态进入 `AWAITING_PLAN_CONFIRMATION`。
++2. 用户新增“GitHub/GitLab 工程实践单列”，Planner 更新计划并确认。
++3. Dispatch 并行调用 Industry Researcher 与 Technical Researcher；两者分别通过 internal/external MCP 检索。
++4. SubAgent 返回 Findings + Raw Evidence；Evidence Manager 形成 E001-E026。
++5. Validator 发现“容量上限”缺少量化证据，产生 G1 并创建 R4，仅研究公开规模/容量/分片上限。
++6. R4 新增 E027-E030，Validator PASS。
++7. Synthesizer 输出章节和 Segment，每个 Segment 绑定 Evidence ID。
++8. Citation Binder 按首次出现顺序映射 E003->[1]、E008->[2]；Renderer 得到句子级引用。
++9. Final Validator 检查无孤立引用、无未引用关键事实、章节覆盖满足计划；输出 Final Report。
++
++## 28. 参考资料
++
++1. DeerFlow 2.0 README / Documentation - Harness、Skills、Sub-agents、LangGraph runtime。https://github.com/bytedance/deer-flow
++2. DeerFlow config.example.yaml - Custom Agent 的 system_prompt、tools、skills、model、max_turns/timeout。https://github.com/bytedance/deer-flow/blob/main/config.example.yaml
++3. DeerFlow Customization - 自定义 Skill 与 LangGraph-compatible checkpointer。https://github.com/bytedance/deer-flow/blob/main/frontend/src/content/zh/harness/customization.mdx
++4. Anthropic, “How we built our multi-agent research system”, 2025-06-13。https://www.anthropic.com/engineering/multi-agent-research-system
++5. OpenAI, “Deep research in ChatGPT” - proposed plan review/edit、interrupt、structured report with citations。https://help.openai.com/en/articles/10500283-deep-research
++6. Google AI, “Gemini Deep Research agent” - collaborative planning、MCP/File Search/tool restrictions。https://ai.google.dev/gemini-api/docs/deep-research
++7. LangGraph, Interrupts / Persistence / Human-in-the-loop。https://docs.langchain.com/oss/python/langgraph/interrupts
++8. LangChain Open Deep Research - supervisor、ConductResearch、ResearchComplete、研究迭代/并发限制。https://github.com/langchain-ai/open_deep_research
++9. GPT Researcher Multi-Agent System - Chief Editor/Researcher/Reviewer/Reviser/Writer/Publisher。https://github.com/assafelovic/gpt-researcher
++10. DeepResearch Bench - RACE/FACT 深度研究质量与引用评估。https://deepresearch-bench.github.io/
+diff --git a/docs/deepresearch/EXTENDING.md b/docs/deepresearch/EXTENDING.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..045e0806d1611bae83f4b5ef270beaca60edd5da
+--- /dev/null
++++ b/docs/deepresearch/EXTENDING.md
+@@ -0,0 +1,100 @@
++# 本地 Skill、Agent 与 MCP 扩展
++
++## 一、优先沿用已有方法论
++
++你原有的行业趋势和技术路线 Skill 不需要改名。将 `deepresearch.local.yaml` 的 `skills.<id>.path` 指向其实际文件；`agent` 对应原 `subagents.custom_agents` 的 key。方法论可以变，**运行时契约不可变**。
++
++新适配器通过 DeerFlow SDK 创建独立执行图，读取现有 Custom Agent 的 system_prompt/model/tools/skills/max_turns/timeout，再注入 registry 指定的 Skill 文本。它不是让 Lead 再调用 `task()` 二次选择角色，也不使用宿主的 Skill 自动发现来改变本次路由。
++
++Skill 当前以方法论文本加载；不自动执行目录中的 scripts，也不会默默授权 Bash、任意网络请求或嵌套 Agent。普通 DeerFlow 聊天和工具链不受影响。需要原生沙箱/文件/脚本能力时，通过下文 AgentRunner 接口接入宿主执行器，保留你的既有中间件和工具策略，不直接把工具函数裸挂到模型。
++
++## 二、给现有子 Skill 的最小调整指令
++
++> 保留原研究方法论与领域知识，删除固定行业、固定网站、固定章节和最终 Markdown/数字引用要求。任务目标、可用来源及预算由运行时注入。每条发现用 claim/raw_evidence_refs/confidence/high_risk；raw_evidence_refs 必须是工具实际返回的 raw_id。证据不足列入 open_questions，不编造来源。内部、外部检索互补，补研只处理指定缺口。研究 Agent 不负责报告综合、全局 Evidence ID 或最终引用编号。
++
++现有子 Skill 若坚持输出旧字段，应在自定义 runner 中做显式 adapter，而不是在任意 JSON 中“猜测”字段。公共 ResearchResult 是后端验证的边界。真实 runner 内部让模型输出 ResearchAnalysis（findings/open_questions/confidence），RawEvidence 元数据由 MCP 结果注入，禁止模型自行重写。
++
++## 三、新增一个产品对标 Skill
++
++参考 `examples/deepresearch/skills/product-benchmark/SKILL.md`。把它复制到你维护的方法论目录，在配置中新增：
++
++```yaml
++skills:
++  product-benchmark:
++    agent: product-researcher
++    path: skills/custom/product-benchmark/SKILL.md
++    description: 产品能力、场景与落地约束对标
++    max_turns: 12
++    timeout_seconds: 180
++```
++
++同时合并新的 Custom Agent：
++
++```yaml
++subagents:
++  custom_agents:
++    product-researcher:
++      description: Research product capabilities against user requirements.
++      system_prompt: Work only on the assigned objective and return the runtime JSON contract.
++      skills: [product-benchmark]
++      tools: [your-internal-mcp_search, your-external-mcp_search]
++      model: inherit
++      max_turns: 12
++      timeout_seconds: 180
++```
++
++Skill ID 是配置项而不是硬编码 Enum。Planner 的 available_skills 和前端选择器自动更新。禁止用户在 HTTP 请求中提交任意磁盘路径、Python 类或新工具名。
++
++如果 Skill frontmatter 声明 `allowed-tools`，它会进一步收紧搜索工具权限：与 Custom Agent tools、disallowed_tools、研究 sources 取交集。请使用**真实暴露工具名**，而不是内部 wrapper 的 `research_<source>` 名。空列表表示没有检索权限，会明确失败，不会绕过白名单。
++
++## 四、适配自己的 MCP 返回值
++
++默认要求结构化 JSON，例如：
++
++```json
++{"results":[{"title":"某文档","url":"https://docs.example.org/a","document_id":"internal-123","snippet":"可引用的内容摘录","published_at":"2026-08-01T00:00:00Z"}]}
++```
++
++支持 MCP structuredContent 或 content 中的 JSON 文本。内部无公开 URL 时须有 document_id/source_uri；外部必须有合法 HTTP(S) URL。空标题、空摘录、无法定位或非法 URL 的命中不会进入证据池；不会把无结构自然语言强行当证据。
++
++假设返回值为 `data.items`，每项字段为 `name/link/summary/id/date`，只改配置：
++
++```yaml
++results_path: data.items
++fields:
++  title: name
++  url: link
++  snippet: summary
++  source_uri: id
++  published_at: date
++```
++
++`fixed_args` 存放固定业务过滤参数；`query_arg` 是查询参数名。只能放非敏感业务参数。需要 query 以外的复杂、动态入参，扩展 `make_search` 或自定义 runner；不要把认证字段放进模型工具 schema。
++
++來源优先级：单元/请求注入的 source_names > source_priority_file 的 YAML 名称列表 > source_fallback。它们控制优先级，不把另一 origin 删除。每个必需 origin 的第一优先来源由代码并行调用；其他白名单来源可由 Agent 为缺口追加检索。
++
++来源等级和发布方当前来自管理员的逻辑 source 配置，不是模型自报。对覆盖全网的搜索服务，默认统一 L4 和保守发布方分组，**不能把搜索服务名视为已核实的独立原始发布者**。需要精细来源质量时，把站点过滤配置为多个逻辑 source，或在可信适配器中基于受校验的域名规则分类；内部转载与外部原文也不能冒充独立交叉验证。
++
++## 五、替换执行器，不重写工作流
++
++设置 `runner_factory: my_company.research:create_runner`，工厂签名 `create_runner(settings, store)`，返回实现以下异步方法的对象：
++
++```python
++async def plan(run, proposed=None) -> ResearchPlan: ...
++async def research(run, unit, dependencies) -> ResearchResult: ...
++async def synthesize(run, plan, findings, pool, errors=()) -> StructuredReport: ...
++```
++
