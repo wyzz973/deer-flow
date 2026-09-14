@@ -1,0 +1,76 @@
+"""Test the native adapter boundary without a model, sandbox, or MCP service."""
+
+import sys
+import types
+from dataclasses import dataclass
+
+import pytest
+
+from deepresearch.native import execute_role
+from deepresearch.store import Store
+
+
+@dataclass
+class Agent:
+    name: str = "technical-researcher"
+    system_prompt: str = "Research carefully"
+    model: str = "local-chat"
+    max_turns: int = 20
+    timeout_seconds: int = 180
+
+
+@pytest.mark.asyncio
+async def test_roles_use_native_executor_with_scoped_tools_and_credentials(settings, tmp_path, monkeypatch):
+    settings.native_tools = ["read_file"]
+    captured = {}
+    completed = types.SimpleNamespace(is_terminal=True)
+    result = types.SimpleNamespace(status=completed, result="ordinary prose", stop_reason=None, snapshot_tool_receipts=lambda: [])
+
+    class Executor:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def execute_async(self, prompt):
+            captured["prompt"] = prompt
+            return "native-execution"
+
+    def tools(**kwargs):
+        assert kwargs["include_mcp"] is False
+        return [types.SimpleNamespace(name="read_file"), types.SimpleNamespace(name="unrelated_network_tool")]
+
+    monkeypatch.setitem(sys.modules, "deerflow.config", types.SimpleNamespace(get_app_config=lambda: object()))
+    monkeypatch.setitem(sys.modules, "deerflow.tools", types.SimpleNamespace(get_available_tools=tools))
+    monkeypatch.setitem(
+        sys.modules,
+        "deerflow.subagents.executor",
+        types.SimpleNamespace(
+            SubagentExecutor=Executor,
+            SubagentStatus=types.SimpleNamespace(COMPLETED=completed),
+            get_background_task_result=lambda _: result,
+            request_cancel_background_task=lambda _: None,
+            cleanup_background_task=lambda _: captured.update(cleaned=True),
+        ),
+    )
+    monkeypatch.setattr("deepresearch.native.model_callbacks", lambda *a, **kw: types.SimpleNamespace(budget_error=None))
+    store = Store(tmp_path / "native.sqlite")
+    await store.start()
+    run = {"run_id": "r", "thread_id": "dr-r", "owner": "alice"}
+    await store.create(run, "k", "h")
+    reply = await execute_role(settings, store, run, "technical-route", {"unit": {"id": "R1"}}, [], Agent(), {"secrets": {"research_cookie": "private-value"}, "user_role": "member"})
+    assert reply.answer == "ordinary prose"
+    assert reply.execution_id == "native-execution"
+    assert captured["thread_id"] == "dr-r-R1"
+    assert captured["user_id"] == "alice"
+    assert captured["request_secrets"] == {"research_cookie": "private-value"}
+    assert [t.name for t in captured["tools"]] == ["read_file"]
+    assert captured["execution_callbacks"]
+    assert "private-value" not in captured["prompt"]
+    assert captured["cleaned"]
+
+    # Diagnostic payload limits cannot truncate the answer used by research.
+    settings.trace_max_chars = 1000
+    result.result = "Long research notes. " * 200
+    result.ai_messages = [{"type": "ai", "content": "notes", "response_metadata": {"headers": {"Authorization": "private"}}}]
+    long_reply = await execute_role(settings, store, run, "technical-route", {"unit": {"id": "R2"}}, [], Agent(), {})
+    assert long_reply.answer == result.result.strip()
+    assert "response_metadata" not in long_reply.messages[0]

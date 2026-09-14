@@ -790,6 +790,8 @@ class SubagentExecutor:
         acceptance_criteria: list[str] | None = None,
         loop_detection_recorder: Any | None = None,
         tool_promotion_recorder: Any | None = None,
+        request_secrets: Mapping[str, str] | None = None,
+        execution_callbacks: list[Any] | None = None,
     ):
         """Initialize the executor.
 
@@ -888,6 +890,13 @@ class SubagentExecutor:
         self.acceptance_criteria = acceptance_criteria
         self.loop_detection_recorder = loop_detection_recorder
         self.tool_promotion_recorder = tool_promotion_recorder
+        # Embedded workflows need the same request-scoped credential carrier as
+        # native task delegation. Never merge arbitrary caller context: identity,
+        # sandbox ownership and authorization remain executor-owned below.
+        self._request_secrets = dict(request_secrets or {})
+        # Callers must provide loop-independent handlers (or owner-loop proxies).
+        # These handlers are added on the isolated loop, not inherited implicitly.
+        self._execution_callbacks = list(execution_callbacks or [])
 
         self._base_tools = _filter_tools(
             tools,
@@ -1432,7 +1441,7 @@ class SubagentExecutor:
             # below instead.
             run_config: RunnableConfig = {
                 "recursion_limit": self.config.max_turns,
-                "callbacks": [collector],
+                "callbacks": [collector, *self._execution_callbacks],
                 "tags": [collector_caller],
             }
 
@@ -1496,6 +1505,8 @@ class SubagentExecutor:
             context[_SANDBOX_COMMAND_SCOPE_CONTEXT_KEY] = sandbox_lease_owner_id
             execution_context = context
             context["agent_id"] = self.config.name
+            if self._request_secrets:
+                context["secrets"] = dict(self._request_secrets)
             if self.loop_detection_recorder is not None:
                 context[LOOP_DETECTION_RECORDER_CONTEXT_KEY] = self.loop_detection_recorder
             if self.tool_promotion_recorder is not None:
@@ -1655,6 +1666,9 @@ class SubagentExecutor:
             )
 
         finally:
+            self._request_secrets.clear()
+            if execution_context is not None:
+                execution_context.get("secrets", {}).clear()
             if execution_context is not None and execution_context.get("sandbox_id") is not None:
                 try:
                     from deerflow.sandbox import get_sandbox_provider

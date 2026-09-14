@@ -1,7 +1,8 @@
 """Public, versioned contracts. No model is trusted to manufacture source metadata."""
+
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
@@ -14,7 +15,7 @@ Identifier = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$")]
 
 
 def utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 class Contract(BaseModel):
@@ -121,7 +122,7 @@ class RawEvidence(Contract):
     title: str = Field(min_length=1, max_length=1000)
     url: str | None = None
     source_uri: str | None = Field(default=None, max_length=2000)
-    origin: Origin
+    origin: Literal["internal", "external", "runtime"]
     source_name: Identifier
     source_level: Level = "L4"
     # Source independence is assigned by configuration (e.g. publisher), not the model.
@@ -130,6 +131,7 @@ class RawEvidence(Contract):
     retrieved_at: str = Field(default_factory=utcnow)
     snippet: str = Field(min_length=1, max_length=20000)
     raw_content_ref: str | None = None
+    provenance: Literal["document", "tool_output"] = "document"
 
     _url = field_validator("url")(safe_http_url)
 
@@ -137,7 +139,9 @@ class RawEvidence(Contract):
     def locator_required(self):
         if not self.url and not self.source_uri:
             raise ValueError("Evidence needs a URL or a source_uri/document_id")
-        if self.origin == "external" and not self.url:
+        if self.provenance == "tool_output" and not (self.source_uri or "").startswith(("mcp-result://", "tool-result://")):
+            raise ValueError("Opaque tool output must reference a registered MCP result")
+        if self.origin == "external" and not self.url and self.provenance != "tool_output":
             raise ValueError("External evidence needs a verifiable http(s) URL")
         return self
 
@@ -174,7 +178,7 @@ class Evidence(Contract):
     canonical_url: str | None
     source_uri: str | None
     title: str
-    origin: Origin
+    origin: Literal["internal", "external", "runtime"]
     source_name: Identifier
     source_level: Level
     publisher: str
@@ -184,6 +188,7 @@ class Evidence(Contract):
     content_hash: str
     unit_ids: list[str]
     raw_content_ref: str | None
+    provenance: Literal["document", "tool_output"] = "document"
 
 
 class BoundFinding(Contract):
@@ -243,6 +248,7 @@ class PlanEdit(PlanDecision):
 
 class ResearchError(RuntimeError):
     """Safe public error: never construct this with a provider exception message."""
+
     def __init__(self, code: str, message: str, *, recoverable: bool = True):
         super().__init__(message)
         self.code, self.recoverable = code, recoverable

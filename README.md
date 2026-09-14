@@ -18,6 +18,11 @@ https://github.com/user-attachments/assets/a8bcadc4-e040-4cf2-8fda-dd768b999c18
 
 ## Official Website
 
+The opt-in [DeepResearch workbench](README.deepresearch.md) uses native DeerFlow
+subagents, original MCP tool schemas/results and local, downloadable execution traces.
+See its [runtime and migration guide](docs/deepresearch/NATIVE_RUNTIME.md) for
+plain Chat Completions support, tool policies and local logging.
+
 Learn more and see **real demos** on our [**official website**](https://deerflow.tech).
 The landing-page case studies open as allowlisted, read-only showcases without requiring a sign-in.
 

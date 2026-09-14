@@ -1,5 +1,12 @@
 ### Subagent System (`packages/harness/deerflow/subagents/`)
 
+**Embedded workflow bridge**: `SubagentExecutor` accepts optional
+`request_secrets` and `execution_callbacks`. Secrets are copied into transient
+runtime context and cleared during execution cleanup; they never enter initial
+messages or RunnableConfig. These arguments do not grant arbitrary context or
+identity overrides. Callback implementations must be loop-independent or use
+an owner-loop proxy, because execution runs on the native isolated loop.
+
 **Durable batch acceptance**: `batch_task` normalizes optional per-item criteria
 before persistence (empty becomes null; 20 items × 500 neutralized characters),
 sharing `normalize_acceptance_criteria` with the executor and checker.

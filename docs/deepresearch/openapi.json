@@ -1,0 +1,981 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "DeerFlow DeepResearch API",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/api/deepresearch/capabilities": {
+      "get": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Capabilities",
+        "operationId": "capabilities_api_deepresearch_capabilities_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/deepresearch": {
+      "post": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Create",
+        "operationId": "create_api_deepresearch_post",
+        "parameters": [
+          {
+            "name": "idempotency-key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateResearch"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "List Runs",
+        "operationId": "list_runs_api_deepresearch_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 50,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/deepresearch/{run_id}": {
+      "get": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Get Run",
+        "operationId": "get_run_api_deepresearch__run_id__get",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/deepresearch/{run_id}/plan/approve": {
+      "post": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Approve",
+        "operationId": "approve_api_deepresearch__run_id__plan_approve_post",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlanDecision"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/deepresearch/{run_id}/plan/edit": {
+      "post": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Edit",
+        "operationId": "edit_api_deepresearch__run_id__plan_edit_post",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlanEdit"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/deepresearch/{run_id}/plan/reject": {
+      "post": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Reject",
+        "operationId": "reject_api_deepresearch__run_id__plan_reject_post",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlanDecision"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/deepresearch/{run_id}/cancel": {
+      "post": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Cancel",
+        "operationId": "cancel_api_deepresearch__run_id__cancel_post",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/deepresearch/{run_id}/retry": {
+      "post": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Retry",
+        "operationId": "retry_api_deepresearch__run_id__retry_post",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/deepresearch/{run_id}/events": {
+      "get": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Events",
+        "operationId": "events_api_deepresearch__run_id__events_get",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "After"
+            }
+          },
+          {
+            "name": "last-event-id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Last-Event-Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/deepresearch/{run_id}/evidences": {
+      "get": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Evidences",
+        "operationId": "evidences_api_deepresearch__run_id__evidences_get",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/deepresearch/{run_id}/trace": {
+      "get": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Trace",
+        "operationId": "trace_api_deepresearch__run_id__trace_get",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "After"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 1,
+              "default": 100,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/deepresearch/{run_id}/trace/export": {
+      "get": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Export Trace",
+        "operationId": "export_trace_api_deepresearch__run_id__trace_export_get",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/deepresearch/{run_id}/report": {
+      "get": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Report",
+        "operationId": "report_api_deepresearch__run_id__report_get",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "json",
+                "md",
+                "html",
+                "docx"
+              ],
+              "type": "string",
+              "default": "json",
+              "title": "Format"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "CreateResearch": {
+        "properties": {
+          "query": {
+            "type": "string",
+            "maxLength": 12000,
+            "minLength": 3,
+            "title": "Query"
+          },
+          "constraints": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 30,
+            "title": "Constraints"
+          },
+          "source_names": {
+            "items": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$"
+            },
+            "type": "array",
+            "maxItems": 50,
+            "title": "Source Names"
+          },
+          "budget": {
+            "$ref": "#/components/schemas/ResearchBudget"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "query"
+        ],
+        "title": "CreateResearch"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "PlanDecision": {
+        "properties": {
+          "plan_version": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Plan Version"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "plan_version"
+        ],
+        "title": "PlanDecision"
+      },
+      "PlanEdit": {
+        "properties": {
+          "plan_version": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Plan Version"
+          },
+          "plan": {
+            "$ref": "#/components/schemas/ResearchPlan"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "plan_version",
+          "plan"
+        ],
+        "title": "PlanEdit"
+      },
+      "ResearchBudget": {
+        "properties": {
+          "max_iterations": {
+            "type": "integer",
+            "maximum": 8.0,
+            "minimum": 0.0,
+            "title": "Max Iterations",
+            "default": 2
+          },
+          "max_units": {
+            "type": "integer",
+            "maximum": 64.0,
+            "minimum": 1.0,
+            "title": "Max Units",
+            "default": 12
+          },
+          "max_tool_calls": {
+            "type": "integer",
+            "maximum": 1000.0,
+            "minimum": 2.0,
+            "title": "Max Tool Calls",
+            "default": 60
+          },
+          "max_elapsed_seconds": {
+            "type": "integer",
+            "maximum": 14400.0,
+            "minimum": 10.0,
+            "title": "Max Elapsed Seconds",
+            "default": 900
+          },
+          "max_model_tokens": {
+            "type": "integer",
+            "maximum": 2000000.0,
+            "minimum": 1000.0,
+            "title": "Max Model Tokens",
+            "default": 120000
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "ResearchBudget"
+      },
+      "ResearchPlan": {
+        "properties": {
+          "goal": {
+            "type": "string",
+            "maxLength": 12000,
+            "minLength": 3,
+            "title": "Goal"
+          },
+          "research_units": {
+            "items": {
+              "$ref": "#/components/schemas/ResearchUnit"
+            },
+            "type": "array",
+            "maxItems": 64,
+            "minItems": 1,
+            "title": "Research Units"
+          },
+          "constraints": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 30,
+            "title": "Constraints"
+          },
+          "expected_output": {
+            "type": "string",
+            "title": "Expected Output",
+            "default": "有证据支撑的结构化研究报告"
+          },
+          "plan_version": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Plan Version",
+            "default": 1
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "goal",
+          "research_units"
+        ],
+        "title": "ResearchPlan"
+      },
+      "ResearchUnit": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$",
+            "title": "Id"
+          },
+          "skill": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$",
+            "title": "Skill"
+          },
+          "objective": {
+            "type": "string",
+            "maxLength": 4000,
+            "minLength": 3,
+            "title": "Objective"
+          },
+          "priority": {
+            "type": "integer",
+            "maximum": 1000.0,
+            "minimum": 0.0,
+            "title": "Priority",
+            "default": 10
+          },
+          "source_strategy": {
+            "$ref": "#/components/schemas/SourceStrategy"
+          },
+          "depends_on": {
+            "items": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$"
+            },
+            "type": "array",
+            "maxItems": 64,
+            "title": "Depends On"
+          },
+          "parent_gap_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent Gap Id"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "skill",
+          "objective"
+        ],
+        "title": "ResearchUnit"
+      },
+      "SourceStrategy": {
+        "properties": {
+          "source_names": {
+            "items": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$"
+            },
+            "type": "array",
+            "maxItems": 50,
+            "title": "Source Names"
+          },
+          "required_origins": {
+            "items": {
+              "type": "string",
+              "enum": [
+                "internal",
+                "external"
+              ]
+            },
+            "type": "array",
+            "minItems": 1,
+            "title": "Required Origins"
+          },
+          "max_results": {
+            "type": "integer",
+            "maximum": 50.0,
+            "minimum": 1.0,
+            "title": "Max Results",
+            "default": 12
+          },
+          "not_before": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Not Before"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "SourceStrategy"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  }
+}

@@ -1,22 +1,8 @@
-# 本地 Skill、Agent 与 MCP 扩展
+# 扩展研究角度与工具
 
-## 一、优先沿用已有方法论
+## 新增研究角度
 
-你原有的行业趋势和技术路线 Skill 不需要改名。将 `deepresearch.local.yaml` 的 `skills.<id>.path` 指向其实际文件；`agent` 对应原 `subagents.custom_agents` 的 key。方法论可以变，**运行时契约不可变**。
-
-新适配器通过 DeerFlow SDK 创建独立执行图，读取现有 Custom Agent 的 system_prompt/model/tools/skills/max_turns/timeout，再注入 registry 指定的 Skill 文本。它不是让 Lead 再调用 `task()` 二次选择角色，也不使用宿主的 Skill 自动发现来改变本次路由。
-
-Skill 当前以方法论文本加载；不自动执行目录中的 scripts，也不会默默授权 Bash、任意网络请求或嵌套 Agent。普通 DeerFlow 聊天和工具链不受影响。需要原生沙箱/文件/脚本能力时，通过下文 AgentRunner 接口接入宿主执行器，保留你的既有中间件和工具策略，不直接把工具函数裸挂到模型。
-
-## 二、给现有子 Skill 的最小调整指令
-
-> 保留原研究方法论与领域知识，删除固定行业、固定网站、固定章节和最终 Markdown/数字引用要求。任务目标、可用来源及预算由运行时注入。每条发现用 claim/raw_evidence_refs/confidence/high_risk；raw_evidence_refs 必须是工具实际返回的 raw_id。证据不足列入 open_questions，不编造来源。内部、外部检索互补，补研只处理指定缺口。研究 Agent 不负责报告综合、全局 Evidence ID 或最终引用编号。
-
-现有子 Skill 若坚持输出旧字段，应在自定义 runner 中做显式 adapter，而不是在任意 JSON 中“猜测”字段。公共 ResearchResult 是后端验证的边界。真实 runner 内部让模型输出 ResearchAnalysis（findings/open_questions/confidence），RawEvidence 元数据由 MCP 结果注入，禁止模型自行重写。
-
-## 三、新增一个产品对标 Skill
-
-参考 `examples/deepresearch/skills/product-benchmark/SKILL.md`。把它复制到你维护的方法论目录，在配置中新增：
+复用公司现有 Custom Agent 和原生 Skill 注册机制，再在研究 registry 增加对应条目：
 
 ```yaml
 skills:
@@ -24,77 +10,38 @@ skills:
     agent: product-researcher
     path: skills/custom/product-benchmark/SKILL.md
     description: 产品能力、场景与落地约束对标
-    max_turns: 12
-    timeout_seconds: 180
+    max_turns: 20
+    timeout_seconds: 300
 ```
 
-同时合并新的 Custom Agent：
+Agent 的模型、tools、skills、disallowed_tools 和运行参数沿用 DeerFlow。
+将方法论注册到宿主 Skill 系统，供原生发现/激活；registry path 用于显式方法说明和配置指纹，不会自动安装脚本或提升工具权限。
+
+研究 Skill 描述方法、关注范围和证据纪律即可。不要要求每个 MCP 返回统一 JSON，也不要要求研究 Agent 提前生成全局 E001/raw_id。研究时引用原生 receipts/工具 call ID，明确结论和未解决问题；跨单元编号由研究结束后的引用目录统一。
+
+## 新增 MCP 来源
+
+先在普通 DeerFlow 中配置并测试 MCP。研究只选择已经可用的工具：
 
 ```yaml
-subagents:
-  custom_agents:
-    product-researcher:
-      description: Research product capabilities against user requirements.
-      system_prompt: Work only on the assigned objective and return the runtime JSON contract.
-      skills: [product-benchmark]
-      tools: [your-internal-mcp_search, your-external-mcp_search]
-      model: inherit
-      max_turns: 12
-      timeout_seconds: 180
+sources:
+  - name: internal-docs
+    origin: internal
+    server: company-docs
+    tool: company-docs_search
+  - name: external-web
+    origin: external
+    server: company-web
+    tool: company-web_search
 ```
 
-Skill ID 是配置项而不是硬编码 Enum。Planner 的 available_skills 和前端选择器自动更新。禁止用户在 HTTP 请求中提交任意磁盘路径、Python 类或新工具名。
+工具名必须精确匹配宿主缓存，服务身份来自宿主 source metadata。复杂参数、返回格式、OAuth、HTTP/SSE/stdio、超时和连接池沿用原生工具链。不要新增 make_search 包装器或按业务返回写适配器。
 
-如果 Skill frontmatter 声明 `allowed-tools`，它会进一步收紧搜索工具权限：与 Custom Agent tools、disallowed_tools、研究 sources 取交集。请使用**真实暴露工具名**，而不是内部 wrapper 的 `research_<source>` 名。空列表表示没有检索权限，会明确失败，不会绕过白名单。
+旧 query_arg/fixed_args/results_path/fields/response_mode 已无执行效果；从公司本地配置删去即可。固定业务筛选可以放在方法论或宿主工具描述中，但不能把凭据放入模型可见参数。
 
-## 四、适配自己的 MCP 返回值
+## 领域契约与自定义 Runner
 
-默认要求结构化 JSON，例如：
+AgentRunner 仍提供 plan/research/synthesize 三个方法，供显式的领域扩展使用。
+自定义实现必须保持原生授权和请求级凭据边界、预算、真实调用可追溯性、取消清理以及失败不回退演示的约定。
 
-```json
-{"results":[{"title":"某文档","url":"https://docs.example.org/a","document_id":"internal-123","snippet":"可引用的内容摘录","published_at":"2026-08-01T00:00:00Z"}]}
-```
-
-支持 MCP structuredContent 或 content 中的 JSON 文本。内部无公开 URL 时须有 document_id/source_uri；外部必须有合法 HTTP(S) URL。空标题、空摘录、无法定位或非法 URL 的命中不会进入证据池；不会把无结构自然语言强行当证据。
-
-假设返回值为 `data.items`，每项字段为 `name/link/summary/id/date`，只改配置：
-
-```yaml
-results_path: data.items
-fields:
-  title: name
-  url: link
-  snippet: summary
-  source_uri: id
-  published_at: date
-```
-
-`fixed_args` 存放固定业务过滤参数；`query_arg` 是查询参数名。只能放非敏感业务参数。需要 query 以外的复杂、动态入参，扩展 `make_search` 或自定义 runner；不要把认证字段放进模型工具 schema。
-
-來源优先级：单元/请求注入的 source_names > source_priority_file 的 YAML 名称列表 > source_fallback。它们控制优先级，不把另一 origin 删除。每个必需 origin 的第一优先来源由代码并行调用；其他白名单来源可由 Agent 为缺口追加检索。
-
-来源等级和发布方当前来自管理员的逻辑 source 配置，不是模型自报。对覆盖全网的搜索服务，默认统一 L4 和保守发布方分组，**不能把搜索服务名视为已核实的独立原始发布者**。需要精细来源质量时，把站点过滤配置为多个逻辑 source，或在可信适配器中基于受校验的域名规则分类；内部转载与外部原文也不能冒充独立交叉验证。
-
-## 五、替换执行器，不重写工作流
-
-设置 `runner_factory: my_company.research:create_runner`，工厂签名 `create_runner(settings, store)`，返回实现以下异步方法的对象：
-
-```python
-async def plan(run, proposed=None) -> ResearchPlan: ...
-async def research(run, unit, dependencies) -> ResearchResult: ...
-async def synthesize(run, plan, findings, pool, errors=()) -> StructuredReport: ...
-```
-
-这些方法是扩展接口声明，不是默认实现中的 TODO。默认 DemoRunner、DeerFlowRunner 均有完整方法实现。
-
-生产自定义 runner 必须继续：用 runtime.context 传凭据；在 MCP/模型调用前使用 store.reserve；只允许已授权工具；保存成功工具调用缓存；将工具结果而不是模型编写的 URL/标题转成 RawEvidence；让 synthesize 无搜索权限。声明 `runner: deerflow` 保留真实模式校验与前端标识。
-
-结构校验通过不代表证据语义支撑成立。需要 SemanticCritic 时，在 validator 节点中增加受预算控制的独立评审，再返回 ResearchGap；当前实现不冒充已实现语义事实核验。
-
-## 六、版本与回归
-
-启动时冻结 Skill 文本，记录配置+文本指纹。运行中的任务不会因编辑磁盘文件而改变方法论。重启后指纹不一致的历史任务仍可查看，但不能在新配置下直接恢复；恢复原配置或新建任务。
-
-宿主模型/Custom Agent 配置仍由宿主管理：它们的版本和原 MCP/数据源 ACL 也应在你的部署流程中固定。当前指纹不宣称对外部服务内容、模型权重或宿主全部配置做版本锁定。
-
-每次修改至少跑单元/集成测试，并使用 `examples/deepresearch/evals/cases.json` 的问题作授权环境回归。该问题集是待运行的测试输入，不是已验证的真实报告质量分数。
+优先复用 native.py/structured.py/observations.py。只有公司宿主接口不同才适配宿主 API；不要另建 Agent loop、MCP client、身份系统或 Skill loader。未实现的日期/语义证明必须作为限制公开。

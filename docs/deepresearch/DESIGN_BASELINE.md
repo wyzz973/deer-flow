@@ -5,6 +5,8 @@
 **日期**：2026-09-14  
 **状态**：Design Draft / Implementation Baseline
 
+运行时升级：原生子 Agent、MCP 兼容层、普通聊天输出整理及本地 Trace 的实际设计见 [NATIVE_RUNTIME.md](NATIVE_RUNTIME.md)。以下保留最初设计，不能把可选语义 Critic 等规划项视为已实现。
+
 > 核心原则：**Skill 管方法，LLM/Agent 管智能，LangGraph 管流程和状态，代码/服务管确定性。**
 
 ## 1. 文档目的

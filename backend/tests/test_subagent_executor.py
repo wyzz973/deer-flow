@@ -1113,6 +1113,34 @@ class TestAsyncExecutionPath:
     """Test _aexecute() async execution path."""
 
     @pytest.mark.anyio
+    async def test_embedded_execution_context_and_callbacks(self, classes, base_config, mock_agent, msg):
+        """Embedded callers use the native lifecycle without persisting secrets."""
+        captured = {}
+        callback = object()
+        supplied = {"research_cookie": "private-request-value"}
+
+        def stream(state, **kwargs):
+            captured["state"] = state
+            captured["config"] = kwargs["config"]
+            captured["context"] = dict(kwargs["context"])
+            captured["context"]["secrets"] = dict(kwargs["context"]["secrets"])
+            return async_iterator([{"messages": [msg.ai("Research completed", "m")]}])
+
+        mock_agent.astream = stream
+        executor = classes["SubagentExecutor"](config=base_config, tools=[], thread_id="research-thread", user_id="alice", request_secrets=supplied, execution_callbacks=[callback])
+        with patch.object(executor, "_create_agent", return_value=mock_agent):
+            result = await executor._aexecute("Research")
+
+        assert result.status == classes["SubagentStatus"].COMPLETED
+        assert captured["context"]["secrets"] == supplied
+        assert captured["context"]["user_id"] == "alice"
+        assert callback in captured["config"]["callbacks"]
+        assert "private-request-value" not in str(captured["state"])
+        assert "private-request-value" not in str(captured["config"])
+        assert supplied == {"research_cookie": "private-request-value"}
+        assert executor._request_secrets == {}
+
+    @pytest.mark.anyio
     async def test_aexecute_success(self, classes, base_config, mock_agent, msg):
         """Test successful async execution returns completed result."""
         SubagentExecutor = classes["SubagentExecutor"]

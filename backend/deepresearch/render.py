@@ -1,4 +1,5 @@
 """Citation binding and rendering are pure functions; source metadata is read-only."""
+
 from __future__ import annotations
 
 import html
@@ -30,6 +31,7 @@ def citation_metadata(mapping, pool):
 def markdown(report, mapping, pool, limitations=(), demo=False):
     def segment(s):
         return plain(s.text) + "".join(f"[{mapping[e]}](#ref-{mapping[e]})" for e in dict.fromkeys(s.evidence_ids))
+
     lines = ["# " + plain(report.title), ""]
     if demo:
         lines += ["> 演示模式：以下证据和结论为合成测试数据，不可用于业务决策。", ""]
@@ -43,39 +45,43 @@ def markdown(report, mapping, pool, limitations=(), demo=False):
         target = ref.get("url") or ref["canonical_url"]
         title = plain(ref["title"])
         locator = f"[{title}](<{quote(target, safe=':/?=&%#@+;,~-._')}>)" if target else title + " — " + plain(ref["source_uri"] or "")
-        lines += [f'<a id="ref-{ref["number"]}"></a>', f'{ref["number"]}. {locator} · {ref["origin"]} · {ref["source_level"]}', ""]
+        lines += [f'<a id="ref-{ref["number"]}"></a>', f"{ref['number']}. {locator} · {ref['origin']} · {ref['source_level']}", ""]
     return "\n".join(lines)
 
 
 def html_report(report, mapping, pool, limitations=(), demo=False):
     esc = html.escape
+
     def segment(s):
         return "<p>" + esc(s.text) + "".join(f'<a href="#ref-{mapping[e]}">[{mapping[e]}]</a>' for e in dict.fromkeys(s.evidence_ids)) + "</p>"
-    parts = ['<!doctype html><html lang="zh"><meta charset="utf-8"><title>' + esc(report.title) + '</title><body><article>', '<h1>' + esc(report.title) + '</h1>']
+
+    parts = ['<!doctype html><html lang="zh"><meta charset="utf-8"><title>' + esc(report.title) + "</title><body><article>", "<h1>" + esc(report.title) + "</h1>"]
     if demo:
-        parts += ['<aside>演示模式：合成测试数据，不可用于业务决策。</aside>']
-    parts += ['<aside>' + esc(x) + '</aside>' for x in limitations]
-    parts += ['<h2>执行摘要</h2>', *map(segment, report.executive_summary)]
+        parts += ["<aside>演示模式：合成测试数据，不可用于业务决策。</aside>"]
+    parts += ["<aside>" + esc(x) + "</aside>" for x in limitations]
+    parts += ["<h2>执行摘要</h2>", *map(segment, report.executive_summary)]
     for section in report.sections:
-        parts += ['<h2>' + esc(section.heading) + '</h2>', *map(segment, section.segments)]
-    parts += ['<h2>结论</h2>', *map(segment, report.conclusion), '<h2>参考资料</h2><ol>']
+        parts += ["<h2>" + esc(section.heading) + "</h2>", *map(segment, section.segments)]
+    parts += ["<h2>结论</h2>", *map(segment, report.conclusion), "<h2>参考资料</h2><ol>"]
     for ref in citation_metadata(mapping, pool):
-        label = esc(ref['title'])
-        target = ref.get('url') or ref['canonical_url']
+        label = esc(ref["title"])
+        target = ref.get("url") or ref["canonical_url"]
         if target:
-            label = '<a rel="noreferrer noopener" href="' + esc(target, quote=True) + '">' + label + '</a>'
+            label = '<a rel="noreferrer noopener" href="' + esc(target, quote=True) + '">' + label + "</a>"
         else:
-            label += ' — ' + esc(ref['source_uri'] or '')
+            label += " — " + esc(ref["source_uri"] or "")
         parts += [f'<li id="ref-{ref["number"]}">{label}</li>']
-    return ''.join(parts) + '</ol></article></body></html>'
+    return "".join(parts) + "</ol></article></body></html>"
 
 
 def docx_report(value):
     """Export the same verified AST; no Markdown reparsing or model formatting."""
     from io import BytesIO
+
     from docx import Document
-    from docx.shared import Pt
     from docx.oxml.ns import qn
+    from docx.shared import Pt
+
     report = StructuredReport.model_validate(value["report"])
     doc = Document()
     normal = doc.styles["Normal"]
@@ -92,9 +98,11 @@ def docx_report(value):
         for text in value["limitations"]:
             doc.add_paragraph(text)
     mapping = value["citation_map"]
+
     def segments(items):
         for item in items:
             doc.add_paragraph(item.text + "".join(f"[{mapping[e]}]" for e in dict.fromkeys(item.evidence_ids)))
+
     doc.add_heading("执行摘要", 1)
     segments(report.executive_summary)
     for section in report.sections:
@@ -104,7 +112,7 @@ def docx_report(value):
     segments(report.conclusion)
     doc.add_heading("参考资料", 1)
     for ref in value["citations"]:
-        doc.add_paragraph(f'[{ref["number"]}] {ref["title"]}\n{ref.get("url") or ref["canonical_url"] or ref["source_uri"]}')
+        doc.add_paragraph(f"[{ref['number']}] {ref['title']}\n{ref.get('url') or ref['canonical_url'] or ref['source_uri']}")
     # Stable core metadata avoids exposing local usernames.
     doc.core_properties.author = "DeepResearch"
     doc.core_properties.title = report.title

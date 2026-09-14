@@ -24,6 +24,7 @@ const LINKABLE_SECTIONS: Record<string, true> = {
   agents: true,
   chats: true,
   "scheduled-tasks": true,
+  deepresearch: true,
 };
 
 export function WorkspaceContainer({
@@ -140,5 +141,6 @@ function nameOfSegment(
   if (!segment) return t.common.home;
   if (segment === "workspace") return t.breadcrumb.workspace;
   if (segment === "chats") return t.breadcrumb.chats;
+  if (segment === "deepresearch") return "DeepResearch";
   return segment[0]?.toUpperCase() + segment.slice(1);
 }

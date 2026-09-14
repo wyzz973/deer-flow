@@ -1,4 +1,5 @@
 """Configuration is local and opt-in; never modifies the host's tool registry."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -29,14 +30,22 @@ class SourceSpec(Contract):
     tool: str  # Exact exposed MCP tool name; no prefix guessing.
     level: Level = "L4"
     priority: int = 100
-    publisher: str
-    query_arg: str = "query"
+    publisher: str = "unclassified"
+    # Accepted only for migration from V1. Native tools now own their argument
+    # and response formats; these legacy fields never modify a tool call.
+    query_arg: str = Field(default="query", deprecated=True)
     fixed_args: dict = Field(default_factory=dict)
     results_path: str = "results"  # dotted path in structuredContent/text JSON
-    fields: dict[str, str] = Field(default_factory=lambda: {
-        "title": "title", "url": "url", "snippet": "snippet",
-        "source_uri": "document_id", "published_at": "published_at",
-    })
+    response_mode: Literal["auto", "mapped"] = "auto"
+    fields: dict[str, str] = Field(
+        default_factory=lambda: {
+            "title": "title",
+            "url": "url",
+            "snippet": "snippet",
+            "source_uri": "document_id",
+            "published_at": "published_at",
+        }
+    )
 
 
 class Settings(Contract):
@@ -53,10 +62,15 @@ class Settings(Contract):
     tool_timeout_seconds: int = Field(default=45, ge=1, le=300)
     tool_retries: int = Field(default=1, ge=0, le=3)
     max_output_tokens: int = Field(default=4096, ge=128, le=32000)
+    output_retries: int = Field(default=2, ge=0, le=4)
+    extraction_model: str | None = None
+    native_tools: list[str] | None = None  # Optional ceiling; native Agent/Skill authorization is authoritative.
+    trace_capture_content: bool = True
+    trace_max_chars: int = Field(default=16000, ge=1000, le=100000)
     allow_limited_report: bool = False
     max_synthesis_repairs: int = Field(default=1, ge=0, le=3)
     require_dual_source: bool = True
-    # Model trace callbacks are disabled for this module; its events never carry prompts/secrets.
+    # Automatic LangSmith tracing is disabled; local spans redact captured content.
     budget_ceiling: ResearchBudget = Field(default_factory=ResearchBudget)
     # Explicit, local-only fallback. These are ENVIRONMENT VARIABLE NAMES, not values.
     local_secret_env: dict[str, str] = Field(default_factory=dict)
@@ -72,7 +86,9 @@ class Settings(Contract):
         names = [source.name for source in self.sources]
         if len(names) != len(set(names)):
             raise ValueError("Source names must be unique")
-        if self.runner == "deerflow" and {s.origin for s in self.sources} != {"internal", "external"}:
+        if self.runner == "deerflow" and not self.sources:
+            raise ValueError("DeerFlow mode needs at least one configured source")
+        if self.runner == "deerflow" and self.require_dual_source and {s.origin for s in self.sources} != {"internal", "external"}:
             raise ValueError("DeerFlow mode needs explicit internal and external MCP bindings")
         if not set(self.source_fallback).issubset(names):
             raise ValueError("Unknown fallback source")

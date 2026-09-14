@@ -1,4 +1,5 @@
 """Lifecycle, admission, ownership and checkpoint resume for the local worker."""
+
 from __future__ import annotations
 
 import asyncio
@@ -7,10 +8,11 @@ import time
 from contextlib import AsyncExitStack
 from uuid import uuid4
 
-from .contracts import CreateResearch, ResearchError, ResearchPlan, TERMINAL, utcnow
+from .contracts import TERMINAL, CreateResearch, ResearchError, ResearchPlan, utcnow
 from .evidence import digest
 from .runner import DeerFlowRunner, DemoRunner
 from .store import ProcessLock, Store
+from .trace import LocalTrace, install_log, logger
 
 
 class ResearchService:
@@ -22,6 +24,7 @@ class ResearchService:
             self.runner = runner
         elif settings.runner_factory:
             import importlib
+
             module, name = settings.runner_factory.rsplit(":", 1)
             self.runner = getattr(importlib.import_module(module), name)(settings, self.store)
         else:
@@ -31,13 +34,17 @@ class ResearchService:
         self.stack = AsyncExitStack()
         self.graph = None
         self.fingerprint = None
+        self.log_handler = None
 
     async def start(self, deps=None):
         from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
         from .workflow import build_workflow
+
         await asyncio.to_thread(self.lock.acquire)
         try:
             await self.store.start()
+            self.log_handler = install_log(self.settings.resolve(self.settings.data_dir))
             bodies = {name: await asyncio.to_thread(self.settings.read_skill, name) for name in self.settings.skills}
             self.fingerprint = digest([self.settings.model_dump(mode="json"), bodies])
             self.settings._skill_cache = bodies
@@ -49,6 +56,7 @@ class ResearchService:
                     await self.store.patch(run["run_id"], status="FAILED", error={"code": "PROCESS_INTERRUPTED", "message": "进程已重启，请重新提供凭据并恢复", "recoverable": True})
         except BaseException:
             await self.stack.aclose()
+            self._close_log()
             await asyncio.to_thread(self.lock.release)
             raise
 
@@ -63,11 +71,21 @@ class ResearchService:
                 await self.store.patch(run_id, status="FAILED", error={"code": "PROCESS_INTERRUPTED", "message": "服务已停止，可从检查点恢复", "recoverable": True})
         await self.stack.aclose()
         await asyncio.to_thread(self.lock.release)
+        self._close_log()
+
+    def _close_log(self):
+        if self.log_handler is not None:
+            logger.removeHandler(self.log_handler)
+            self.log_handler.close()
+            self.log_handler = None
 
     def context(self, run, supplied=None):
         secrets = {key: os.environ[env] for key, env in self.settings.local_secret_env.items() if os.environ.get(env)}
-        secrets.update(supplied or {})
-        return {"user_id": run["owner"], "thread_id": run["thread_id"], "secrets": secrets}
+        supplied = supplied or {}
+        # Direct Python callers may still pass the old secret-only mapping.
+        secrets.update(supplied.get("secrets", supplied) if "identity" not in supplied else supplied.get("secrets", {}))
+        identity = supplied.get("identity", {})
+        return {"user_id": run["owner"], "thread_id": run["thread_id"], "secrets": secrets, "user_role": identity.get("user_role"), "is_internal": identity.get("is_internal", False)}
 
     def config(self, run):
         return {"configurable": {"thread_id": run["thread_id"]}, "recursion_limit": 200, "callbacks": []}
@@ -88,11 +106,27 @@ class ResearchService:
             self._admit()
             run_id = str(uuid4())
             now = utcnow()
-            run = {**request.model_dump(mode="json"), "run_id": run_id, "thread_id": "dr-" + run_id, "owner": owner,
-                   "status": "CREATED", "created_at": now, "updated_at": now, "fingerprint": self.fingerprint,
-                   "plan": None, "units": [], "unit_statuses": {}, "evidence_count": 0, "iteration": 0, "gaps": [],
-                   "usage": {"tool_calls": 0, "model_tokens": 0, "reported_model_tokens": 0, "elapsed_seconds": 0},
-                   "report": None, "error": None, "limitations": [], "demo": self.settings.runner == "demo"}
+            run = {
+                **request.model_dump(mode="json"),
+                "run_id": run_id,
+                "thread_id": "dr-" + run_id,
+                "owner": owner,
+                "status": "CREATED",
+                "created_at": now,
+                "updated_at": now,
+                "fingerprint": self.fingerprint,
+                "plan": None,
+                "units": [],
+                "unit_statuses": {},
+                "evidence_count": 0,
+                "iteration": 0,
+                "gaps": [],
+                "usage": {"tool_calls": 0, "model_tokens": 0, "reported_model_tokens": 0, "elapsed_seconds": 0},
+                "report": None,
+                "error": None,
+                "limitations": [],
+                "demo": self.settings.runner == "demo",
+            }
             run, created = await self.store.create(run, key, digest(request.model_dump(mode="json")))
             if created:
                 await self.store.event(run_id, "run.created", {"thread_id": run["thread_id"], "demo": run["demo"]}, key="created")
@@ -101,6 +135,7 @@ class ResearchService:
 
     async def decision(self, run_id, version, action, plan=None, secrets=None):
         from langgraph.types import Command
+
         async with self.guard:
             self._admit(run_id)
             run = await self.store.get(run_id)
@@ -140,6 +175,7 @@ class ResearchService:
 
     async def _drive(self, run, payload, context):
         from langsmith import tracing_context
+
         start = time.monotonic()
         try:
             remaining = run["budget"]["max_elapsed_seconds"] - run["usage"]["elapsed_seconds"]
@@ -147,7 +183,9 @@ class ResearchService:
                 raise ResearchError("TIME_BUDGET", "研究执行时间预算已用尽", recoverable=False)
             with tracing_context(enabled=False):
                 async with asyncio.timeout(remaining):
-                    output = await self.graph.ainvoke(payload, config=self.config(run), context=context)
+                    trace = LocalTrace(self.store, run["run_id"], self.settings, context.get("secrets", {}).values())
+                    async with trace.span("workflow", "workflow", {"resume": payload is None}):
+                        output = await self.graph.ainvoke(payload, config=self.config(run), context=context)
             if output.get("__interrupt__"):
                 await self.store.patch(run["run_id"], status="AWAITING_PLAN_CONFIRMATION", plan=output["plan"], units=output["units"], error=None)
                 await self.store.event(run["run_id"], "plan.waiting_confirmation", {"plan_version": output["plan"]["plan_version"]}, key="waiting-" + str(output["plan"]["plan_version"]))

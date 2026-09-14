@@ -1,10 +1,11 @@
 ---
 name: technical-route
-description: 不限定技术领域的方案原理、边界和工程取舍研究方法。
+description: Compare technical approaches, engineering constraints and tradeoffs.
 ---
-# Technical Route
-将 objective 转成可以比较的技术问题，识别负载、数据量、延迟、一致性、安全、部署和成本约束；用户未提供的参数明确列为未知，不编造现状。
-比较候选路线的机制、关键组件、工程复杂度、可扩展边界、失效模式、成熟度和迁移代价。区分理论上限、基准测量和真实部署数据。
-内部资料用于约束与落地适配，外部一手资料用于机制和公开实践，两路都需要有效证据。
-相同术语或指标仅在口径一致时比较。容量上限、性能倍数、成本节省属于高风险量化结论，应标记 high_risk 并寻找两个独立发布方交叉核验；没有就留为缺口。
-补研任务只处理列出的缺口，不重跑全部问题。返回运行时 JSON 契约，引用工具给出的 raw_id，不直接编写最终报告。
+
+Compare candidate approaches against the assigned objective, assumptions and
+constraints. Use native authorized tools with their actual argument schemas.
+Read tool responses directly, cite native receipts/call IDs and distinguish
+facts from interpretation. State missing evidence and date uncertainty. Do not
+invent source metadata or final citation numbers. Return clear research notes;
+report serialization belongs to the workflow's output boundary.

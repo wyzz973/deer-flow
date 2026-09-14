@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### DeepResearch native workspace feature
+
+- Add DeepResearch to the existing workspace navigation, header and shared UI controls, including an accessible source Sheet and local trace export.
+- Delegate research roles to native DeerFlow subagents and use the host MCP cache, original tool schemas/results, credentials and middleware.
+- Remove query-only search wrappers and MCP business-result normalization. Build citation references from native messages and receipts after research.
+- Support ordinary Chat Completions output with bounded contract conversion; preserve native stop reasons and unresolved questions for supplementation.
+- Add local redacted tracing, rotating operational logs, regression coverage and corporate adaptation/API/design documentation. No LangSmith service required.
+- Migration: legacy search mapping fields are ignored; create new runs after upgrading. Native tool calls are not automatically replay-cached, and receipt provenance is not semantic validation.
+
 This section accumulates work toward the **2.1.0** milestone
 ([milestone 2](https://github.com/bytedance/deer-flow/milestone/2)).
 

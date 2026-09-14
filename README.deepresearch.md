@@ -1,132 +1,87 @@
-# DeepResearch：可确认、可恢复的研究工作流
+# DeepResearch：DeerFlow 原生研究模块
 
-基于 DeerFlow fork 提交 `0d4925305a6330a3442dcd336ed25750aea87cbd` 与 [设计基线](docs/deepresearch/DESIGN_BASELINE.md)。所有新增功能在独立模块中；不替换原聊天、不改全局 MCP/工具注册、不覆盖本地 Skills。
+在 DeerFlow 工作区侧栏打开 **DeepResearch**，进入 `/workspace/deepresearch`。
+研究计划可以编辑、确认或拒绝；确认后由原生子 Agent 执行，最终输出带可追溯引用的报告。
 
-**入口**：真实模式 `/workspace/deepresearch`；本地演示 `/deepresearch-demo`。后端接口 `/api/deepresearch`。
+## 设计原则
 
-## 已实现
+- LangGraph 管计划审批、状态、依赖调度与补研。
+- DeerFlow `SubagentExecutor` 管 Agent、工具授权、Skill 激活、沙箱、上下文压缩、运行保护和取消。
+- MCP 的参数和结果由原生工具链处理，**不要求任何统一搜索返回格式**。模型直接阅读原始 ToolMessage。
+- 研究完成后，从原生 ToolMessage 和 receipts 建立报告引用；调用记录不等于语义支持证明。
+- 普通 Chat Completions 回复通过独立、有限重试的输出整理进入研究契约，不要求 JSON mode。
+- 本地 Trace 与轮转日志支持调查，不依赖 LangSmith 或其他遥测服务。
 
-| 层 | 实现 |
-|---|---|
-| 计划与流程 | LangGraph 显式工作流、计划查看/编辑/确认/拒绝、依赖调度、并发、定向补研、有限修订 |
-| 研究执行 | DemoRunner 和实际 DeerFlowRunner；读取 Custom Agent 配置、注入指定 Skill、只发现白名单服务；internal/external 并行，禁止失败回退 |
-| 证据与报告 | RawEvidence 适配、后端全局 ID、URL/内容摘要去重、lineage、结构化 AST、确定性引用、Markdown/HTML/DOCX 导出 |
-| 可靠性 | SQLite checkpoint、成功单元/工具结果缓存、同 run/thread 恢复、取消、预算、幂等创建、计划版本检查、SSE 持久事件重放 |
-| 前端 | 新建研究、历史任务、可编辑计划、来源偏好、预算、进度、缺口、恢复/取消、句段引用按钮、来源抽屉、导出 |
-| 权限 | 宿主 principal、任务 owner 隔离、可选实时 ACL 插件、运行时凭据、对外错误脱敏、本地演示限制回环地址 |
+详细说明：[设计与原生能力复用](docs/deepresearch/NATIVE_RUNTIME.md) · [逐步评审记录](docs/deepresearch/REUSE_AUDIT.md) · [API](docs/deepresearch/API.md) · [公司 Agent 交接](docs/deepresearch/HANDOFF.md)
 
-> **边界**：这是可运行的单进程实现基线，不是已完成线上压测的分布式生产系统。演示数据全部明确标记；真实模式没有 demo fallback。真实 MCP URL、工具名、字段映射及凭据必须来自你的环境，仓库没有内置业务凭据。
+## 接入已有 DeerFlow
 
-## 交付状态
+1. 合并 `examples/deepresearch/host-config.fragment.yaml` 到本地 `config.yaml`，保留原模型、其他 Agent 与插件配置。
+2. 复制 `deepresearch.example.yaml` 为 `deepresearch.local.yaml`，设置 `runner: deerflow`。
+3. 将 Skill registry 的 `agent` 对应到现有 Custom Agent，`path` 指向实际方法论文件。
+4. 在 `sources` 填写已在 DeerFlow 中配置成功的 MCP 服务名、**精确工具名**、来源分类；不再配置返回字段映射。
+5. MCP 连接、stdio/HTTP/SSE、认证及凭据策略沿用宿主；研究模块不建立另一套客户端或推断工具名前缀。
+6. 执行 `uv sync` 安装宿主依赖（本分支已声明 DOCX 依赖）。检查后重启 Gateway。
+7. 打开工作区侧栏 DeepResearch，新建研究。旧运行配置指纹不兼容时应新建任务。
 
-GitHub 分支已创建，但本次批量源码写入被工具安全检查拦截，**没有产生代码提交，也没有触发 CI**。这份源码包和随附补丁是本次实际交付；先审阅/应用到已有 fork，再执行下述命令。ZIP 不是整个 DeerFlow 仓库，包含本次新增文件及 `.gitignore` 修改。
+原生 Agent 和激活 Skill 的工具白名单仍生效。`native_tools: null` 表示使用宿主候选工具；可以额外配置列表收紧权限。研究模块不会绕过原生授权，也不会自动开放嵌套 Agent 或非交互任务中的澄清工具。
 
-## 1. 先跑完整演示链路
+默认要求 internal/external 两类来源；可以设置 `require_dual_source: false` 并在计划中选择实际来源类别。模型负责调用顺序和并行机会，没有强制的“两次预搜索”。
 
-需要 Python 3.12+、Node 22、pnpm 10.26.2。演示不需要模型、MCP 或登录后端。
+配置检查（不访问模型/MCP）：
 
-从仓库根目录，在终端 A：
-
-```bash
-python -m venv .venv-dr
-# macOS/Linux
-source .venv-dr/bin/activate
-# Windows PowerShell 使用：.\.venv-dr\Scripts\Activate.ps1
-python -m pip install -r backend/deepresearch/requirements.txt
-python -m uvicorn deepresearch.demo:app --app-dir backend --host 127.0.0.1 --port 8022
+```sh
+PYTHONPATH=backend python -m deepresearch.doctor --config deepresearch.local.yaml
 ```
 
-终端 B：
+## 凭据
 
-```bash
-cd frontend
-corepack enable
-corepack prepare pnpm@10.26.2 --activate
-pnpm install --frozen-lockfile
-pnpm exec next dev --hostname 127.0.0.1 --port 3000
-```
-
-访问 `http://127.0.0.1:3000/deepresearch-demo`。如前端环境校验要求变量，先按原仓库说明配置前端环境；仅演示时可设置 `SKIP_ENV_VALIDATION=1`。
-
-输入问题 → 生成计划 → 修改并保存 → 确认新版本 → 查看报告 → 点击引用 → 导出。刷新页面后通过 URL 的 `run` 参数恢复当前任务。关闭后端再启动，等待确认的计划和已完成报告仍在。
-
-演示后端只接受回环客户端、回环 Host 及明确允许的本地 Origin；不能将它作为公开服务部署，也不能将它切为真实 MCP 模式。普通生产入口始终依赖宿主认证。
-
-## 2. 接入你现有的 DeerFlow 和 MCP
-
-1. 将 `deepresearch.example.yaml` 复制为 **`deepresearch.local.yaml`**，设置 `runner: deerflow`。
-2. 将 [host-config.fragment.yaml](examples/deepresearch/host-config.fragment.yaml) **合并**到原 `config.yaml`，不要覆盖原模型、工具、其他 Agent。已有 industry/technical Agent 可以直接复用，只需调整 registry 的 `agent` 名。
-3. 将 registry 的 `path` 指向你本地真正的主/子 Skill。随附 `examples/.../skills` 是通用参考方法论，不宣称等同于你本地的原有 Skill。
-4. 通过原宿主 `extensions_config.json` 配置两个 MCP，参考 [MCP 片段](examples/deepresearch/mcp.fragment.json)。两服务均使用 `headers_from_context` 和 `on_missing: deny`。
-5. 在研究配置的 `sources` 中填写**精确暴露工具名**、服务名和返回字段映射。工具必须同时在现有 Custom Agent 的 tools 白名单中。真实适配器当前支持 HTTP/SSE，不将 stdio 秘密降级为其他传输。
-6. 按原仓库方式 `cd backend && uv sync`。宿主已声明 LangGraph、SQLite checkpointer 与 MCP adapter 依赖；DOCX 导出还需 `python-docx`，可执行 `uv add 'python-docx>=1.1,<2'` 并提交由本地环境生成的锁文件更新。
-7. 运行单个 Gateway worker，登录后打开 `/workspace/deepresearch`。插件 `required: true`，配置或导入错误会阻止启用，而不是静默跳过。
-
-本地暂时用环境变量传凭据，在 `deepresearch.local.yaml` 中增加：
+优先使用已经可用的 DeerFlow MCP 认证。需要请求级凭据时，沿用宿主的 `headers_from_context`，通过专用请求头或本地环境变量传递：
 
 ```yaml
 local_secret_env:
   research_cookie: DEEPRESEARCH_MCP_COOKIE
-  research_csrf: DEEPRESEARCH_MCP_CSRF
-```
-
-将真实值放在**宿主已经读取的本地环境**或启动 shell 中，不能提交到 Git。生产环境建议由已认证网关将专门的请求头映射到 context：
-
-```yaml
 request_secret_headers:
   X-Research-Cookie: research_cookie
-  X-Research-Csrf: research_csrf
 ```
 
-这些值不进入 prompt、state、事件或数据库。不要把宿主自己的登录 Cookie 自动转发给不同系统。暂停/重启后恢复时需要重新提供有效凭据；缺失直接 deny。前端不保存业务 Cookie/Token；上面的专用头由你自己的认证网关注入。
+这里存的是环境变量名/映射，不是真实凭据。凭据只进入原生 executor 的 runtime context；不要把宿主登录 Cookie 自动转发到另一个业务系统。
 
-配置检查（不访问 MCP/模型）：
+## 本地 Trace 与日志
 
-```bash
-# 从根目录，使用已装好宿主依赖的 Python；Windows 用 $env:PYTHONPATH="backend"
-PYTHONPATH=backend python -m deepresearch.doctor --config deepresearch.local.yaml
+工作台展开“本地 Trace”，查看 workflow/node/agent/model/tool/conversion 的父子关联、输入输出、耗时、错误和调用记录；支持分页及完整 JSONL 导出。
+
+研究数据目录默认 `.deerflow/deepresearch`：
+
+- `research.sqlite3`：研究数据、事件和本地 Trace。
+- `checkpoints.sqlite3`：LangGraph 检查点。
+- `research.log`：不含原始 prompt/header 的运行元数据，5 MiB 轮转、3 个备份。
+
+`trace_capture_content: false` 可关闭明细采集；`trace_max_chars` 限制单条载荷长度。已知凭据与敏感字段被脱敏，不采集隐藏推理块。数据仍可能包含业务内容，必须按私有应用数据保护；当前 Trace 无自动 TTL。
+
+## 演示与验收
+
+演示使用合成数据，不调用业务模型/MCP：
+
+```sh
+python -m pip install -r backend/deepresearch/requirements.txt
+python -m uvicorn deepresearch.demo:app --app-dir backend --host 127.0.0.1 --port 8022
+python scripts/pnpm.py dev
 ```
 
-## 3. 测试
+打开 `/deepresearch-demo`。它与真实工作区共用研究组件，但后端仅接受回环地址。
 
-```bash
-# 根目录；演示虚拟环境中
-python -m pytest tests/deepresearch -v
-python -m compileall -q backend/deepresearch
-# 前端
-cd frontend
-pnpm typecheck
-pnpm exec playwright install chromium
-pnpm exec playwright test -c playwright.deepresearch.config.ts
+从 `backend/` 执行回归：
+
+```sh
+uv run --no-sync --with python-docx python -m pytest ../tests/deepresearch tests/test_subagent_executor.py -q
+DEEPRESEARCH_E2E_FRONTEND_PORT=3100 uv run --no-sync --with python-docx python ../scripts/pnpm.py exec playwright test -c playwright.deepresearch.config.ts
 ```
 
-Playwright 会启动演示后端与 Next 开发服务，要求当前终端的 Python 已装演示依赖，8022/3000 端口空闲。后端测试会在依赖缺失时跳过整个 workflow 测试模块；**看到 skipped 不能算集成验收通过**。CI 显式导入 LangGraph/checkpointer 后才执行测试，避免把依赖缺失当成通过。
+浏览器测试使用独立演示数据库和宿主已有的开发免登录模式，覆盖演示页与真实工作区页面、侧栏、移动端、计划编辑/确认、报告/引用、Trace 和下载。权限隔离由后端测试覆盖，不能把开发免登录测试当作真实企业 SSO 验收。
 
-`.github/workflows/deepresearch.yml` 包含后端集成、前端类型检查和浏览器演示 E2E。真实内部 MCP 与模型调用需要你的授权环境，不在无凭据 CI 中伪造测试成功。详情见 [验证记录](docs/deepresearch/VERIFICATION.md)。
+## 当前边界
 
-## 4. 文件导航
+单进程 SQLite；不支持多实例负载均衡。成功的完整 Agent 执行会缓存，格式修复不重复研究；中途失败的子 Agent 会重启，不自动缓存/重放任意 MCP 调用。工具可能有副作用，不能宣称 exactly-once。
 
-```text
-backend/deepresearch/
-  contracts.py           # ResearchPlan / Result / Evidence / StructuredReport
-  config.py              # registry、来源策略、预算与扩展配置
-  runner.py              # AgentRunner / DemoRunner / DeerFlowRunner
-  workflow.py            # LangGraph 节点与路由
-  evidence.py            # MCP 结果映射、来源排序、证据去重和 lineage
-  validators.py          # coverage / dual-source / high-risk / final gates
-  render.py              # Binder + MD/HTML/DOCX renderer
-  store.py               # 业务持久化、幂等缓存、事件、单进程锁
-  service.py             # admission、生命周期、审批、恢复、取消
-  api.py / extension.py  # 宿主认证路由与插件入口
-  demo.py / doctor.py    # 本地演示 / 无网络配置检查
-frontend/src/components/deepresearch/workbench.tsx
-frontend/src/core/deepresearch/{api,types}.ts
-frontend/src/app/{workspace/deepresearch,deepresearch-demo}/page.tsx
-examples/deepresearch/   # 配置片段、通用 Skills、扩展示例
-```
-
-## 5. 扩展和交接
-
-[本地 Skill 扩展](docs/deepresearch/EXTENDING.md) · [运行时与接口细节](docs/deepresearch/RUNTIME.md) · [给本地 Agent 的交接指令](docs/deepresearch/LOCAL_AGENT_HANDOFF.md)
-
-单个新研究角度通常只需：新增 SKILL.md → 注册 skill/agent → 配置工具和输出契约。无需修改 Graph、Evidence ID、引用算法或前端分支。
+原生子 Agent 的能力不等于全部 Lead 能力。Lead 记忆写入、聊天历史、上传管理没有被暗中移植。原始文档日期、发布方独立性和语义支持由研究内容评审，代码仅确认执行来源和结构覆盖。真实业务验收清单见交接文档。

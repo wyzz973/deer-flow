@@ -14,8 +14,9 @@ from deepresearch.service import ResearchService
 async def settle(service, run_id):
     for _ in range(1000):
         task = service.tasks.get(run_id)
-        if task is None: return await service.store.get(run_id)
-        await asyncio.sleep(.01)
+        if task is None:
+            return await service.store.get(run_id)
+        await asyncio.sleep(0.01)
     raise AssertionError("workflow did not settle")
 
 
@@ -33,7 +34,8 @@ async def test_review_edit_approve_persistence_and_secret_exclusion(settings):
         await service.decision(run["run_id"], 1, "edit", updated)
         run = await settle(service, run["run_id"])
         assert run["status"] == "AWAITING_PLAN_CONFIRMATION" and run["plan"]["plan_version"] == 2
-        with pytest.raises(ResearchError): await service.decision(run["run_id"], 1, "approve")
+        with pytest.raises(ResearchError):
+            await service.decision(run["run_id"], 1, "approve")
         await service.decision(run["run_id"], 2, "approve")
         run = await settle(service, run["run_id"])
         assert run["status"] == "COMPLETED", run["error"]
@@ -48,20 +50,25 @@ async def test_review_edit_approve_persistence_and_secret_exclusion(settings):
         assert b"SECRET-MARKER-NEVER-PERSIST" not in path.read_bytes()
     again = ResearchService(settings)
     await again.start()
-    try: assert (await again.store.get(saved_id))["status"] == "COMPLETED"
-    finally: await again.stop()
+    try:
+        assert (await again.store.get(saved_id))["status"] == "COMPLETED"
+    finally:
+        await again.stop()
 
 
 @pytest.mark.asyncio
 async def test_retry_reuses_successful_sibling(settings):
     service = ResearchService(settings)
+
     class Flaky(DemoRunner):
         calls = {}
+
         async def research(self, run, unit, dependencies):
             self.calls[unit.id] = self.calls.get(unit.id, 0) + 1
             if unit.id == "R2" and self.calls[unit.id] == 1:
                 raise RuntimeError("SECRET-UPSTREAM-ERROR")
             return await super().research(run, unit, dependencies)
+
     runner = Flaky(settings, service.store)
     service.runner = runner
     await service.start()
@@ -76,7 +83,8 @@ async def test_retry_reuses_successful_sibling(settings):
         run = await settle(service, run["run_id"])
         assert run["status"] == "COMPLETED", run["error"]
         assert runner.calls == {"R1": 1, "R2": 2}
-    finally: await service.stop()
+    finally:
+        await service.stop()
 
 
 @pytest.mark.asyncio
@@ -92,19 +100,23 @@ async def test_restart_awaiting_plan_and_cancel(settings):
         assert (await service.store.get(run["run_id"]))["status"] == "AWAITING_PLAN_CONFIRMATION"
         await service.cancel(run["run_id"])
         assert (await service.store.get(run["run_id"]))["status"] == "CANCELLED"
-        with pytest.raises(ResearchError): await service.retry(run["run_id"])
-    finally: await service.stop()
+        with pytest.raises(ResearchError):
+            await service.retry(run["run_id"])
+    finally:
+        await service.stop()
 
 
 @pytest.mark.asyncio
 async def test_gap_stops_without_fabricated_report(settings):
     service = ResearchService(settings)
+
     class Missing(DemoRunner):
         async def research(self, run, unit, dependencies):
             value = await super().research(run, unit, dependencies)
             value.raw_evidences = [e for e in value.raw_evidences if e.origin == "internal"]
             value.findings[0].raw_evidence_refs = [e.raw_id for e in value.raw_evidences]
             return value
+
     service.runner = Missing(settings, service.store)
     await service.start()
     try:
@@ -114,4 +126,5 @@ async def test_gap_stops_without_fabricated_report(settings):
         run = await settle(service, run["run_id"])
         assert run["status"] == "FAILED" and run["error"]["code"] == "RESEARCH_GAPS"
         assert run["report"] is None and run["iteration"] <= 2
-    finally: await service.stop()
+    finally:
+        await service.stop()

@@ -69,6 +69,12 @@ More specific `AGENTS.md` files under `src/` contain the frontend sections split
 
 ## Code Style
 
+The DeepResearch workbench exposes a local trace panel. Fetch trace payloads on
+expansion with the forward cursor, and key the panel by run ID so responses
+from a previous selection cannot populate another run's trace. Keep export
+requests on the authenticated research API; do not put trace payloads in
+localStorage or send them to a telemetry service.
+
 - **Imports**: Enforced ordering (builtin → external → internal → parent → sibling), alphabetized, newlines between groups. Use inline type imports: `import { type Foo }`.
 - **Unused variables**: Prefix with `_`.
 - **Class names**: Use `cn()` from `@/lib/utils` for conditional Tailwind classes.

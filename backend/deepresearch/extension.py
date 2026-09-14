@@ -1,4 +1,5 @@
 """Opt-in DeerFlow extension. Normal chat and global tool configuration are untouched."""
+
 from deerflow_extension_api import extension
 
 from .api import build_router

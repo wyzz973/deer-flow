@@ -2,6 +2,11 @@
 
 ## Project Overview
 
+DeepResearch is an opt-in extension under `deepresearch/`. Its workflow delegates
+roles to the native subagent executor rather than assembling a parallel runtime.
+See [deepresearch/AGENTS.md](deepresearch/AGENTS.md) for MCP compatibility,
+plain-chat output conversion, local tracing and credential boundaries.
+
 DeerFlow is a LangGraph-based AI super agent system with a full-stack architecture. The backend provides a "super agent" with sandbox execution, persistent memory, subagent delegation, and extensible tool integration - all operating in per-thread isolated environments.
 
 **Architecture**:

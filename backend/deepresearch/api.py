@@ -1,22 +1,22 @@
 """Authenticated HTTP API with durable, cursor-based SSE replay."""
+
 from __future__ import annotations
 
 import asyncio
 import importlib
 import inspect
-import json
 import ipaddress
+import json
 from typing import Literal
-from urllib.parse import urlsplit
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import Response, StreamingResponse
 
-from .contracts import CreateResearch, PlanDecision, PlanEdit, ResearchError, TERMINAL
+from .contracts import TERMINAL, CreateResearch, PlanDecision, PlanEdit, ResearchError
 
 
-def build_router(service, *, local_demo=False):
+def build_router(service, *, local_demo=False, demo_origins=None):
     router = APIRouter(prefix="/api/deepresearch", tags=["deepresearch"])
 
     async def principal(request: Request):
@@ -28,13 +28,20 @@ def build_router(service, *, local_demo=False):
             if not local or request.url.hostname not in {"127.0.0.1", "localhost", "::1"}:
                 raise HTTPException(403, "Standalone demo is loopback-only")
             origin = request.headers.get("origin")
-            if origin and origin not in {"http://localhost:3000", "http://127.0.0.1:3000", str(request.base_url).rstrip("/")}:
+            allowed_origins = set(demo_origins or ["http://localhost:3000", "http://127.0.0.1:3000"])
+            allowed_origins.add(str(request.base_url).rstrip("/"))
+            if origin and origin not in allowed_origins:
                 raise HTTPException(403, "Origin denied")
             return "local-demo"
         from deerflow_extension_api import resolve_principal
+
         user = resolve_principal(request)
         if user is None:
             raise HTTPException(401, "Authentication required")
+        request.state.research_identity = {
+            "user_role": "admin" if getattr(user, "is_admin", False) else next(iter(getattr(user, "roles", ())), "user"),
+            "is_internal": getattr(user, "is_internal", False),
+        }
         return str(user.user_id)
 
     async def can_read(request, run):
@@ -58,7 +65,7 @@ def build_router(service, *, local_demo=False):
 
     def secrets(request):
         # Explicit headers only; never forward the browser's host session cookie by default.
-        return {key: request.headers[header] for header, key in service.settings.request_secret_headers.items() if request.headers.get(header)}
+        return {"secrets": {key: request.headers[header] for header, key in service.settings.request_secret_headers.items() if request.headers.get(header)}, "identity": getattr(request.state, "research_identity", {})}
 
     def public(run, report=True):
         body = {k: v for k, v in run.items() if k not in {"owner", "fingerprint"}}
@@ -76,10 +83,13 @@ def build_router(service, *, local_demo=False):
 
     @router.get("/capabilities")
     async def capabilities(owner=Depends(principal)):
-        return {"mode": service.settings.runner, "ready": service.graph is not None,
-                "skills": {k: {"description": v.description, "agent": v.agent} for k, v in service.settings.skills.items()},
-                "sources": [{"name": s.name, "origin": s.origin, "level": s.level} for s in service.settings.sources],
-                "budget_ceiling": service.settings.budget_ceiling.model_dump()}
+        return {
+            "mode": service.settings.runner,
+            "ready": service.graph is not None,
+            "skills": {k: {"description": v.description, "agent": v.agent} for k, v in service.settings.skills.items()},
+            "sources": [{"name": s.name, "origin": s.origin, "level": s.level} for s in service.settings.sources],
+            "budget_ceiling": service.settings.budget_ceiling.model_dump(),
+        }
 
     @router.post("", status_code=202)
     async def create(body: CreateResearch, request: Request, owner=Depends(principal), idempotency_key: str | None = Header(default=None)):
@@ -127,6 +137,7 @@ def build_router(service, *, local_demo=False):
             cursor = max(after, int(last_event_id or 0))
         except ValueError:
             raise HTTPException(422, "Invalid Last-Event-ID") from None
+
         async def stream():
             nonlocal cursor
             ticks = 0
@@ -135,7 +146,7 @@ def build_router(service, *, local_demo=False):
                 batch = await service.store.events(run["run_id"], cursor)
                 for item in batch:
                     cursor = item["seq"]
-                    yield f'id: {cursor}\nevent: message\ndata: {json.dumps(item, ensure_ascii=False)}\n\n'
+                    yield f"id: {cursor}\nevent: message\ndata: {json.dumps(item, ensure_ascii=False)}\n\n"
                 if len(batch) == 200:
                     continue
                 if current["status"] in TERMINAL and run["run_id"] not in service.tasks:
@@ -148,12 +159,33 @@ def build_router(service, *, local_demo=False):
                 if ticks % 20 == 0:
                     yield ": heartbeat\n\n"
                 await asyncio.sleep(0.5)
+
         return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 
     @router.get("/{run_id}/evidences")
     async def evidences(run=Depends(owned)):
         snapshot = await service.graph.aget_state(service.config(run))
         return {"evidences": list(snapshot.values.get("evidence_pool", {}).values()), "lineage": snapshot.values.get("lineage", {})}
+
+    @router.get("/{run_id}/trace")
+    async def trace(after: int = Query(default=0, ge=0), limit: int = Query(default=100, ge=1, le=200), run=Depends(owned)):
+        items = await service.store.trace_events(run["run_id"], after, limit)
+        return {"trace_id": run["run_id"], "items": items, "next_cursor": items[-1]["seq"] if items else after}
+
+    @router.get("/{run_id}/trace/export")
+    async def export_trace(request: Request, run=Depends(owned)):
+        async def stream():
+            cursor = 0
+            while True:
+                await owned(run["run_id"], request, run["owner"])
+                items = await service.store.trace_events(run["run_id"], cursor, 200)
+                if not items:
+                    return
+                for item in items:
+                    yield json.dumps(item, ensure_ascii=False) + "\n"
+                cursor = items[-1]["seq"]
+
+        return StreamingResponse(stream(), media_type="application/x-ndjson", headers={"Content-Disposition": f'attachment; filename="research-{run["run_id"]}-trace.jsonl"', "Cache-Control": "no-store"})
 
     @router.get("/{run_id}/report")
     async def report(format: Literal["json", "md", "html", "docx"] = "json", run=Depends(owned)):
@@ -164,11 +196,14 @@ def build_router(service, *, local_demo=False):
             return value
         if format == "docx":
             from .render import docx_report
+
             data = await asyncio.to_thread(docx_report, value)
             media = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         else:
             data = value["markdown" if format == "md" else "html"]
             media = "text/markdown" if format == "md" else "text/html"
-        return Response(data, media_type=media, headers={"Content-Disposition": f'attachment; filename="research-{run["run_id"]}.{format}"', "Cache-Control": "no-store", "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'"})
+        return Response(
+            data, media_type=media, headers={"Content-Disposition": f'attachment; filename="research-{run["run_id"]}.{format}"', "Cache-Control": "no-store", "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'"}
+        )
 
     return router

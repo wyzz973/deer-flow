@@ -1,12 +1,11 @@
-import json
 from io import BytesIO
 
 import pytest
 from pydantic import ValidationError
 
 from deepresearch.contracts import ResearchPlan, ResearchUnit, StructuredReport, safe_http_url
-from deepresearch.evidence import canonical_url, merge_results, normalize_mcp, ordered_sources
-from deepresearch.render import bind_citations, markdown, html_report, docx_report, citation_metadata
+from deepresearch.evidence import canonical_url, merge_results, ordered_sources
+from deepresearch.render import bind_citations, citation_metadata, docx_report, html_report, markdown
 from deepresearch.validators import research_gaps, supplemental_units, validate_report
 
 
@@ -26,7 +25,8 @@ def test_plan_dag_and_unique_ids(plan):
 
 @pytest.mark.parametrize("url", ["javascript:alert(1)", "file:///etc/passwd", "https://user:pass@example.org", "https://example.org/\nsecret", "https://example.org:notaport/path"])
 def test_url_deny(url):
-    with pytest.raises(ValueError): safe_http_url(url)
+    with pytest.raises(ValueError):
+        safe_http_url(url)
 
 
 def test_canonical_url_preserves_business_parameters():
@@ -46,15 +46,6 @@ def test_merge_replay_lineage_and_distinct_origins(result):
     merged, _, _ = merge_results([result, second], pool)
     assert len(merged) == 2
     assert all(e["unit_ids"] == ["R1", "R2"] for e in merged.values())
-
-
-def test_normalization_rejects_unverifiable_rows(settings):
-    raw = {"results": [{"title": "valid", "url": "https://example.com", "snippet": "evidence", "published_at": "not-a-date"},
-                       {"title": "unsafe", "url": "javascript:alert(1)", "snippet": "bad"}, {"title": "empty"}]}
-    parsed = normalize_mcp([{"type": "text", "text": json.dumps(raw)}], settings.sources[1], limit=12)
-    assert len(parsed) == 1 and parsed[0].published_at is None
-    assert parsed[0].origin == "external"
-    assert parsed[0].publisher == settings.sources[1].publisher
 
 
 def test_source_priority_injected_file_fallback(settings, plan, tmp_path):
@@ -82,7 +73,8 @@ def test_reference_binding_first_appearance_and_render(result, plan):
     assert one.count("[1](#ref-1)") == 3
     assert "id=1" in one and "utm_source=x" in one  # Export the original locator, not a rewritten signed URL.
     assert all("utm_source" not in (e["canonical_url"] or "") for e in pool.values())
-    with pytest.raises(ValueError): bind_citations(make_report(["E999"]), pool)
+    with pytest.raises(ValueError):
+        bind_citations(make_report(["E999"]), pool)
 
 
 def test_html_escapes_model_and_source_text(result):
@@ -116,6 +108,7 @@ def test_dual_source_and_high_risk_gap(result, plan):
 
 def test_docx_uses_same_ast(result):
     from docx import Document
+
     pool, _, _ = merge_results([result])
     report = make_report(["E001"])
     value = {"report": report.model_dump(), "citation_map": {"E001": 1}, "citations": citation_metadata({"E001": 1}, pool), "demo": True, "limitations": []}

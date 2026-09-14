@@ -1,27 +1,48 @@
-# 验证记录
+# 验收记录（2026-09-14）
 
-## 本地工具环境已实际执行
+## 本地已执行
 
-- Python `pytest tests/deepresearch -q`：**20 passed，1 skipped**。
-- `python -m compileall -q backend/deepresearch`：通过。
-- 随附 7 个 TypeScript/TSX 文件通过 TypeScript `transpileModule` 语法检查，0 个语法诊断。**这不等于完整 `tsc --noEmit` 类型检查或浏览器验收**。
-- 已运行范围：Pydantic/DAG、URL 处理、MCP 结果映射、来源优先级、证据/lineage、引用顺序、HTML 转义、DOCX 内容、SQLite 幂等和并发预算、owner/Origin 权限、实时 ACL 撤销后历史列表隐藏、真实研究适配器的双源调度与成功缓存（transport/LLM 使用测试替身）。
-- skipped 是整个 LangGraph 工作流集成测试模块，当前执行环境未安装 LangGraph/checkpointer，也不能通过 pip 获取其依赖。**不把这些集成用例计作通过。**
+| 范围 | 命令/方式 | 结果 |
+|---|---|---|
+| 研究 + 原生子 Agent 回归 | `uv run --no-sync --with python-docx python -m pytest ../tests/deepresearch tests/test_subagent_executor.py -q`，backend/ | 177 passed |
+| 干净依赖环境 | `uv run --isolated --no-project --with-requirements backend/deepresearch/requirements.txt python -m pytest tests/deepresearch -q`，根目录 | 36 passed |
+| Python 规范 | Ruff check + format --check，研究模块/测试/原生 executor | 通过 |
+| 前端类型 | `python scripts/pnpm.py typecheck` | 通过 |
+| 完整前端检查 | `python scripts/pnpm.py check`（全量 ESLint + TypeScript） | 通过 |
+| 浏览器 | Playwright，演示页与 `/workspace/deepresearch` 全流程、移动端 | 4 passed |
 
-## 仓库已提供、需要完整依赖环境执行
+浏览器命令（backend/）：
 
-- LangGraph：计划中断/编辑/批准、持久化与重启、失败单元恢复、缺口停止、凭据不持久化。
-- 前端：完整 TypeScript 检查和真实浏览器计划编辑→报告→引用→下载→刷新恢复。
-- CI 工作流 `.github/workflows/deepresearch.yml` 安装依赖后执行以上检查。应以 GitHub Actions 对相应提交的实际运行状态为准；本文件不预先宣称 CI 已通过。
+```sh
+DEEPRESEARCH_E2E_FRONTEND_PORT=3100 uv run --no-sync --with python-docx python ../scripts/pnpm.py exec playwright test -c playwright.deepresearch.config.ts
+```
 
-## 不能在无授权数据环境中证明
+浏览器验证了创建、计划编辑/版本确认、研究完成、引用 Sheet、Markdown 下载、刷新恢复、Trace 分页/JSONL 导出、工作区侧栏入口、移动端 SidebarTrigger、页面及引用卡片无横向溢出。
 
-真实内部 MCP 的认证、具体工具返回格式、内部 ACL 撤销、实际模型结构化输出能力、Semantic Citation Accuracy、真实负载与多租户生产稳定性。需要在你的本地授权环境验收；没有用演示来源或猜测的评测数值替代这些结果。
+采用宿主现有的开发免登录模式和合成研究后端，数据在独立的 `.deerflow/deepresearch/e2e`。3000 上的 New API 服务未停止/修改。该测试不是企业 SSO 或真实业务模型验收。后端 owner、Origin、ACL、Trace 导出权限由单元/API 测试覆盖。
 
-## GitHub 状态
+## 关键回归证据
 
-新分支 `feat/deepresearch-v1-fullstack-20260914` 已创建。批量源码写入被工具安全检查拦截，未产生代码提交，未执行 GitHub Actions。上述 CI 文件已包含在源码包中，但不能据此声称 CI 通过。
+- 原始工具对象、非 query 参数 schema、纯文本/任意对象/内容块原样到研究执行器。
+- 研究开始前没有固定预搜索；执行完成后才从原生消息和 receipts 建立引用。
+- 已完成原生执行缓存可供格式修复复用，不重放单个有副作用工具。
+- 宿主缓存选工具时核对真实 server metadata，不接受同名的其他服务。
+- 未知引用被拒绝；opaque 调用不依赖日期字段；Agent 未解决问题进入补研。
+- 原生 executor 收到身份、独立线程范围、请求级凭据和本地 callbacks；凭据不进入配置/消息，执行后清理。
+- Trace 内容长度不会截断研究答案；归档忽略可能携带 header 的 provider metadata。
+- 本地 Trace 父子 span、错误、分页和重启后读取，敏感字段/已知凭据脱敏。
 
-## 交付补丁检查
+## 视觉检查
 
-补丁对修改前 `.gitignore` 的 Git blob SHA 已与 GitHub 基线核对一致；在仅含原 `.gitignore` 的本地最小 Git 基线中执行 `git apply --check` 与实际应用，全部源码文件逐字节一致。此检查验证补丁格式和文件内容，不代表已对你当前本地的全部改动做冲突检查。
+以下图片来自合成环境的真实浏览器截图，已经查看。宿主其他模块的占位加载状态来自演示后端没有实现那些 API，不代表完整宿主数据验收。
+
+![Workspace desktop](assets/workspace-desktop.png)
+![Workspace mobile](assets/workspace-mobile.png)
+
+## 不宣称完成的外部验证
+
+公司的实际模型、MCP 认证/返回、企业 ACL 撤销、语义支持度、真实负载与多实例生产稳定性。请按 HANDOFF.md 在公司环境验证。历史 20/40/181 等测试数量属于先前迭代，不应覆盖本记录。
+
+远端 CI 必须看最终推送提交对应的 GitHub Actions，不能把此前分支上的成功运行算到新代码。
+
+正式依赖：`uv sync --locked` 已成功安装声明在 backend/pyproject.toml 与 uv.lock 的 python-docx。原生文件/沙箱调用也可作为 runtime 类型证据被引用，但不会冒充 internal/external MCP 来源通过覆盖检查。

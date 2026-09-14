@@ -1,8 +1,9 @@
 """Explicit LangGraph control flow. Side effects before interrupts are avoided."""
+
 from __future__ import annotations
 
 import asyncio
-from typing import Any, TypedDict
+from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
@@ -10,6 +11,7 @@ from langgraph.types import interrupt
 from .contracts import ResearchError, ResearchPlan, ResearchResult, ResearchUnit, StructuredReport
 from .evidence import digest, merge_results
 from .render import bind_citations, citation_metadata, html_report, markdown
+from .trace import LocalTrace
 from .validators import research_gaps, supplemental_units, validate_report
 
 
@@ -77,6 +79,7 @@ def build_workflow(settings, store, runner, checkpointer):
             if cached is not None:
                 results[unit.id] = cached
         semaphore = asyncio.Semaphore(settings.max_concurrency)
+
         async def execute(unit):
             async with semaphore:
                 await store.event(run["run_id"], "research.unit.started", {"unit_id": unit.id, "skill_name": unit.skill})
@@ -96,6 +99,7 @@ def build_workflow(settings, store, runner, checkpointer):
                 except Exception:
                     await store.mutate(run["run_id"], lambda r: r["unit_statuses"].update({unit.id: "FAILED"}))
                     raise
+
         pending = [u for u in units if u.id not in results]
         while pending:
             ready = sorted([u for u in pending if set(u.depends_on).issubset(results)], key=lambda u: (u.priority, u.id))
@@ -126,7 +130,7 @@ def build_workflow(settings, store, runner, checkpointer):
     async def validator(s):
         await stage(s, "VALIDATING")
         plan = ResearchPlan.model_validate(s["plan"])
-        gaps = research_gaps(plan, s["units"], s["findings"], s["evidence_pool"])
+        gaps = research_gaps(plan, s["units"], s["findings"], s["evidence_pool"], s["results"])
         run_id = s["run"]["run_id"]
         await store.save_pool(run_id, s["evidence_pool"], gaps)
         await store.patch(run_id, gaps=gaps)
@@ -147,8 +151,7 @@ def build_workflow(settings, store, runner, checkpointer):
 
     async def supplement(s):
         iteration = s.get("iteration", 0) + 1
-        extra = supplemental_units(ResearchPlan.model_validate(s["plan"]), s["gaps"], iteration,
-                                   s["run"]["budget"]["max_units"] - len(s["units"]))
+        extra = supplemental_units(ResearchPlan.model_validate(s["plan"]), s["gaps"], iteration, s["run"]["budget"]["max_units"] - len(s["units"]))
         if not extra:
             raise ResearchError("UNIT_BUDGET", "没有可用的补研单元预算", recoverable=False)
         await store.patch(s["run"]["run_id"], iteration=iteration, units=s["units"] + extra)
@@ -158,8 +161,7 @@ def build_workflow(settings, store, runner, checkpointer):
         await stage(s, "SYNTHESIZING", "report.synthesizing")
         key = "synthesis:" + digest([s["plan"], s["findings"], s.get("final_errors", []), s.get("synthesis_repairs", 0)])
         cached = await store.cached(s["run"]["run_id"], key)
-        report = StructuredReport.model_validate(cached) if cached else await runner.synthesize(
-            s["run"], ResearchPlan.model_validate(s["plan"]), s["findings"], s["evidence_pool"], s.get("final_errors", []))
+        report = StructuredReport.model_validate(cached) if cached else await runner.synthesize(s["run"], ResearchPlan.model_validate(s["plan"]), s["findings"], s["evidence_pool"], s.get("final_errors", []))
         await store.cache(s["run"]["run_id"], key, report.model_dump(mode="json"))
         return {"structured_report": report.model_dump(mode="json")}
 
@@ -184,20 +186,52 @@ def build_workflow(settings, store, runner, checkpointer):
         await stage(s, "RENDERING")
         report, pool, mapping = StructuredReport.model_validate(s["structured_report"]), s["evidence_pool"], s["citation_map"]
         limited, demo = s.get("limitations", []), settings.runner == "demo"
+        if any(e.get("provenance") == "tool_output" for e in pool.values()):
+            limited = [*limited, "引用关联原生工具调用记录；代码未验证原文发布日期、发布方独立性或语义支持度，相关判断来自研究 Agent，重要结论需内容复核。"]
         text = markdown(report, mapping, pool, limited, demo)
-        body = {"version": 1 + s.get("synthesis_repairs", 0), "report": report.model_dump(mode="json"), "markdown": text,
-                "html": html_report(report, mapping, pool, limited, demo), "citations": citation_metadata(mapping, pool),
-                "citation_map": mapping, "limitations": limited, "demo": demo}
+        body = {
+            "version": 1 + s.get("synthesis_repairs", 0),
+            "report": report.model_dump(mode="json"),
+            "markdown": text,
+            "html": html_report(report, mapping, pool, limited, demo),
+            "citations": citation_metadata(mapping, pool),
+            "citation_map": mapping,
+            "limitations": limited,
+            "demo": demo,
+        }
         await store.save_report(s["run"]["run_id"], body["version"], body)
         await store.patch(s["run"]["run_id"], report=body, status="COMPLETED")
         await store.event(s["run"]["run_id"], "report.completed", {"version": body["version"], "limitations": limited}, key="report-completed")
         return {"rendered_report": text, "status": "COMPLETED"}
 
+    def traced(name, node):
+        async def invoke(state):
+            from langgraph.runtime import get_runtime
+
+            context = get_runtime().context or {}
+            trace = LocalTrace(store, state["run"]["run_id"], settings, (context.get("secrets") or {}).values())
+            async with trace.span(name, "node", {k: v for k, v in state.items() if k != "run"}) as output:
+                result = await node(state)
+                output.update(result)
+                return result
+
+        return invoke
+
     graph = StateGraph(ResearchState, context_schema=dict)
-    for name, node in [("planner", planner), ("plan_review", review), ("rejected", rejected), ("dispatch", dispatch),
-                       ("evidence_merge", merge), ("validator", validator), ("supplement", supplement),
-                       ("synthesis", synthesis), ("citation_binder", binder), ("final_validator", final_validate), ("renderer", render)]:
-        graph.add_node(name, node)
+    for name, node in [
+        ("planner", planner),
+        ("plan_review", review),
+        ("rejected", rejected),
+        ("dispatch", dispatch),
+        ("evidence_merge", merge),
+        ("validator", validator),
+        ("supplement", supplement),
+        ("synthesis", synthesis),
+        ("citation_binder", binder),
+        ("final_validator", final_validate),
+        ("renderer", render),
+    ]:
+        graph.add_node(name, traced(name, node))
     graph.add_edge(START, "planner")
     graph.add_edge("planner", "plan_review")
     graph.add_conditional_edges("plan_review", lambda s: s["decision"]["action"], {"edit": "planner", "approve": "dispatch", "reject": "rejected"})

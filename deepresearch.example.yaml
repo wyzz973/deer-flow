@@ -1,5 +1,11 @@
 # Explicit synthetic demo. Never silently used when the real adapter fails.
 runner: demo
+# Real execution uses DeerFlow's native SubagentExecutor (runner: deerflow).
+output_retries: 2
+extraction_model: null
+native_tools: null  # Inherit host candidates; Agent/Skill authorization still applies.
+trace_capture_content: true
+trace_max_chars: 16000
 data_dir: .deerflow/deepresearch
 skills:
   deepresearch:
@@ -26,13 +32,6 @@ sources:
     level: L1
     publisher: your-organization
     priority: 10
-    results_path: results
-    fields:
-      title: title
-      url: url
-      source_uri: document_id
-      snippet: snippet
-      published_at: published_at
   - name: external-web
     origin: external
     server: your-external-mcp
@@ -40,12 +39,6 @@ sources:
     level: L4
     publisher: external-search-unclassified
     priority: 20
-    results_path: results
-    fields:
-      title: title
-      url: url
-      snippet: snippet
-      published_at: published_at
 source_fallback: [internal-kb, external-web]
 max_concurrency: 3
 max_active_runs: 8

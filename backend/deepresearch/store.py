@@ -3,13 +3,14 @@
 Success caches are durable independently of LangGraph checkpoints. A remote call
 that succeeds immediately before process death is still at-least-once, not exactly-once.
 """
+
 from __future__ import annotations
 
 import asyncio
 import json
 import sqlite3
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 from .contracts import ResearchError, utcnow
 
@@ -42,8 +43,9 @@ class Store:
 
     async def start(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
+
         def init(db):
-            db.executescript('''
+            db.executescript("""
             CREATE TABLE IF NOT EXISTS research_run (
               id TEXT PRIMARY KEY, owner TEXT NOT NULL, request_key TEXT NOT NULL,
               request_hash TEXT NOT NULL, body TEXT NOT NULL,
@@ -67,7 +69,8 @@ class Store:
               run_id TEXT NOT NULL REFERENCES research_run(id), key TEXT NOT NULL,
               body TEXT NOT NULL, PRIMARY KEY(run_id,key));
             PRAGMA user_version=1;
-            ''')
+            """)
+
         await self.call(init)
 
     async def create(self, run, key, request_hash):
@@ -79,12 +82,14 @@ class Store:
                 return json.loads(old["body"]), False
             db.execute("INSERT INTO research_run VALUES (?,?,?,?,?)", (run["run_id"], run["owner"], key, request_hash, dumps(run)))
             return run, True
+
         return await self.call(op)
 
     async def get(self, run_id):
         def op(db):
             row = db.execute("SELECT body FROM research_run WHERE id=?", (run_id,)).fetchone()
             return json.loads(row[0]) if row else None
+
         return await self.call(op)
 
     async def list(self, owner=None, limit=50):
@@ -94,6 +99,7 @@ class Store:
             else:
                 rows = db.execute("SELECT body FROM research_run WHERE owner=? ORDER BY rowid DESC LIMIT ?", (owner, limit)).fetchall()
             return [json.loads(row[0]) for row in rows]
+
         return await self.call(op)
 
     async def mutate(self, run_id, fn):
@@ -106,6 +112,7 @@ class Store:
             run["updated_at"] = utcnow()
             db.execute("UPDATE research_run SET body=? WHERE id=?", (dumps(run), run_id))
             return run
+
         return await self.call(op)
 
     async def patch(self, run_id, **values):
@@ -117,6 +124,7 @@ class Store:
                 if run["usage"][key] + delta > run["budget"][maximum]:
                     raise ResearchError("BUDGET_EXHAUSTED", f"预算已用尽: {maximum}", recoverable=False)
                 run["usage"][key] += delta
+
         return await self.mutate(run_id, change)
 
     async def event(self, run_id, kind, data=None, key=None):
@@ -129,17 +137,22 @@ class Store:
             event = {"seq": seq, "type": kind, "run_id": run_id, "at": utcnow(), "data": data or {}}
             db.execute("INSERT INTO research_event VALUES (?,?,?,?)", (run_id, seq, key or f"event-{seq}", dumps(event)))
             return event
+
         return await self.call(op)
 
     async def events(self, run_id, after=0, limit=200):
-        return await self.call(lambda db: [json.loads(row[0]) for row in db.execute(
-            "SELECT body FROM research_event WHERE run_id=? AND seq>? ORDER BY seq LIMIT ?", (run_id, after, limit))])
+        return await self.call(lambda db: [json.loads(row[0]) for row in db.execute("SELECT body FROM research_event WHERE run_id=? AND seq>? ORDER BY seq LIMIT ?", (run_id, after, limit))])
 
     async def cached(self, run_id, key):
         def op(db):
             row = db.execute("SELECT body FROM research_cache WHERE run_id=? AND key=?", (run_id, key)).fetchone()
             return json.loads(row[0]) if row else None
+
         return await self.call(op)
+
+    async def trace_events(self, run_id, after=0, limit=100):
+        """Page trace records in SQL, not after limiting the mixed event stream."""
+        return await self.call(lambda db: [json.loads(row[0]) for row in db.execute("SELECT body FROM research_event WHERE run_id=? AND seq>? AND json_extract(body, '$.type') LIKE 'trace.%' ORDER BY seq LIMIT ?", (run_id, after, limit))])
 
     async def cache(self, run_id, key, body):
         await self.call(lambda db: db.execute("INSERT OR IGNORE INTO research_cache VALUES (?,?,?)", (run_id, key, dumps(body))).rowcount)
@@ -150,6 +163,7 @@ class Store:
             if row and row[0] != input_hash:
                 raise ResearchError("UNIT_CHANGED", "已执行单元的输入发生变化，需创建新任务", recoverable=False)
             return json.loads(row[1]) if row else None
+
         return await self.call(op)
 
     async def save_unit(self, run_id, unit_id, input_hash, result):
@@ -161,6 +175,7 @@ class Store:
                 db.execute("INSERT OR REPLACE INTO research_evidence VALUES (?,?,?)", (run_id, eid, dumps(evidence)))
             for gap in gaps:
                 db.execute("INSERT OR REPLACE INTO research_gap VALUES (?,?,?)", (run_id, gap["gap_id"], dumps(gap)))
+
         await self.call(op)
 
     async def save_report(self, run_id, version, body):
@@ -169,11 +184,13 @@ class Store:
 
 class ProcessLock:
     """Fail closed on accidental multiple workers sharing the same local runtime."""
+
     def __init__(self, path):
         self.path, self.file = path, None
 
     def acquire(self):
         import os
+
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if os.name != "nt":
             self.path.parent.chmod(0o700)
@@ -181,6 +198,7 @@ class ProcessLock:
         try:
             if os.name == "nt":
                 import msvcrt
+
                 self.file.seek(0)
                 self.file.write(b"0")
                 self.file.flush()
@@ -188,6 +206,7 @@ class ProcessLock:
                 msvcrt.locking(self.file.fileno(), msvcrt.LK_NBLCK, 1)
             else:
                 import fcntl
+
                 fcntl.flock(self.file, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             self.file.close()

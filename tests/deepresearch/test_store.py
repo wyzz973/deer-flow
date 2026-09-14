@@ -1,4 +1,5 @@
 import asyncio
+
 import pytest
 
 from deepresearch.contracts import ResearchError
@@ -13,7 +14,8 @@ async def test_idempotency_events_and_atomic_budget(tmp_path):
     one, created = await store.create(run, "key", "hash")
     two, duplicate = await store.create(run, "key", "hash")
     assert created and not duplicate and one == two
-    with pytest.raises(ResearchError): await store.create(run, "key", "different")
+    with pytest.raises(ResearchError):
+        await store.create(run, "key", "different")
     outcomes = await asyncio.gather(*(store.reserve("run1", tool_calls=1) for _ in range(5)), return_exceptions=True)
     assert sum(isinstance(x, ResearchError) for x in outcomes) == 3
     assert (await store.get("run1"))["usage"]["tool_calls"] == 2
@@ -26,13 +28,17 @@ async def test_idempotency_events_and_atomic_budget(tmp_path):
     assert await store.cached("run1", "tool") == []
     await store.save_unit("run1", "R1", "input1", {"success": True})
     assert await store.unit("run1", "R1", "input1") == {"success": True}
-    with pytest.raises(ResearchError): await store.unit("run1", "R1", "changed")
+    with pytest.raises(ResearchError):
+        await store.unit("run1", "R1", "changed")
 
 
 def test_single_process_guard(tmp_path):
     first, second = ProcessLock(tmp_path / "worker.lock"), ProcessLock(tmp_path / "worker.lock")
     first.acquire()
     try:
-        with pytest.raises(RuntimeError): second.acquire()
-    finally: first.release()
-    second.acquire(); second.release()
+        with pytest.raises(RuntimeError):
+            second.acquire()
+    finally:
+        first.release()
+    second.acquire()
+    second.release()
