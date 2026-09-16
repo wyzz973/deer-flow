@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### DeepResearch native workspace feature
 
+- Replace the form-based workbench with the shared native conversation surface, versioned plan cards, a server-owned 45-second countdown, pause-on-edit, and conversational follow-ups.
+- Add linked report/source views, recorded activity with domain chips, searchable local trace timelines, and version-specific report downloads.
+- Accept explicitly configured native web tools as research sources without requiring an MCP server; keep original MCP objects and all native authorization boundaries.
+- Add countdown/citation regressions, report rewrite and research-cycle tests, updated browser scenarios, and a computer-use acceptance record that distinguishes synthetic checks from live model connectivity.
 - Add DeepResearch to the existing workspace navigation, header and shared UI controls, including an accessible source Sheet and local trace export.
 - Delegate research roles to native DeerFlow subagents and use the host MCP cache, original tool schemas/results, credentials and middleware.
 - Remove query-only search wrappers and MCP business-result normalization. Build citation references from native messages and receipts after research.

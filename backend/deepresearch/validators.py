@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 
 from .contracts import ResearchGap, ResearchPlan, ResearchUnit, StructuredReport
 from .evidence import digest
+from .report_policy import report_character_limit, source_allowed
 
 
 def research_gaps(plan: ResearchPlan, units, findings, pool, results=()):
@@ -97,7 +98,14 @@ def validate_report(report: StructuredReport, plan, pool, limited=False):
             errors.append("事实段落必须有 evidence_ids")
         if not set(segment.evidence_ids).issubset(pool):
             errors.append("使用了不存在的 evidence_id")
-        if re.search(r"\[(?:\d+|E\d+)\]|https?://|<[^>]+>", segment.text):
-            errors.append("段落不得自带引用编号、URL 或 HTML；引用只能由 Binder 生成")
+        if any(not source_allowed(pool[eid], plan.source_policy) for eid in segment.evidence_ids if eid in pool):
+            errors.append("引用不符合计划中的来源范围或原文读取要求")
+        if re.search(r"\[(?:\d+|E\d+)\]|https?://", segment.text):
+            errors.append("段落不得自带引用编号或 URL；引用只能由 Binder 生成")
+        # Technical placeholders such as <name>_docsize are ordinary text.
+        # Renderers escape markup rather than confusing it with bad evidence.
+    limit = report_character_limit(plan.report_style)
+    if sum(len(segment.text) for segment in report.segments()) > limit:
+        errors.append(f"正文超过 {plan.report_style} 报告的 {limit} 字符上限；去重并压缩，不要删去关键证据或限制")
     # Coverage is structural, not proof that a segment answers the objective.
     return list(dict.fromkeys(errors))

@@ -11,6 +11,7 @@ from typing import Any
 
 from .contracts import RawEvidence
 from .evidence import digest
+from .sources import fetched_source, observed_sources
 
 
 @dataclass
@@ -47,10 +48,10 @@ def research_observations(execution: NativeExecution, sources):
         item = RawEvidence(
             raw_id=raw_id,
             title=f"{source.name if source else name} / {receipt.get('id', call_id)}",
-            source_uri=f"{'mcp-result' if source else 'tool-result'}://{execution.execution_id}/{raw_id}",
+            source_uri=f"{'mcp-result' if source and source.kind == 'mcp' else 'tool-result'}://{execution.execution_id}/{raw_id}",
             # Files, sandbox and other native tools can support findings too.
-            # Runtime provenance must not masquerade as a configured internal
-            # or external MCP source and satisfy that source's coverage gate.
+            # Only explicitly configured source tools carry an internal or
+            # external classification; unrelated host tools stay runtime-only.
             origin=source.origin if source else "runtime",
             source_name=source.name if source else "native-" + digest(name)[:16],
             source_level=source.level if source else "L4",
@@ -60,5 +61,43 @@ def research_observations(execution: NativeExecution, sources):
             raw_content_ref=f"execution:{execution.execution_id}:{call_id}",
         )
         evidence[raw_id] = item
+        fetched = fetched_source(message.get("artifact"), connector=source.name if source else name, origin=item.origin) if source and source.kind == "native" else None
+        if fetched:
+            document_id = "doc_" + digest([execution.execution_id, call_id, fetched["id"]])[:24]
+            document = item.model_copy(
+                update={"raw_id": document_id, "title": fetched["title"], "url": fetched["url"], "source_id": fetched["id"], "source_uri": None, "provenance": "fetched_document", "document_hash": fetched["document_hash"]}
+            )
+            evidence[document_id] = document
+            catalog.append({"raw_id": document_id, "receipt_id": receipt.get("id"), "tool_call_id": call_id, "tool_name": name, "origin": item.origin, "url": fetched["url"], "title": fetched["title"], "provenance": "fetched_document"})
+        for observed in observed_sources(text, connector=source.name if source else name, origin=item.origin):
+            if fetched and observed["canonical_url"] == fetched["canonical_url"]:
+                continue
+            document_id = "doc_" + digest([execution.execution_id, call_id, observed["id"]])[:24]
+            document = item.model_copy(update={"raw_id": document_id, "title": observed["title"], "url": observed["url"], "source_id": observed["id"], "source_uri": None, "snippet": observed["excerpt"], "provenance": "observed_source"})
+            evidence[document_id] = document
+            catalog.append({"raw_id": document_id, "receipt_id": receipt.get("id"), "tool_call_id": call_id, "tool_name": name, "origin": item.origin, "url": observed["url"], "title": observed["title"], "excerpt": observed["excerpt"]})
         catalog.append({"raw_id": raw_id, "receipt_id": receipt.get("id"), "tool_call_id": call_id, "tool_name": name, "origin": item.origin, "excerpt": item.snippet})
     return list(evidence.values()), catalog
+
+
+def ground_source_annotations(evidences, annotations):
+    """Accept source labels/excerpts only when present in the native result.
+
+    The model can interpret arbitrary result formats, but cannot invent a URL
+    or silently turn a paraphrase into an allegedly verbatim source excerpt.
+    """
+    by_id = {e.raw_id: e for e in evidences}
+    original = {e.raw_content_ref: e.snippet for e in evidences if e.provenance == "tool_output"}
+
+    def normalize(text):
+        return " ".join(text.split()).casefold()
+
+    for annotation in annotations:
+        evidence = by_id.get(annotation.raw_id)
+        if evidence is None or evidence.provenance not in {"observed_source", "fetched_document"}:
+            continue
+        body = normalize(original.get(evidence.raw_content_ref, ""))
+        if annotation.title.strip() and normalize(annotation.title) in body:
+            evidence.title = annotation.title.strip()
+        if annotation.quote.strip() and normalize(annotation.quote) in body:
+            evidence.snippet = annotation.quote.strip()

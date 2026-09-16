@@ -1,5 +1,8 @@
 "use client";
 
+import { usePathname } from "next/navigation";
+
+import { ResearchHistory } from "@/components/deepresearch/research-history";
 import {
   Sidebar,
   SidebarHeader,
@@ -20,6 +23,7 @@ export function WorkspaceSidebar({
   ...props
 }: React.ComponentProps<typeof Sidebar>) {
   const { open: isSidebarOpen } = useSidebar();
+  const researchScope = usePathname().startsWith("/workspace/deepresearch");
   return (
     <>
       <Sidebar variant="sidebar" collapsible="icon" {...props}>
@@ -32,7 +36,7 @@ export function WorkspaceSidebar({
           {isSidebarOpen && (
             <>
               <ProjectsSection />
-              <RecentChatList />
+              {researchScope ? <ResearchHistory /> : <RecentChatList />}
             </>
           )}
         </SidebarContent>

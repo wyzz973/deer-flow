@@ -58,6 +58,9 @@ class AioSandbox(Sandbox):
     #: so shell state (exports, cwd, functions) carries from one command into
     #: the next — recorded bash evidence cannot prove a clean environment.
     persistent_shell_sessions = True
+    # A directory listing is bounded read-only work, not a long-running bash
+    # job. Bound server execution and HTTP waiting independently.
+    _LIST_DIR_TIMEOUT = 30
 
     def __init__(
         self,
@@ -577,8 +580,10 @@ class AioSandbox(Sandbox):
         with self._lock:
             try:
                 result = self._client.shell.exec_command(
-                    command=remote_list_dir_command(resolved, max_depth),
-                    no_change_timeout=self._DEFAULT_NO_CHANGE_TIMEOUT,
+                    command=remote_list_dir_command(resolved, max_depth, isolate=True),
+                    no_change_timeout=self._LIST_DIR_TIMEOUT,
+                    hard_timeout=self._LIST_DIR_TIMEOUT,
+                    request_options={"timeout_in_seconds": self._LIST_DIR_TIMEOUT + 5},
                 )
             except Exception as e:
                 logger.error(f"Failed to list directory in sandbox: {e}")

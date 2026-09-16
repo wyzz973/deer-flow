@@ -87,6 +87,28 @@ def error_details(error):
     return data
 
 
+def provider_failure(error):
+    """Classify provider status without exposing its free-form response body."""
+    from .contracts import ResearchError
+
+    status = getattr(error, "status_code", None)
+    if not isinstance(status, int) or isinstance(status, bool):
+        return None
+    known = {
+        401: ("MODEL_AUTH_REQUIRED", "模型服务鉴权失败，请检查配置的 API 凭据"),
+        403: ("MODEL_ACCESS_DENIED", "模型服务拒绝访问，请检查账户权限与模型配置"),
+        402: ("MODEL_BILLING_REQUIRED", "模型服务要求处理余额或计费状态，请检查 API 账户"),
+        429: ("MODEL_RATE_LIMIT", "模型服务限流，请稍后从检查点重试"),
+        408: ("MODEL_TIMEOUT", "模型服务请求超时，可从检查点重试"),
+        504: ("MODEL_TIMEOUT", "模型服务请求超时，可从检查点重试"),
+    }
+    if status in known:
+        return ResearchError(*known[status])
+    if isinstance(status, int) and status >= 500:
+        return ResearchError("MODEL_UNAVAILABLE", "模型服务暂时不可用，可从检查点重试")
+    return None
+
+
 class LocalTrace:
     def __init__(self, store, run_id, settings, secrets=()):
         self.store, self.run_id, self.settings = store, run_id, settings
@@ -106,6 +128,10 @@ class LocalTrace:
 
     @asynccontextmanager
     async def span(self, name, kind, payload=None):
+        if kind == "workflow":
+            # Recovery keeps old attempts visible while explicitly terminating
+            # callback spans whose parent already reached a terminal state.
+            await self.store.reconcile_trace(self.run_id)
         span_id, parent_id = str(uuid4()), _parent.get()
         started = time.monotonic()
         await self.write("started", span_id, parent_id, name, kind, payload=payload)
@@ -134,17 +160,24 @@ class LocalTrace:
             _parent.reset(token)
 
 
-def model_callbacks(trace, *, metered_tools=(), model_name=None):
+def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
     """Build lazily so demo/API imports need no model SDK installation."""
     from langchain_core.callbacks import AsyncCallbackHandler
+
+    from .contracts import ResearchError, utcnow
+    from .sources import fetched_source, observed_sources
+
+    scope = scope or {}
 
     class LocalCallbacks(AsyncCallbackHandler):
         raise_error = True
 
         def __init__(self):
             self.active = {}
+            self.reservations = {}
             self.parent_id = _parent.get()
             self.budget_error = None
+            self.provider_error = None
 
         async def begin(self, run_id, name, kind, payload):
             key = str(run_id)
@@ -166,51 +199,128 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None):
                 status="error" if error else "ok",
                 duration_ms=round((time.monotonic() - started) * 1000),
                 error_type=type(error).__name__ if error else None,
-                payload={"error": error_details(error)} if error else payload,
+                payload={"error": error_details(error), "output": payload} if error else payload,
             )
 
+        async def close(self):
+            """Finalize missing callbacks only after the native worker drains.
+
+            Unknown model usage retains its reservation. An interrupted tool
+            result is never promoted to evidence or reported as successful.
+            """
+            error = ResearchError("NATIVE_CALLBACK_INTERRUPTED", "Native execution ended without a terminal callback")
+            for key, (_, _, kind) in tuple(self.active.items()):
+                if kind == "tool":
+                    await self.on_tool_error(error, run_id=key)
+                else:
+                    self.reservations.pop(key, None)
+                    await self.finish(key, error=error)
+
         async def on_chat_model_start(self, serialized, messages, *, run_id, **kwargs):
+            self.provider_error = None
             body = [[{"role": getattr(m, "type", "unknown"), "content": visible_text(m.content)} for m in batch] for batch in messages]
             await self.begin(run_id, model_name or (serialized or {}).get("name", "model"), "model", body)
             try:
-                size = len(json.dumps(body, ensure_ascii=False).encode("utf-8")) + trace.settings.max_output_tokens
-                size += sum(len(json.dumps(t.args, ensure_ascii=False).encode("utf-8")) for t in metered_tools)
+                from langchain_core.messages.utils import count_tokens_approximately
+
+                # Offline framework estimation, not UTF-8 bytes billed as tokens.
+                # Escaped Unicode gives multilingual text a conservative weight.
+                # No tokenizer download or provider request occurs here.
+                payload = json.dumps({"messages": body, "tools": [t.args for t in metered_tools]}, ensure_ascii=True)
+                size = count_tokens_approximately([("user", payload)]) + trace.settings.max_output_tokens
                 await trace.store.reserve(trace.run_id, model_tokens=size)
+                self.reservations[str(run_id)] = size
+                await trace.store.event(trace.run_id, "usage.reserved", {"model_call_id": str(run_id), "estimated_tokens": size})
             except Exception as exc:
                 self.budget_error = exc
                 await self.finish(run_id, error=exc)
                 raise
 
         async def on_llm_end(self, response, *, run_id, **kwargs):
-            answers, usage = [], 0
+            answers, usage, known_usage = [], 0, False
             for batch in response.generations:
                 for generation in batch:
                     message = getattr(generation, "message", None)
                     answers.append({"content": visible_text(getattr(message, "content", generation.text)), "tool_calls": getattr(message, "tool_calls", [])})
-                    usage += (getattr(message, "usage_metadata", None) or {}).get("total_tokens", 0)
-            if usage:
-                await trace.store.mutate(trace.run_id, lambda r: r["usage"].update(reported_model_tokens=r["usage"].get("reported_model_tokens", 0) + usage))
+                    total = (getattr(message, "usage_metadata", None) or {}).get("total_tokens")
+                    if isinstance(total, int) and not isinstance(total, bool) and total >= 0:
+                        known_usage = True
+                        usage += total
+            reserved = self.reservations.pop(str(run_id), None)
+            if known_usage and reserved is not None:
+
+                def settle(run):
+                    run["usage"]["model_tokens"] += usage - reserved
+                    run["usage"]["reported_model_tokens"] = run["usage"].get("reported_model_tokens", 0) + usage
+
+                current = await trace.store.mutate(trace.run_id, settle)
+                await trace.store.event(trace.run_id, "usage.settled", {"model_call_id": str(run_id), "reserved_tokens": reserved, "reported_tokens": usage})
+                ceiling = current["budget"]["max_model_tokens"]
+                if ceiling is not None and current["usage"]["model_tokens"] > ceiling:
+                    self.budget_error = ResearchError("BUDGET_EXHAUSTED", "预算已用尽: max_model_tokens", recoverable=False)
+                    await self.finish(run_id, payload={"answers": answers, "reported_tokens": usage}, error=self.budget_error)
+                    raise self.budget_error
+            # Missing usage or a failed call keeps the conservative reservation;
+            # uncertainty must not become a free retry or negative accounting.
             await self.finish(run_id, payload={"answers": answers, "reported_tokens": usage})
 
         async def on_llm_error(self, error, *, run_id, **kwargs):
+            self.provider_error = provider_failure(error)
+            self.reservations.pop(str(run_id), None)
             await self.finish(run_id, error=error)
 
         async def on_tool_start(self, serialized, input_str, *, run_id, **kwargs):
             name = (serialized or {}).get("name", "tool")
             await self.begin(run_id, name, "tool", kwargs.get("inputs") or input_str)
+            await trace.store.record_call(trace.run_id, str(run_id), {**scope, "tool_name": name, "started_at": utcnow(), "status": "running", "span_id": str(run_id)})
+            await trace.store.event(trace.run_id, "activity.tool.started", {**scope, "call_id": str(run_id), "tool_name": name})
             # All tools now use the native call path with their original
             # schemas. Reserve here; there is no separate search wrapper.
             try:
                 await trace.store.reserve(trace.run_id, tool_calls=1)
             except Exception as exc:
                 self.budget_error = exc
-                await self.finish(run_id, error=exc)
+                await self.on_tool_error(exc, run_id=run_id)
                 raise
 
         async def on_tool_end(self, output, *, run_id, **kwargs):
-            await self.finish(run_id, payload=output)
+            entry = self.active.get(str(run_id))
+            if entry is None:
+                return  # A duplicate/end-after-rejection cannot revive a call.
+            name = entry[1] if entry else getattr(output, "name", "tool")
+            spec = next((s for s in trace.settings.sources if s.tool == name), None)
+            status = "error" if getattr(output, "status", None) == "error" else "success"
+            content = getattr(output, "content", output)
+            # Observe only the model-visible body. Do not mine provider headers
+            # or mutate the object handed to the native model/tool loop.
+            safe_content = redact(content, trace.secrets, 256000)
+            found = observed_sources(safe_content, connector=spec.name if spec else name, origin=spec.origin if spec else "runtime") if status == "success" else []
+            fetched = fetched_source(redact(getattr(output, "artifact", None), trace.secrets), connector=spec.name, origin=spec.origin) if status == "success" and spec and spec.kind == "native" else None
+            if fetched:
+                found = [source for source in found if source["id"] != fetched["id"]] + [fetched]
+            call = await trace.store.record_call(
+                trace.run_id,
+                str(run_id),
+                {
+                    **scope,
+                    "tool_name": name,
+                    "provider_call_id": getattr(output, "tool_call_id", None),
+                    "status": status,
+                    "ended_at": utcnow(),
+                    "duration_ms": round((time.monotonic() - entry[0]) * 1000) if entry else None,
+                },
+                found,
+            )
+            await trace.store.event(trace.run_id, "activity.tool.completed", call)
+            returned_error = ResearchError("TOOL_RETURNED_ERROR", "Native tool returned an error result") if status == "error" else None
+            await self.finish(run_id, payload=output, error=returned_error)
 
         async def on_tool_error(self, error, *, run_id, **kwargs):
+            entry = self.active.get(str(run_id))
+            if entry is None:
+                return
+            call = await trace.store.record_call(trace.run_id, str(run_id), {**scope, "status": "error", "ended_at": utcnow(), "tool_name": entry[1] if entry else "tool", "error_type": type(error).__name__})
+            await trace.store.event(trace.run_id, "activity.tool.completed", call)
             await self.finish(run_id, error=error)
 
     return LocalCallbacks()

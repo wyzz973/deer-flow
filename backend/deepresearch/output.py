@@ -8,6 +8,7 @@ import json
 import re
 
 import yaml
+from pydantic import ValidationError
 
 
 def visible_text(content) -> str:
@@ -21,11 +22,27 @@ def visible_text(content) -> str:
 def parse_contract(content, schema):
     """Accept fenced/embedded JSON and explicitly fenced YAML, then validate."""
     text = visible_text(content)
+    best_error, best_score = "", 0
+
+    def validate(value):
+        nonlocal best_error, best_score
+        try:
+            return schema.model_validate(value)
+        except ValidationError as error:
+            # Prefer the complete reply over nested objects encountered by
+            # raw_decode. Never echo input values, provider metadata or secrets.
+            score = len(set(value) & set(schema.model_fields)) if isinstance(value, dict) else 0
+            if score > best_score:
+                best_score = score
+                details = [{"field": ".".join(str(part) for part in item["loc"]), "message": item["msg"]} for item in error.errors(include_input=False, include_url=False, include_context=False)[:8]]
+                best_error = json.dumps(details, ensure_ascii=False)[:2000]
+            raise
+
     candidates = [text]
     for language, body in re.findall(r"```(\w*)\s*\n(.*?)```", text, re.S):
         if language.lower() in {"yaml", "yml"}:
             try:
-                return schema.model_validate(yaml.safe_load(body))
+                return validate(yaml.safe_load(body))
             except (ValueError, TypeError, yaml.YAMLError):
                 continue
         candidates.append(body.strip())
@@ -37,7 +54,7 @@ def parse_contract(content, schema):
         for start in starts:
             try:
                 value, _ = decoder.raw_decode(candidate[start:])
-                return schema.model_validate(value)
+                return validate(value)
             except (ValueError, TypeError):
                 continue
-    raise ValueError(f"Reply does not satisfy {schema.__name__}")
+    raise ValueError(f"Reply does not satisfy {schema.__name__}" + (": " + best_error if best_error else ""))

@@ -21,8 +21,10 @@ green synthetic test does not imply corporate MCP/model acceptance.
 | Synthesis | Native role executor | StructuredReport output | Plain-chat conversion only at report boundary |
 | Citations/export | Native receipt IDs plus recorded call IDs | Global report numbering and MD/HTML/DOCX | Keep deterministic report rendering |
 | Observability | Native model/tool callbacks and receipts | Local research spans/correlation/export | Local storage, no LangSmith service |
-| Workspace | Existing sidebar, auth layout, WorkspaceContainer/Header/Body | Research route and navigation item | Integrate at /workspace/deepresearch |
-| Controls | Existing Button/Input/Textarea/Sheet | Plan fields and report content | Reuse host primitives and theme tokens |
+| Workspace | Native sidebar, ChatSurface, MessageList and ChatBox | Conversation route and domain-message renderer | Share the same surface with ordinary chat; no second in-page history |
+| Controls | Native PromptInput, Button and mobile Sheet | Conversational plan cards and linked reports | No constraints form; pause server countdown before editing |
+| Source selection | Host native tools or MCP cache | Explicit source metadata and classification | Native sources do not require MCP discovery or bypass tool ceilings |
+| Follow-up | Existing graph and native role executor | Answer/rewrite/new-research routing and report versions | Preserve old reports; only new research repeats evidence gathering |
 | Persistence | Graph SQLite checkpointer | Research-specific plan/report/event tables | Retain explicit single-worker boundary; evaluate host store migration separately |
 
 ## Delivery gates and evidence
@@ -49,4 +51,9 @@ Tool receipts establish provenance of an execution, not original-document
 identity or semantic support. Reports must say that clearly. Advanced semantic
 evaluation cannot be replaced by schema checks or fabricated URL metadata.
 
-Local result: 177 combined backend tests, 36 isolated research tests and four browser tests passed. See VERIFICATION.md for exact scope and rendered screenshots. Publication is confirmed separately against the remote Git revision after pushing.
+The previous form-based iteration had 177 combined backend tests and four browser
+tests; those results and screenshots do not prove the new conversation UI. The
+current worktree has 188 passing backend tests, six passing presentation tests,
+full frontend lint/typecheck, and computer-use observations documented in
+COMPUTER_USE_2026-09-15.md. Updated repeatable browser scenarios are written but
+not yet counted as passing. Full live research and publication remain open.

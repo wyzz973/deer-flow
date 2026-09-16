@@ -39,7 +39,22 @@ class Store:
             db.close()
 
     async def call(self, fn):
-        return await asyncio.to_thread(self._call, fn)
+        # Cancelling to_thread does not stop its SQLite transaction. Drain it
+        # before cancellation is acknowledged, rather than allowing late writes
+        # after cancel/shutdown has returned to the caller.
+        task = asyncio.create_task(asyncio.to_thread(self._call, fn))
+        interrupted = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                interrupted = True
+        if interrupted:
+            # Retrieve exceptions so a cancelled caller cannot leak task errors.
+            if not task.cancelled():
+                task.exception()
+            raise asyncio.CancelledError
+        return task.result()
 
     async def start(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -68,6 +83,12 @@ class Store:
             CREATE TABLE IF NOT EXISTS research_cache (
               run_id TEXT NOT NULL REFERENCES research_run(id), key TEXT NOT NULL,
               body TEXT NOT NULL, PRIMARY KEY(run_id,key));
+            CREATE TABLE IF NOT EXISTS research_source (
+              run_id TEXT NOT NULL REFERENCES research_run(id), id TEXT NOT NULL,
+              body TEXT NOT NULL, PRIMARY KEY(run_id,id));
+            CREATE TABLE IF NOT EXISTS research_tool_call (
+              run_id TEXT NOT NULL REFERENCES research_run(id), id TEXT NOT NULL,
+              body TEXT NOT NULL, PRIMARY KEY(run_id,id));
             PRAGMA user_version=1;
             """)
 
@@ -82,6 +103,15 @@ class Store:
                 return json.loads(old["body"]), False
             db.execute("INSERT INTO research_run VALUES (?,?,?,?,?)", (run["run_id"], run["owner"], key, request_hash, dumps(run)))
             return run, True
+
+        return await self.call(op)
+
+    async def by_request(self, owner, key, request_hash):
+        def op(db):
+            row = db.execute("SELECT body, request_hash FROM research_run WHERE owner=? AND request_key=?", (owner, key)).fetchone()
+            if row and row["request_hash"] != request_hash:
+                raise ResearchError("IDEMPOTENCY_CONFLICT", "同一幂等键不能用于不同请求", recoverable=False)
+            return json.loads(row["body"]) if row else None
 
         return await self.call(op)
 
@@ -118,10 +148,23 @@ class Store:
     async def patch(self, run_id, **values):
         return await self.mutate(run_id, lambda run: run.update(values))
 
+    async def append_message(self, run_id, message):
+        """Persist a conversation projection once, including across node replay."""
+
+        def append(run):
+            messages = run.setdefault("conversation", [])
+            if not any(item["id"] == message["id"] for item in messages):
+                messages.append(message)
+
+        return await self.mutate(run_id, append)
+
     async def reserve(self, run_id, tool_calls=0, model_tokens=0):
         def change(run):
+            if run.get("cancel_requested") or run.get("status") == "CANCELLED":
+                raise ResearchError("RUN_CANCELLED", "研究已取消，不再启动新调用", recoverable=False)
             for key, delta, maximum in [("tool_calls", tool_calls, "max_tool_calls"), ("model_tokens", model_tokens, "max_model_tokens")]:
-                if run["usage"][key] + delta > run["budget"][maximum]:
+                ceiling = run["budget"][maximum]
+                if ceiling is not None and run["usage"][key] + delta > ceiling:
                     raise ResearchError("BUDGET_EXHAUSTED", f"预算已用尽: {maximum}", recoverable=False)
                 run["usage"][key] += delta
 
@@ -150,9 +193,96 @@ class Store:
 
         return await self.call(op)
 
+    async def record_call(self, run_id, call_id, details, sources=()):
+        """Link calls and observed sources in one transaction, replay-safe."""
+
+        def op(db):
+            old = db.execute("SELECT body FROM research_tool_call WHERE run_id=? AND id=?", (run_id, call_id)).fetchone()
+            call = {**(json.loads(old[0]) if old else {}), "id": call_id, **details}
+            if sources:
+                call["source_ids"] = [source["id"] for source in sources]
+                call["domains"] = sorted({source["domain"] for source in sources if source.get("domain")})
+            db.execute("INSERT INTO research_tool_call VALUES (?,?,?) ON CONFLICT(run_id,id) DO UPDATE SET body=excluded.body", (run_id, call_id, dumps(call)))
+            for source in sources:
+                old = db.execute("SELECT body FROM research_source WHERE run_id=? AND id=?", (run_id, source["id"])).fetchone()
+                previous = json.loads(old[0]) if old else {}
+                merged = {**source, **previous}
+                merged["call_ids"] = list(dict.fromkeys([*previous.get("call_ids", []), call_id]))
+                if source.get("status") == "read":
+                    merged.update(status="read", excerpt=source["excerpt"], document_hash=source.get("document_hash"))
+                if source.get("title_observed") and (source.get("status") == "read" or previous.get("status") != "read"):
+                    merged.update(title=source["title"], title_observed=True)
+                db.execute("INSERT INTO research_source VALUES (?,?,?) ON CONFLICT(run_id,id) DO UPDATE SET body=excluded.body", (run_id, source["id"], dumps(merged)))
+            return call
+
+        return await self.call(op)
+
+    async def sources(self, run_id):
+        return await self.call(lambda db: [json.loads(row[0]) for row in db.execute("SELECT body FROM research_source WHERE run_id=? ORDER BY rowid", (run_id,))])
+
+    async def calls(self, run_id):
+        return await self.call(lambda db: [json.loads(row[0]) for row in db.execute("SELECT body FROM research_tool_call WHERE run_id=? ORDER BY rowid", (run_id,))])
+
     async def trace_events(self, run_id, after=0, limit=100):
         """Page trace records in SQL, not after limiting the mixed event stream."""
         return await self.call(lambda db: [json.loads(row[0]) for row in db.execute("SELECT body FROM research_event WHERE run_id=? AND seq>? AND json_extract(body, '$.type') LIKE 'trace.%' ORDER BY seq LIMIT ?", (run_id, after, limit))])
+
+    async def reconcile_trace(self, run_id):
+        """Append explicit interruption records beneath already-ended parents.
+
+        This never guesses that a live root has stopped and never rewrites past
+        events. The actual interruption time is unknown, so duration stays null.
+        Tool status and its terminal activity are committed with the trace.
+        """
+
+        def op(db):
+            rows = db.execute("SELECT body FROM research_event WHERE run_id=? AND json_extract(body, '$.type') IN ('trace.started','trace.ended') ORDER BY seq", (run_id,))
+            started, ended = {}, set()
+            for row in rows:
+                event = json.loads(row[0])
+                span = event["data"]
+                if event["type"] == "trace.started":
+                    started[span["span_id"]] = span
+                else:
+                    ended.add(span["span_id"])
+            orphaned = []
+            for span_id, span in started.items():
+                if span_id in ended:
+                    continue
+                parent, visited = span.get("parent_span_id"), {span_id}
+                while parent and parent not in visited:
+                    if parent in ended:
+                        orphaned.append(span)
+                        break
+                    visited.add(parent)
+                    parent = started.get(parent, {}).get("parent_span_id")
+            if not orphaned:
+                return 0
+            seq = db.execute("SELECT COALESCE(MAX(seq),0) FROM research_event WHERE run_id=?", (run_id,)).fetchone()[0]
+            at = utcnow()
+
+            def append(kind, data, key):
+                nonlocal seq
+                seq += 1
+                event = {"seq": seq, "type": kind, "run_id": run_id, "at": at, "data": data}
+                db.execute("INSERT INTO research_event VALUES (?,?,?,?)", (run_id, seq, key, dumps(event)))
+
+            for span in orphaned:
+                span_id = span["span_id"]
+                data = {key: span.get(key) for key in ("trace_id", "span_id", "parent_span_id", "name", "kind")}
+                data.update(status="cancelled", reconciled=True, duration_ms=None, error_type="InterruptedTrace")
+                append("trace.ended", data, "reconciled-trace:" + span_id)
+                if span.get("kind") == "tool":
+                    row = db.execute("SELECT body FROM research_tool_call WHERE run_id=? AND id=?", (run_id, span_id)).fetchone()
+                    if row:
+                        call = json.loads(row[0])
+                        if call.get("status") == "running":
+                            call.update(status="error", ended_at=at, duration_ms=None, reconciled=True, error_type="InterruptedTrace")
+                            db.execute("UPDATE research_tool_call SET body=? WHERE run_id=? AND id=?", (dumps(call), run_id, span_id))
+                            append("activity.tool.completed", call, "reconciled-tool:" + span_id)
+            return len(orphaned)
+
+        return await self.call(op)
 
     async def cache(self, run_id, key, body):
         await self.call(lambda db: db.execute("INSERT OR IGNORE INTO research_cache VALUES (?,?,?)", (run_id, key, dumps(body))).rowcount)
@@ -163,6 +293,19 @@ class Store:
             if row and row[0] != input_hash:
                 raise ResearchError("UNIT_CHANGED", "已执行单元的输入发生变化，需创建新任务", recoverable=False)
             return json.loads(row[1]) if row else None
+
+        return await self.call(op)
+
+    async def completed_unit(self, run_id, unit_id):
+        """Read provenance for a declared dependency within the same run/cycle.
+
+        Dispatch owns input-hash validation; this lookup never admits work or
+        treats a result from another run as an interchangeable dependency.
+        """
+
+        def op(db):
+            row = db.execute("SELECT result FROM research_unit WHERE run_id=? AND id=?", (run_id, unit_id)).fetchone()
+            return json.loads(row[0]) if row else None
 
         return await self.call(op)
 
@@ -180,6 +323,40 @@ class Store:
 
     async def save_report(self, run_id, version, body):
         await self.call(lambda db: db.execute("INSERT OR REPLACE INTO research_report VALUES (?,?,?)", (run_id, version, dumps(body))).rowcount)
+
+    async def publish_report(self, run_id, publication_key, body):
+        """Commit version, conversation, terminal state and event together.
+
+        The content-addressed publication key fences node replay. Native graph
+        checkpoints may lag this transaction without duplicating a report.
+        """
+
+        def op(db):
+            row = db.execute("SELECT body FROM research_run WHERE id=?", (run_id,)).fetchone()
+            if row is None:
+                raise ResearchError("NOT_FOUND", "研究任务不存在", recoverable=False)
+            run = json.loads(row[0])
+            if run.get("cancel_requested") or run.get("status") == "CANCELLED":
+                raise ResearchError("RUN_CANCELLED", "研究已取消，不发布报告", recoverable=False)
+            key = "publication:" + publication_key
+            existing = db.execute("SELECT body FROM research_cache WHERE run_id=? AND key=?", (run_id, key)).fetchone()
+            if existing:
+                published = json.loads(existing[0])
+            else:
+                version = db.execute("SELECT COALESCE(MAX(version),0)+1 FROM research_report WHERE run_id=?", (run_id,)).fetchone()[0]
+                published = {**body, "version": version}
+                at = utcnow()
+                db.execute("INSERT INTO research_report VALUES (?,?,?)", (run_id, version, dumps(published)))
+                run.setdefault("conversation", []).append({"id": f"report-{version}", "role": "assistant", "kind": "report", "text": published["report"]["title"], "report": published, "cycle": run.get("cycle", 0), "at": at})
+                seq = db.execute("SELECT COALESCE(MAX(seq),0)+1 FROM research_event WHERE run_id=?", (run_id,)).fetchone()[0]
+                event = {"seq": seq, "type": "report.completed", "run_id": run_id, "at": at, "data": {"version": version, "limitations": published["limitations"]}}
+                db.execute("INSERT INTO research_event VALUES (?,?,?,?)", (run_id, seq, f"report-completed-{version}", dumps(event)))
+                db.execute("INSERT INTO research_cache VALUES (?,?,?)", (run_id, key, dumps(published)))
+            run.update(report=published, status="COMPLETED", error=None, updated_at=utcnow())
+            db.execute("UPDATE research_run SET body=? WHERE id=?", (dumps(run), run_id))
+            return published
+
+        return await self.call(op)
 
 
 class ProcessLock:

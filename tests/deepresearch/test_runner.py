@@ -59,8 +59,9 @@ async def test_native_tools_unchanged_and_execution_cached(settings, plan, tmp_p
             receipts.append({"id": f"r{index + 1}", "tool_call_id": call_id, "tool_name": tool.name, "status": "success"})
         return NativeExecution("Research notes [r1] [r2]", "native-exec", messages, receipts)
 
-    async def convert(runner, run, name, payload, schema, answer, context):
+    async def convert(runner, run, name, payload, schema, answer, context, **kwargs):
         assert answer == "Research notes [r1] [r2]"
+        assert all("excerpt" not in call for call in payload["observed_calls"])
         refs = [e["raw_id"] for e in payload["observed_calls"]]
         return ResearchAnalysis(findings=[Finding(claim="claim", raw_evidence_refs=refs, confidence=0.8)], confidence=0.8)
 
@@ -75,12 +76,34 @@ async def test_native_tools_unchanged_and_execution_cached(settings, plan, tmp_p
     await runner.research(run, plan.research_units[0], {})
     assert len(invoked) == 2  # conversion retry reuses the whole completed execution
 
-    async def fabricated(*args):
+    async def fabricated(*args, **kwargs):
         return ResearchAnalysis(findings=[Finding(claim="claim", raw_evidence_refs=["fabricated"], confidence=0.8)], confidence=0.8)
 
     monkeypatch.setattr("deepresearch.structured.convert_answer", fabricated)
     with pytest.raises(ResearchError, match="unobserved"):
         await runner.research(run, plan.research_units[0], {})
+
+
+@pytest.mark.asyncio
+async def test_writer_receives_only_referenced_evidence(settings, plan, monkeypatch):
+    runner = DeerFlowRunner(settings, None)
+    captured = {}
+
+    async def capture(_run, _skill, payload, _schema):
+        captured.update(payload)
+        return "result"
+
+    monkeypatch.setattr(runner, "_json", capture)
+    pool = {"E001": {"snippet": "Referenced evidence"}, "E002": {"snippet": "Unrelated raw tool payload"}}
+    result = await runner.synthesize({}, plan, [{"claim": "Finding", "evidence_ids": ["E001"]}], pool)
+    assert result == "result"
+    assert captured["evidence_pool"] == {"E001": pool["E001"]}
+    assert set(pool) == {"E001", "E002"}
+    assert captured["previous_report"] is None
+    previous = {"title": "Existing report AST", "sections": []}
+    await runner.synthesize({"revision_report": previous}, plan, [], {}, [])
+    assert captured["previous_report"] is previous
+    assert "Preserve its unaffected sections" in captured["editorial_brief"]["revision_mode"]
 
 
 def test_opaque_calls_do_not_require_external_date_schema(settings, plan):

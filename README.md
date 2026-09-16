@@ -18,8 +18,11 @@ https://github.com/user-attachments/assets/a8bcadc4-e040-4cf2-8fda-dd768b999c18
 
 ## Official Website
 
-The opt-in [DeepResearch workbench](README.deepresearch.md) uses native DeerFlow
-subagents, original MCP tool schemas/results and local, downloadable execution traces.
+The opt-in [DeepResearch conversation](README.deepresearch.md) reuses the native
+chat surface, message list, composer primitives and side panel. Plans support a
+server-owned countdown and conversational edits; reports link to grouped sources
+and local execution traces. Researchers use native DeerFlow subagents and the
+original schemas/results of configured native or MCP tools.
 See its [runtime and migration guide](docs/deepresearch/NATIVE_RUNTIME.md) for
 plain Chat Completions support, tool policies and local logging.
 
@@ -1686,3 +1689,11 @@ Your unwavering commitment and expertise have been the driving force behind Deer
 ## Star History
 
 [![Star History Chart](https://star-history.dera.page/svg?repos=bytedance/deer-flow&type=Date)](https://star-history.dera.page/#bytedance/deer-flow&Date)
+
+### DeepResearch extension recovery
+
+The optional DeepResearch extension supports checkpoint recovery and explicit
+completion with documented evidence limitations. Citation validation remains
+mandatory. See the [DeepResearch guide](README.deepresearch.md) and the
+[stability acceptance record](docs/deepresearch/STABILITY_AUDIT_2026-09-16.md) for
+configuration, real-model verification, and known deployment boundaries.

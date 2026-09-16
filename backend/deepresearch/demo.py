@@ -17,6 +17,8 @@ def create_app(settings=None):
         settings = settings.model_copy(update={"data_dir": os.environ["DEEPRESEARCH_DEMO_DATA_DIR"]})
     if settings.runner != "demo":
         raise RuntimeError("Standalone demo refuses real MCP mode; use authenticated DeerFlow extension")
+    if os.getenv("DEEPRESEARCH_DEMO_PLAN_COUNTDOWN"):
+        settings = settings.model_copy(update={"plan_countdown_seconds": float(os.environ["DEEPRESEARCH_DEMO_PLAN_COUNTDOWN"])})
     service = ResearchService(settings)
     frontend_port = int(os.getenv("DEEPRESEARCH_DEMO_FRONTEND_PORT", "3000"))
     if not 1 <= frontend_port <= 65535:

@@ -22,8 +22,12 @@ _LIST_LIMIT = 500
 _FIND_OK = (0, 1, 141)
 
 
-def remote_list_dir_command(path: str, max_depth: int, *, limit: int = _LIST_LIMIT) -> str:
-    """Return a POSIX ``sh -lc`` script that lists ``path`` and records find status."""
+def remote_list_dir_command(path: str, max_depth: int, *, limit: int = _LIST_LIMIT, isolate: bool = False) -> str:
+    """Build the listing script, isolating it from a persistent caller if needed.
+
+    ``exit`` belongs to the short-lived script, never a persistent shell session.
+    A unique private status file also avoids predictable /tmp symlink targets.
+    """
     quoted = shlex.quote(path)
     depth = int(max_depth)
     n = int(limit)
@@ -32,14 +36,16 @@ def remote_list_dir_command(path: str, max_depth: int, *, limit: int = _LIST_LIM
     # a login-profile ``set -e`` so a failing find still records $?. End with
     # ``exit`` of that status (126 if the file is missing): the last command
     # would otherwise be ``rm``, whose 0/1 is not find's status.
-    return (
-        f"set +e; _st=/tmp/df_find_$$; "
+    script = (
+        "set +e; _st=$(mktemp /tmp/df_find.XXXXXX) || exit 126; "
+        "trap 'rm -f \"$_st\"' 0; "
         f"{{ find -H {quoted} -maxdepth {depth} \\( -type f -o -type d \\) 2>/dev/null; "
         f'echo $? > "$_st"; }} | head -n {n}; '
         f'st=$(cat "$_st" 2>/dev/null); '
         f"printf '\\n%s\\n' {_STATUS_PREFIX}$st; "
         f'rm -f "$_st"; exit "${{st:-126}}"'
     )
+    return "sh -c " + shlex.quote(script) if isolate else script
 
 
 def parse_remote_list_dir_output(

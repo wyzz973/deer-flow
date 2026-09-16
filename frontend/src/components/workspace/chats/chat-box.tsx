@@ -71,13 +71,19 @@ const SidecarPanel = dynamic(
 const RIGHT_PANEL_ANIMATION_MS = 280;
 const RIGHT_PANEL_DEFAULT_SIZE = "40%";
 
-type RightPanelKind = "sidecar" | "artifacts" | "browser";
+type RightPanelKind = "sidecar" | "artifacts" | "browser" | "extension";
 
 const ChatBox: React.FC<{
   children: React.ReactNode;
   threadId: string;
   browserEnabled?: boolean;
-}> = ({ children, threadId, browserEnabled = true }) => {
+  extensionPanel?: {
+    open: boolean;
+    title: string;
+    content: React.ReactNode;
+    onClose: () => void;
+  };
+}> = ({ children, threadId, browserEnabled = true, extensionPanel }) => {
   const { thread } = useThread();
   const isMobile = useIsMobile();
   const pathname = usePathname();
@@ -152,13 +158,15 @@ const ChatBox: React.FC<{
     return artifactsOpen;
   }, [artifactsOpen, artifacts, sidecarOpen]);
 
-  const activeRightPanel: RightPanelKind | null = sidecarOpen
-    ? "sidecar"
-    : browserViewOpen
-      ? "browser"
-      : artifactPanelOpen
-        ? "artifacts"
-        : null;
+  const activeRightPanel: RightPanelKind | null = extensionPanel?.open
+    ? "extension"
+    : sidecarOpen
+      ? "sidecar"
+      : browserViewOpen
+        ? "browser"
+        : artifactPanelOpen
+          ? "artifacts"
+          : null;
   const rightPanelOpen = activeRightPanel !== null;
   const [renderedRightPanel, setRenderedRightPanel] =
     useState<RightPanelKind | null>(activeRightPanel);
@@ -208,7 +216,9 @@ const ChatBox: React.FC<{
       // Finalize a drag-collapse only after the pointer is released. Closing
       // from onResize at the first 0% frame would break a continuous gesture
       // that reaches the edge and then reverses before release.
-      if (activeRightPanel === "sidecar") {
+      if (activeRightPanel === "extension") {
+        extensionPanel?.onClose();
+      } else if (activeRightPanel === "sidecar") {
         sidecar?.close();
       } else if (activeRightPanel === "browser") {
         browserView?.close();
@@ -216,7 +226,14 @@ const ChatBox: React.FC<{
         setArtifactsOpen(false);
       }
     },
-    [activeRightPanel, browserView, resizableIdBase, setArtifactsOpen, sidecar],
+    [
+      activeRightPanel,
+      browserView,
+      resizableIdBase,
+      setArtifactsOpen,
+      sidecar,
+      extensionPanel,
+    ],
   );
 
   useEffect(() => {
@@ -286,6 +303,8 @@ const ChatBox: React.FC<{
   }, [browserEnabled, browserView]);
 
   const rightPanelContent = useMemo(() => {
+    if (renderedRightPanel === "extension")
+      return extensionPanel?.content ?? null;
     if (renderedRightPanel === "browser") {
       return <BrowserViewPanel threadId={threadId} className="size-full" />;
     }
@@ -345,6 +364,7 @@ const ChatBox: React.FC<{
     threadId,
     artifacts,
     setArtifactsOpen,
+    extensionPanel,
   ]);
 
   if (isMobile) {
@@ -357,6 +377,7 @@ const ChatBox: React.FC<{
             if (open) {
               return;
             }
+            if (extensionPanel?.open) extensionPanel.onClose();
             if (sidecarOpen) {
               sidecar?.close();
             }
@@ -374,11 +395,13 @@ const ChatBox: React.FC<{
           >
             <SheetHeader className="sr-only">
               <SheetTitle>
-                {renderedRightPanel === "sidecar"
-                  ? "Sidecar"
-                  : renderedRightPanel === "browser"
-                    ? "Browser"
-                    : "Artifacts"}
+                {renderedRightPanel === "extension"
+                  ? extensionPanel?.title
+                  : renderedRightPanel === "sidecar"
+                    ? "Sidecar"
+                    : renderedRightPanel === "browser"
+                      ? "Browser"
+                      : "Artifacts"}
               </SheetTitle>
               <SheetDescription>
                 Browse the side panel for this conversation.

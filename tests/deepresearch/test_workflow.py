@@ -126,5 +126,47 @@ async def test_gap_stops_without_fabricated_report(settings):
         run = await settle(service, run["run_id"])
         assert run["status"] == "FAILED" and run["error"]["code"] == "RESEARCH_GAPS"
         assert run["report"] is None and run["iteration"] <= 2
+        calls = run["usage"]["tool_calls"]
+        await service.retry(run["run_id"], allow_limited_report=True)
+        run = await settle(service, run["run_id"])
+        assert run["status"] == "COMPLETED", run["error"]
+        assert run["report"]["limitations"]
+        assert run["usage"]["tool_calls"] == calls
+        assert any(e["type"] == "report.limitations.policy" for e in await service.store.events(run["run_id"]))
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_final_validation_retry_does_not_reuse_rejected_draft(settings):
+    service = ResearchService(settings)
+
+    class Writer(DemoRunner):
+        bad = True
+        drafts = 0
+
+        async def synthesize(self, *args, **kwargs):
+            self.drafts += 1
+            value = await super().synthesize(*args, **kwargs)
+            if self.bad:
+                value.executive_summary[0].text += " [999]"
+            return value
+
+    runner = Writer(settings, service.store)
+    service.runner = runner
+    await service.start()
+    try:
+        run = await service.create("u", CreateResearch(query="Validate report recovery"), "retry-report")
+        run = await settle(service, run["run_id"])
+        await service.decision(run["run_id"], 1, "approve")
+        run = await settle(service, run["run_id"])
+        assert run["error"]["code"] == "FINAL_VALIDATION"
+        calls, drafts = run["usage"]["tool_calls"], runner.drafts
+        runner.bad = False
+        await service.retry(run["run_id"])
+        run = await settle(service, run["run_id"])
+        assert run["status"] == "COMPLETED", run["error"]
+        assert runner.drafts == drafts + 1
+        assert run["usage"]["tool_calls"] == calls
     finally:
         await service.stop()

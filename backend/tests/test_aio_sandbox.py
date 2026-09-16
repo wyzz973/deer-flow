@@ -697,7 +697,9 @@ class TestNoChangeTimeout:
         sandbox.list_dir("/test")
 
         assert len(calls) == 1
-        assert calls[0].get("no_change_timeout") == sandbox._DEFAULT_NO_CHANGE_TIMEOUT
+        assert calls[0].get("no_change_timeout") == sandbox._LIST_DIR_TIMEOUT
+        assert calls[0].get("hard_timeout") == sandbox._LIST_DIR_TIMEOUT
+        assert calls[0].get("request_options") == {"timeout_in_seconds": sandbox._LIST_DIR_TIMEOUT + 5}
 
 
 class TestReadFile:

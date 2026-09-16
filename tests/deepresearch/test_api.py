@@ -28,6 +28,17 @@ async def test_owner_authorization_and_demo_origin(settings, monkeypatch):
         assert (await client.get("/api/deepresearch/private-run", headers={"x-test-user": "bob"})).status_code == 404
         response = await client.get("/api/deepresearch/private-run", headers={"x-test-user": "alice"})
         assert response.status_code == 200 and "owner" not in response.json()
+        retry_calls = []
+
+        async def retry(run_id, secrets=None, *, allow_limited_report=None):
+            retry_calls.append((run_id, allow_limited_report))
+            return run
+
+        monkeypatch.setattr(service, "retry", retry)
+        assert (await client.post("/api/deepresearch/private-run/retry", json={"allow_limited_report": True}, headers={"x-test-user": "bob"})).status_code == 404
+        assert not retry_calls
+        assert (await client.post("/api/deepresearch/private-run/retry", json={"allow_limited_report": True}, headers={"x-test-user": "alice"})).status_code == 202
+        assert retry_calls == [("private-run", True)]
         await service.store.event("private-run", "trace.started", {"span_id": "s", "name": "private"})
         assert (await client.get("/api/deepresearch/private-run/trace", headers={"x-test-user": "bob"})).status_code == 404
         assert (await client.get("/api/deepresearch/private-run/trace/export", headers={"x-test-user": "bob"})).status_code == 404

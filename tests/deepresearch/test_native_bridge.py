@@ -3,10 +3,11 @@
 import sys
 import types
 from dataclasses import dataclass
+from unittest.mock import AsyncMock
 
 import pytest
 
-from deepresearch.native import execute_role
+from deepresearch.native import execute_role, native_thread_id
 from deepresearch.store import Store
 
 
@@ -21,6 +22,9 @@ class Agent:
 
 @pytest.mark.asyncio
 async def test_roles_use_native_executor_with_scoped_tools_and_credentials(settings, tmp_path, monkeypatch):
+    from deerflow.config.app_config import AppConfig
+
+    config = AppConfig.model_validate({"sandbox": {"use": "deerflow.sandbox.local:LocalSandboxProvider"}, "models": [{"name": "local-chat", "model": "local-chat", "use": "langchain_openai:ChatOpenAI", "max_tokens": 32768}]})
     settings.native_tools = ["read_file"]
     captured = {}
     completed = types.SimpleNamespace(is_terminal=True)
@@ -38,7 +42,7 @@ async def test_roles_use_native_executor_with_scoped_tools_and_credentials(setti
         assert kwargs["include_mcp"] is False
         return [types.SimpleNamespace(name="read_file"), types.SimpleNamespace(name="unrelated_network_tool")]
 
-    monkeypatch.setitem(sys.modules, "deerflow.config", types.SimpleNamespace(get_app_config=lambda: object()))
+    monkeypatch.setitem(sys.modules, "deerflow.config", types.SimpleNamespace(get_app_config=lambda: config))
     monkeypatch.setitem(sys.modules, "deerflow.tools", types.SimpleNamespace(get_available_tools=tools))
     monkeypatch.setitem(
         sys.modules,
@@ -51,7 +55,7 @@ async def test_roles_use_native_executor_with_scoped_tools_and_credentials(setti
             cleanup_background_task=lambda _: captured.update(cleaned=True),
         ),
     )
-    monkeypatch.setattr("deepresearch.native.model_callbacks", lambda *a, **kw: types.SimpleNamespace(budget_error=None))
+    monkeypatch.setattr("deepresearch.native.model_callbacks", lambda *a, **kw: types.SimpleNamespace(budget_error=None, close=AsyncMock()))
     store = Store(tmp_path / "native.sqlite")
     await store.start()
     run = {"run_id": "r", "thread_id": "dr-r", "owner": "alice"}
@@ -59,11 +63,14 @@ async def test_roles_use_native_executor_with_scoped_tools_and_credentials(setti
     reply = await execute_role(settings, store, run, "technical-route", {"unit": {"id": "R1"}}, [], Agent(), {"secrets": {"research_cookie": "private-value"}, "user_role": "member"})
     assert reply.answer == "ordinary prose"
     assert reply.execution_id == "native-execution"
-    assert captured["thread_id"] == "dr-r-R1"
+    assert captured["thread_id"] == native_thread_id(run, "technical-route", "R1")
     assert captured["user_id"] == "alice"
     assert captured["request_secrets"] == {"research_cookie": "private-value"}
     assert [t.name for t in captured["tools"]] == ["read_file"]
     assert captured["execution_callbacks"]
+    assert captured["config"].max_turns == Agent().max_turns
+    assert captured["app_config"].models[0].model_extra["max_tokens"] == settings.max_output_tokens
+    assert config.models[0].model_extra["max_tokens"] == 32768
     assert "private-value" not in captured["prompt"]
     assert captured["cleaned"]
 
@@ -74,3 +81,13 @@ async def test_roles_use_native_executor_with_scoped_tools_and_credentials(setti
     long_reply = await execute_role(settings, store, run, "technical-route", {"unit": {"id": "R2"}}, [], Agent(), {})
     assert long_reply.answer == result.result.strip()
     assert "response_metadata" not in long_reply.messages[0]
+
+    settings.skills["technical-route"].max_turns = 5
+    await execute_role(settings, store, run, "technical-route", {"unit": {"id": "R3"}}, [], Agent(), {})
+    assert captured["config"].max_turns == 5
+
+    settings.native_tools = ["read_file", "unrelated_network_tool"]
+    await execute_role(settings, store, run, "deepresearch", {}, [], Agent(name="planner"), {})
+    assert [tool.name for tool in captured["tools"]] == ["read_file"]
+    await execute_role(settings, store, run, "report-synthesis", {}, [], Agent(name="writer"), {})
+    assert [tool.name for tool in captured["tools"]] == ["read_file"]

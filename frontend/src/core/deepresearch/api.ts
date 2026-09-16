@@ -1,7 +1,12 @@
 import { fetch as gatewayFetch } from "@/core/api/fetcher";
 import { getBackendBaseURL } from "@/core/config";
 
-import type { Capabilities, ResearchEvent, Run } from "./types";
+import type {
+  Capabilities,
+  ResearchEvent,
+  ResearchSources,
+  Run,
+} from "./types";
 
 // Defaults to the same-origin authenticated DeerFlow gateway.
 // The separate demo page explicitly passes http://127.0.0.1:8022.
@@ -53,11 +58,29 @@ export function researchApi(base = "") {
   ): Promise<T> {
     return (await (await response(path, body, headers)).json()) as T;
   }
+  async function snapshot(
+    path: string,
+    body?: unknown,
+    headers?: Record<string, string>,
+  ): Promise<Run> {
+    const value = await json<Run>(path, body, headers);
+    // Anchor to receipt, not component mount: cached plans may be remounted
+    // long after this response without acquiring a fresh countdown interval.
+    return { ...value, client_received_at: performance.now() };
+  }
   return {
     root,
     capabilities: () => json<Capabilities>("/capabilities"),
     list: () => json<Run[]>(""),
-    get: (id: string) => json<Run>(`/${encodeURIComponent(id)}`),
+    get: (id: string) => snapshot(`/${encodeURIComponent(id)}`),
+    sources: (id: string) =>
+      json<ResearchSources>(`/${encodeURIComponent(id)}/sources`),
+    message: (id: string, text: string, messageId: string, version?: number) =>
+      snapshot(`/${encodeURIComponent(id)}/messages`, {
+        text,
+        client_message_id: messageId,
+        plan_version: version,
+      }),
     trace: (id: string, after = 0) =>
       json<{ items: ResearchEvent[]; next_cursor: number }>(
         `/${encodeURIComponent(id)}/trace?after=${after}`,
@@ -72,12 +95,16 @@ export function researchApi(base = "") {
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     },
     create: (body: unknown, key: string) =>
-      json<Run>("", body, { "Idempotency-Key": key }),
+      snapshot("", body, { "Idempotency-Key": key }),
     action: (id: string, action: string, body: unknown = {}) =>
-      json<Run>(`/${encodeURIComponent(id)}/${action}`, body),
-    async download(id: string, format: "md" | "html" | "docx") {
+      snapshot(`/${encodeURIComponent(id)}/${action}`, body),
+    async download(
+      id: string,
+      format: "md" | "html" | "docx",
+      version?: number,
+    ) {
       const res = await response(
-        `/${encodeURIComponent(id)}/report?format=${format}`,
+        `/${encodeURIComponent(id)}/report?format=${format}${version === undefined ? "" : `&version=${version}`}`,
       );
       const url = URL.createObjectURL(await res.blob());
       const a = document.createElement("a");

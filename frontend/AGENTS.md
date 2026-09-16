@@ -69,11 +69,32 @@ More specific `AGENTS.md` files under `src/` contain the frontend sections split
 
 ## Code Style
 
-The DeepResearch workbench exposes a local trace panel. Fetch trace payloads on
-expansion with the forward cursor, and key the panel by run ID so responses
-from a previous selection cannot populate another run's trace. Keep export
-requests on the authenticated research API; do not put trace payloads in
-localStorage or send them to a telemetry service.
+DeepResearch reuses `ChatSurface`, `MessageList` (domain-message renderer),
+`PromptInput`, and the `ChatBox` extension panel. Keep ordinary chat on the same
+shared surface rather than copying its markup into a second workbench. Research
+history occupies the native sidebar history slot; do not add an in-page history
+list or a separate constraints form. The research stream projection is read-only;
+mutations use the authenticated research API, not invented SDK methods.
+
+Plan deadlines are server-owned. Render their remaining time from a server
+snapshot plus monotonic elapsed time; do not start research in a browser timer.
+Anchor elapsed time when the API response arrives, not when a cached card mounts.
+Keep this client-only clock metadata out of server writes and persistent storage.
+Fence delayed requests by conversation selection, retain message idempotency keys
+after uncertain responses, and compare GET snapshots with the cache after the
+request resolves. Reconcile reconnects and refresh terminal sidebar state even
+when the backend has no new SSE event. Guard readiness in the send handler as
+well as the button so keyboard submit cannot bypass the unavailable state.
+Citation recognition must accept the native Markdown sanitizer's anchor prefix
+and only bind IDs in the report's citation map. Do not weaken Markdown sanitization.
+Historical report cards export their own version.
+On mobile, returning from a source to its citation closes the native Sheet before
+showing the report location; desktop retains the side-by-side source panel.
+
+Fetch trace payloads on expansion with the forward cursor, and key the panel by
+run ID so responses from a previous selection cannot populate another run's trace.
+Keep export requests on the authenticated research API; do not put trace payloads
+in localStorage or send them to a telemetry service.
 
 - **Imports**: Enforced ordering (builtin → external → internal → parent → sibling), alphabetized, newlines between groups. Use inline type imports: `import { type Foo }`.
 - **Unused variables**: Prefix with `_`.
@@ -145,3 +166,16 @@ lists from the server instead of inserting those snapshots into either view.
 ### Delimited artifact preview
 
 CSV/TSV previews share `artifact-table-preview.tsx` between the panel and standalone viewer. Papa Parse runs only inside `delimited-preview.worker.ts`; `use-delimited-preview.ts` bounds input before transfer, cancels stale work, and enforces a five-second timeout. The parser detects the first record separator outside quoted fields and passes it explicitly to Papa Parse, so embedded newlines in an incomplete quoted field cannot corrupt newline detection. It retains at most 202 logical records and 50 columns, discarding an incomplete final record from truncated input. UI pagination displays at most 200 data rows in pages of 50. Keep the table mounted but inactive when switching to source so header/pagination state survives; changing file identity resets it. Pending `write_file` content stays in source mode until success.
+
+DeepResearch report citations may share a display number across multiple recorded
+excerpts of the same page. Use `uniqueCitationIds` per paragraph/table cell, keep
+all citation `evidence_ids` aliases selectable, and choose the selected excerpt in
+the source panel. Comparison-table cells retain citation buttons. Discovered
+sources are collapsed separately from cited pages; read status is not a claim
+that an entire document or all its assertions have been verified.
+
+For evidence-bearing `RESEARCH_GAPS` failures, the existing research plan card
+must expose explicit limited-report consent using the authenticated retry API.
+Do not silently opt in, treat citation failures as evidence gaps, or offer this
+path for an evidence-free run. The report must still pass backend reference and
+source-policy validation. Other unrecoverable failures retain disabled retry.

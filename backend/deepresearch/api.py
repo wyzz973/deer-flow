@@ -13,7 +13,7 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import Response, StreamingResponse
 
-from .contracts import TERMINAL, CreateResearch, PlanDecision, PlanEdit, ResearchError
+from .contracts import TERMINAL, ConversationMessage, CreateResearch, PlanDecision, PlanEdit, ResearchError, RetryResearch, utcnow
 
 
 def build_router(service, *, local_demo=False, demo_origins=None):
@@ -68,9 +68,11 @@ def build_router(service, *, local_demo=False, demo_origins=None):
         return {"secrets": {key: request.headers[header] for header, key in service.settings.request_secret_headers.items() if request.headers.get(header)}, "identity": getattr(request.state, "research_identity", {})}
 
     def public(run, report=True):
-        body = {k: v for k, v in run.items() if k not in {"owner", "fingerprint"}}
+        body = {k: v for k, v in run.items() if k not in {"owner", "fingerprint", "pending_operation", "research_cycle_message_id"}}
+        body["server_time"] = utcnow()
         if not report:
             body.pop("report", None)
+            body.pop("conversation", None)
         return body
 
     async def invoke(awaitable):
@@ -78,25 +80,33 @@ def build_router(service, *, local_demo=False, demo_origins=None):
             return public(await awaitable)
         except ResearchError as exc:
             conflict = exc.code in {"RUN_BUSY", "PLAN_VERSION", "NOT_RETRYABLE", "IDEMPOTENCY_CONFLICT", "CONFIG_CHANGED"}
-            status = 409 if conflict else 429 if exc.code == "CAPACITY" else 422
+            status = 503 if exc.code == "SERVICE_STOPPING" else 409 if conflict else 429 if exc.code == "CAPACITY" else 422
             raise HTTPException(status, {"code": exc.code, "message": str(exc), "recoverable": exc.recoverable}) from None
 
     @router.get("/capabilities")
     async def capabilities(owner=Depends(principal)):
         return {
             "mode": service.settings.runner,
-            "ready": service.graph is not None,
+            "ready": service.graph is not None and not service.stopping,
             "skills": {k: {"description": v.description, "agent": v.agent} for k, v in service.settings.skills.items()},
             "sources": [{"name": s.name, "origin": s.origin, "level": s.level} for s in service.settings.sources],
             "budget_ceiling": service.settings.budget_ceiling.model_dump(),
+            "plan_countdown_seconds": service.settings.plan_countdown_seconds,
         }
 
     @router.post("", status_code=202)
     async def create(body: CreateResearch, request: Request, owner=Depends(principal), idempotency_key: str | None = Header(default=None)):
+        if service.graph is None or service.stopping:
+            raise HTTPException(503, "Research service is not ready")
         key = idempotency_key or str(uuid4())
         if len(key) > 200:
             raise HTTPException(422, "Idempotency-Key too long")
-        return await invoke(service.create(owner, body, key, secrets(request)))
+
+        async def authorize(run):
+            if not await can_read(request, run):
+                raise HTTPException(403, "Source/report access revoked")
+
+        return await invoke(service.create(owner, body, key, secrets(request), authorize=authorize))
 
     @router.get("")
     async def list_runs(request: Request, owner=Depends(principal), limit: int = Query(default=50, ge=1, le=100)):
@@ -115,6 +125,22 @@ def build_router(service, *, local_demo=False, demo_origins=None):
     async def approve(body: PlanDecision, request: Request, run=Depends(owned)):
         return await invoke(service.decision(run["run_id"], body.plan_version, "approve", secrets=secrets(request)))
 
+    @router.post("/{run_id}/plan/pause")
+    async def pause(body: PlanDecision, run=Depends(owned)):
+        return await invoke(service.pause_plan(run["run_id"], body.plan_version))
+
+    @router.post("/{run_id}/plan/resume")
+    async def resume(body: PlanDecision, request: Request, run=Depends(owned)):
+        return await invoke(service.resume_plan(run["run_id"], body.plan_version, secrets(request)))
+
+    @router.post("/{run_id}/messages", status_code=202)
+    async def message(body: ConversationMessage, request: Request, run=Depends(owned)):
+        return await invoke(service.message(run["run_id"], body.text, body.client_message_id, plan_version=body.plan_version, secrets=secrets(request)))
+
+    @router.get("/{run_id}/sources")
+    async def sources(run=Depends(owned)):
+        return {"sources": await service.store.sources(run["run_id"]), "calls": await service.store.calls(run["run_id"])}
+
     @router.post("/{run_id}/plan/edit", status_code=202)
     async def edit(body: PlanEdit, request: Request, run=Depends(owned)):
         return await invoke(service.decision(run["run_id"], body.plan_version, "edit", body.plan.model_dump(mode="json"), secrets(request)))
@@ -128,8 +154,8 @@ def build_router(service, *, local_demo=False, demo_origins=None):
         return await invoke(service.cancel(run["run_id"]))
 
     @router.post("/{run_id}/retry", status_code=202)
-    async def retry(request: Request, run=Depends(owned)):
-        return await invoke(service.retry(run["run_id"], secrets(request)))
+    async def retry(request: Request, body: RetryResearch | None = None, run=Depends(owned)):
+        return await invoke(service.retry(run["run_id"], secrets(request), allow_limited_report=body.allow_limited_report if body else None))
 
     @router.get("/{run_id}/events")
     async def events(request: Request, run=Depends(owned), after: int = Query(default=0, ge=0), last_event_id: str | None = Header(default=None)):
@@ -146,7 +172,10 @@ def build_router(service, *, local_demo=False, demo_origins=None):
                 batch = await service.store.events(run["run_id"], cursor)
                 for item in batch:
                     cursor = item["seq"]
-                    yield f"id: {cursor}\nevent: message\ndata: {json.dumps(item, ensure_ascii=False)}\n\n"
+                    visible = item
+                    if item["type"].startswith("trace."):
+                        visible = {**item, "data": {k: v for k, v in item["data"].items() if k != "payload"}}
+                    yield f"id: {cursor}\nevent: message\ndata: {json.dumps(visible, ensure_ascii=False)}\n\n"
                 if len(batch) == 200:
                     continue
                 if current["status"] in TERMINAL and run["run_id"] not in service.tasks:
@@ -188,10 +217,19 @@ def build_router(service, *, local_demo=False, demo_origins=None):
         return StreamingResponse(stream(), media_type="application/x-ndjson", headers={"Content-Disposition": f'attachment; filename="research-{run["run_id"]}-trace.jsonl"', "Cache-Control": "no-store"})
 
     @router.get("/{run_id}/report")
-    async def report(format: Literal["json", "md", "html", "docx"] = "json", run=Depends(owned)):
-        if run["status"] != "COMPLETED" or not run.get("report"):
-            raise HTTPException(409, "Report is not ready")
-        value = run["report"]
+    async def report(format: Literal["json", "md", "html", "docx"] = "json", version: int | None = Query(default=None, ge=1), run=Depends(owned)):
+        # Historical cards export their own immutable report, even while a
+        # follow-up is running. Ownership and source ACLs still apply above.
+        if version is not None:
+            value = next((m["report"] for m in run.get("conversation", []) if m.get("report", {}).get("version") == version), None)
+            if value is None and (run.get("report") or {}).get("version") == version:
+                value = run["report"]
+            if value is None:
+                raise HTTPException(404, "Report version not found")
+        else:
+            if run["status"] != "COMPLETED" or not run.get("report"):
+                raise HTTPException(409, "Report is not ready")
+            value = run["report"]
         if format == "json":
             return value
         if format == "docx":

@@ -184,3 +184,15 @@ def test_list_dir_command_head_truncation_is_not_an_error(tmp_path) -> None:
     assert len(entries) == 500
     assert entries[0] == "/dir/f1"
     assert entries[-1] == "/dir/f500"
+
+
+@_POSIX_SH
+def test_persistent_shell_survives_listing_and_retains_its_variables(tmp_path) -> None:
+    (tmp_path / "file.txt").write_text("sample", encoding="utf-8")
+    script = "st=parent; " + remote_list_dir_command(str(tmp_path), 2, isolate=True) + '; printf "\\nPARENT_ALIVE:%s\\n" "$st"'
+    proc = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=5, check=False)
+    assert proc.returncode == 0
+    assert "PARENT_ALIVE:parent" in proc.stdout
+    listing = proc.stdout.split("PARENT_ALIVE:", 1)[0].rstrip() + "\n"
+    assert str(tmp_path / "file.txt") in parse_remote_list_dir_output(listing, str(tmp_path))
+    assert "mktemp" in script and "/tmp/df_find_$$" not in script

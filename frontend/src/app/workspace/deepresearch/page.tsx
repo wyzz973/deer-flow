@@ -1,17 +1,5 @@
-import { ResearchWorkbench } from "@/components/deepresearch/workbench";
-import {
-  WorkspaceBody,
-  WorkspaceContainer,
-  WorkspaceHeader,
-} from "@/components/workspace/workspace-container";
+import { ResearchConversation } from "@/components/deepresearch/research-conversation";
 
 export default function DeepResearchPage() {
-  return (
-    <WorkspaceContainer>
-      <WorkspaceHeader />
-      <WorkspaceBody>
-        <ResearchWorkbench />
-      </WorkspaceBody>
-    </WorkspaceContainer>
-  );
+  return <ResearchConversation key="new" />;
 }

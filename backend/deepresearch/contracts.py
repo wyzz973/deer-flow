@@ -26,6 +26,9 @@ class RunStatus(StrEnum):
     CREATED = "CREATED"
     PLANNING = "PLANNING"
     AWAITING_PLAN_CONFIRMATION = "AWAITING_PLAN_CONFIRMATION"
+    AWAITING_CLARIFICATION = "AWAITING_CLARIFICATION"
+    EDITING_PLAN = "EDITING_PLAN"
+    RESPONDING = "RESPONDING"
     RESEARCHING = "RESEARCHING"
     VALIDATING = "VALIDATING"
     GAP_FOUND = "GAP_FOUND"
@@ -45,9 +48,11 @@ TERMINAL = {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}
 class ResearchBudget(Contract):
     max_iterations: int = Field(default=2, ge=0, le=8)
     max_units: int = Field(default=12, ge=1, le=64)
-    max_tool_calls: int = Field(default=60, ge=2, le=1000)
-    max_elapsed_seconds: int = Field(default=900, ge=10, le=14400)
-    max_model_tokens: int = Field(default=120000, ge=1000, le=2000000)
+    # Null explicitly disables that resource ceiling. Admission still rejects
+    # unbounded requests when the operator configured a finite ceiling.
+    max_tool_calls: int | None = Field(default=60, ge=2, le=1000)
+    max_elapsed_seconds: int | None = Field(default=900, ge=10, le=14400)
+    max_model_tokens: int | None = Field(default=120000, ge=1000, le=2000000)
 
 
 class SourceStrategy(Contract):
@@ -73,12 +78,39 @@ class ResearchUnit(Contract):
     parent_gap_id: str | None = None
 
 
+class SourcePolicy(Contract):
+    """Intent-derived citation scope, not a schema imposed on MCP results."""
+
+    allowed_domains: list[str] = Field(default_factory=list, max_length=50)
+    excluded_url_prefixes: list[str] = Field(default_factory=list, max_length=50)
+    require_original: bool = False
+
+    @field_validator("allowed_domains")
+    @classmethod
+    def valid_domains(cls, values):
+        result = []
+        for value in values:
+            domain = value.lower().strip().rstrip(".")
+            if any(char in domain for char in "/:@*?# ") or "." not in domain:
+                raise ValueError("Source domains must be hostnames, not URLs or wildcards")
+            result.append(domain.encode("idna").decode("ascii"))
+        return list(dict.fromkeys(result))
+
+    @field_validator("excluded_url_prefixes")
+    @classmethod
+    def valid_prefixes(cls, values):
+        return [safe_http_url(value) for value in values]
+
+
 class ResearchPlan(Contract):
     goal: str = Field(min_length=3, max_length=12000)
     research_units: list[ResearchUnit] = Field(min_length=1, max_length=64)
     constraints: list[str] = Field(default_factory=list, max_length=30)
     expected_output: str = "有证据支撑的结构化研究报告"
     plan_version: int = Field(default=1, ge=1)
+    clarification_questions: list[str] = Field(default_factory=list, max_length=3)
+    source_policy: SourcePolicy = Field(default_factory=SourcePolicy)
+    report_style: Literal["brief", "standard", "detailed"] = "standard"
 
     @model_validator(mode="after")
     def acyclic(self):
@@ -131,7 +163,9 @@ class RawEvidence(Contract):
     retrieved_at: str = Field(default_factory=utcnow)
     snippet: str = Field(min_length=1, max_length=20000)
     raw_content_ref: str | None = None
-    provenance: Literal["document", "tool_output"] = "document"
+    provenance: Literal["document", "tool_output", "observed_source", "fetched_document"] = "document"
+    source_id: str | None = None
+    document_hash: str | None = None
 
     _url = field_validator("url")(safe_http_url)
 
@@ -153,11 +187,18 @@ class Finding(Contract):
     high_risk: bool = False
 
 
+class SourceAnnotation(Contract):
+    raw_id: Identifier
+    title: str = Field(default="", max_length=1000)
+    quote: str = Field(default="", max_length=20000)
+
+
 class ResearchResult(Contract):
     unit_id: Identifier
     findings: list[Finding] = Field(default_factory=list, max_length=100)
     raw_evidences: list[RawEvidence] = Field(default_factory=list, max_length=500)
     open_questions: list[str] = Field(default_factory=list, max_length=50)
+    limitations: list[str] = Field(default_factory=list, max_length=30)
     confidence: float = Field(ge=0, le=1)
     searched_origins: list[Origin] = Field(default_factory=list)
 
@@ -188,7 +229,9 @@ class Evidence(Contract):
     content_hash: str
     unit_ids: list[str]
     raw_content_ref: str | None
-    provenance: Literal["document", "tool_output"] = "document"
+    provenance: Literal["document", "tool_output", "observed_source", "fetched_document"] = "document"
+    source_id: str | None = None
+    document_hash: str | None = None
 
 
 class BoundFinding(Contract):
@@ -218,14 +261,36 @@ class ReportSection(Contract):
     segments: list[Segment] = Field(min_length=1, max_length=200)
 
 
+class ComparisonRow(Contract):
+    label: str = Field(min_length=1, max_length=100, description="Dimension label, rendered in a separate first column; not an alternative cell.")
+    cells: list[Segment] = Field(min_length=2, max_length=4)
+
+
+class ComparisonTable(Contract):
+    headers: list[str] = Field(min_length=2, max_length=4, description="Alternative names ONLY, e.g. ['SQLite', 'PostgreSQL']. Do not include the implicit dimension/row-label heading.")
+    rows: list[ComparisonRow] = Field(min_length=1, max_length=10)
+
+    @model_validator(mode="after")
+    def matching_columns(self):
+        if any(len(row.cells) != len(self.headers) for row in self.rows):
+            raise ValueError(
+                "Each comparison row must match the header count: headers must contain only alternative names, not the dimension/row label. For two alternatives use two headers and two cells; each row.label is rendered separately."
+            )
+        return self
+
+
 class StructuredReport(Contract):
     title: str = Field(min_length=1, max_length=500)
     executive_summary: list[Segment] = Field(min_length=1, max_length=100)
+    comparison_table: ComparisonTable | None = None
     sections: list[ReportSection] = Field(min_length=1, max_length=64)
     conclusion: list[Segment] = Field(min_length=1, max_length=100)
 
     def segments(self):
         yield from self.executive_summary
+        if self.comparison_table:
+            for row in self.comparison_table.rows:
+                yield from row.cells
         for section in self.sections:
             yield from section.segments
         yield from self.conclusion
@@ -242,8 +307,24 @@ class PlanDecision(Contract):
     plan_version: int = Field(ge=1)
 
 
+class RetryResearch(Contract):
+    # Explicit owner consent, not a model-controlled completeness decision.
+    allow_limited_report: bool | None = None
+
+
 class PlanEdit(PlanDecision):
     plan: ResearchPlan
+
+
+class ConversationMessage(Contract):
+    text: str = Field(min_length=1, max_length=12000)
+    client_message_id: Identifier
+    plan_version: int | None = Field(default=None, ge=1)
+
+
+class FollowupResult(Contract):
+    action: Literal["answer", "revise", "research"]
+    text: str = Field(min_length=1, max_length=20000)
 
 
 class ResearchError(RuntimeError):

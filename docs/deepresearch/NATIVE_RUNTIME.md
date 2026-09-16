@@ -20,7 +20,7 @@ flowchart TD
   V -->|gaps| D
   V --> S[Native synthesizer]
   S --> C[Output contract and citation binder]
-  C --> R[Shared workbench and report export]
+  C --> R[Shared conversation and versioned report export]
 ```
 
 ## 各层所有权
@@ -33,7 +33,7 @@ flowchart TD
 
 ## MCP 不需要统一返回格式
 
-`runner._source_tools` 从宿主缓存选择原始工具，通过宿主 MCP source metadata 确认服务身份。原对象进入执行器，其名称、描述、参数 schema、返回内容块、artifact、传输和 interceptor 不被重写。
+`runner._source_tools` 对 `kind: mcp` 从宿主缓存选择原始工具，通过宿主 MCP source metadata 确认服务身份；对 `kind: native` 从宿主工具工厂按精确名称选择。仅使用原生来源时不触发 MCP 发现。原对象进入执行器，其名称、描述、参数 schema、返回内容块、artifact、传输和 interceptor 不被重写。
 
 不再：要求 `results/title/url/snippet`、把工具包装成 `query`、强制先检索两路、为每个响应设计 adapter、自动重放任意工具调用。旧 `fields/results_path/query_arg/fixed_args/response_mode` 只为读取旧配置保留，已无执行效果。
 
@@ -61,10 +61,26 @@ LangGraph checkpoint 控制 interrupt/resume。研究业务库记录计划、报
 
 ## 前端和观测
 
-工作区复用 Sidebar、WorkspaceContainer/Header/Body、宿主 fetcher 和主题；表单使用 Button/Input/Textarea，来源抽屉使用现有 Sheet，继承键盘、焦点和动画行为。研究计划、报告引用和 Trace 展示是领域组件。
+工作区复用原生 Sidebar、`ChatSurface`、`MessageList`、`PromptInput` 和 `ChatBox` 可调整侧面板，沿用宿主 fetcher、主题及移动端 Sheet。普通对话也使用同一 `ChatSurface`，不是把原生页面复制成另一份研究 UI。计划、报告和引用是消息内领域组件；没有独立研究约束表单或页面内历史列表。
+
+前端只投影服务端 `conversation` 为原生消息列表，不能调用伪造的 LangGraph SDK 写方法。用户自然语言进入意图理解，必要时澄清，然后产生有版本的计划卡。默认 45 秒倒计时保存在服务端；编辑立即暂停，同一输入框修改；刷新和多标签页不重新创建启动期限。进程重启暂停未批准计划，不持久化凭据。
+
+右侧来源视图区分报告引用和已发现链接，并按域名/连接器组织引用；活动视图展示实际 Agent 工具调用。链接观察发生在旁路，不要求 MCP 更换结果 schema，也不阻止模型读取原始结果。原文读取、语义支持和发布日期不能从“出现了链接”推断出来。
+
+完成后的解释复用已有报告，改写创建新报告版本而不重复研究，需要新证据时开启新轮次。缓存键包含研究轮次，旧版报告仍可按版本导出。运行中更新需求尚未实现，不声称新消息已经改变正在执行的任务。
 
 本地 span 和轮转日志依赖原生模型/工具回调。Trace 按 run owner/ACL 查询与导出，默认载荷限长脱敏；运营日志只记运行元数据。详见 README 和 API 文档。没有 LangSmith 服务依赖。
 
 ## 保留的领域能力及限制
+
+真实集成还验证了两个不能只靠 API 兼容性判断的边界：原生 `max_turns` 消耗的是
+包含中间件的图步骤，而不是简单模型轮数；原生 Skill 读取需要 `read_file`，不能
+宣告技能却只保留网页工具。默认继承原生递归上限，Planner/Writer 可读取方法论，
+Researcher 保留宿主候选能力与原生授权。原生预算中间件提供提前收尾预警，研究
+总预算仍独立约束全工作流。模型输入只传当前阶段需要的资料，完整证据留在审计库。
+
+输出契约通过普通提示提供给 Planner/Writer，符合契约的结果不再调用第二个模型；
+Researcher 仍直接读取原始工具结果，后置转换只接收紧凑的回执/来源标识，不重复
+读取全部原始载荷。没有开启供应商 JSON mode。
 
 没有把研究业务表直接写进聊天消息库：审批版本、跨单元证据与报告导出是不同契约。研究 API 使用宿主 principal，执行使用原生子 Agent，而 Lead-only 记忆写入、Gateway 聊天历史和上传不在本次范围。逐层评审见 REUSE_AUDIT.md。

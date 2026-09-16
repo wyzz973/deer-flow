@@ -392,3 +392,12 @@ See `docs/` directory for detailed documentation:
 - [PATH_EXAMPLES.md](docs/PATH_EXAMPLES.md) - Path types and usage
 - [summarization.md](docs/summarization.md) - Context summarization
 - [plan_mode_usage.md](docs/plan_mode_usage.md) - Plan mode with TodoList
+
+### Native web page excerpts
+
+The Jina-backed `web_fetch` tool accepts `start_index`, bounded `max_length`, and
+an optional literal `query`. Long pages include explicit continuation positions
+instead of silent 4096-character truncation. Its standard LangChain artifact
+`deerflow.web_page.v1` records title, URL, document hash and excerpt coordinates;
+callers should preserve this optional metadata without imposing it on arbitrary
+MCP tools. Fetch failures use native ToolException handling and error status.

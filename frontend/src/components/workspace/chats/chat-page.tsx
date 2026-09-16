@@ -66,6 +66,7 @@ import { env } from "@/env";
 import { cn } from "@/lib/utils";
 
 import { ChatBox } from "./chat-box";
+import { ChatSurface } from "./chat-surface";
 import { useSpecificChatMode } from "./use-chat-mode";
 import { useThreadChat } from "./use-thread-chat";
 
@@ -358,216 +359,196 @@ export default function ChatPage() {
         isMock={isMock}
       >
         <ChatBox threadId={threadId} browserEnabled={browserEnabled}>
-          <div className="relative flex size-full min-h-0 justify-between">
-            <header
-              className={cn(
-                "absolute top-0 right-0 left-0 flex h-12 shrink-0 items-center gap-2 px-2 sm:px-4",
-                isWelcomeMode
-                  ? "bg-background/0 z-40 backdrop-blur-none"
-                  : "bg-background/80 z-30 shadow-xs backdrop-blur",
-              )}
-            >
-              {!isMock && <SidebarTrigger className="md:hidden" />}
-              <div className="flex min-w-0 flex-1 items-center gap-2 text-sm font-medium">
-                <ThreadTitle
-                  threadId={threadId}
-                  thread={thread}
-                  canonicalTitle={threadMetadata.data?.values?.title}
-                />
-                {!isNewThread &&
-                  !isMock &&
-                  env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY !== "true" && (
-                    <ThreadArchiveStatus
-                      threadId={threadId}
-                      metadata={threadMetadata.data?.metadata}
-                    />
-                  )}
-                {affiliatedProjectId && (
-                  <ProjectAffiliationBadge projectId={affiliatedProjectId} />
-                )}
-              </div>
-              <div className="flex shrink-0 items-center gap-2">
-                {!isNewThread &&
-                  !isMock &&
-                  env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY !== "true" && (
-                    <ThreadBackgroundTasks threadId={threadId} />
-                  )}
-                {!isNewThread &&
-                  !isMock &&
-                  env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY !== "true" && (
-                    <ThreadSubagentBatches threadId={threadId} />
-                  )}
-                {!isNewThread && !isMock && (
-                  <ThreadScheduledTasksLink threadId={threadId} />
-                )}
-                {tokenUsageEnabled ? (
-                  <TokenUsageIndicator
-                    threadId={isNewThread ? undefined : threadId}
-                    backendUsage={backendTokenUsage}
-                    contextUsage={contextUsage}
-                    enabled={tokenUsageEnabled}
-                    messages={thread.messages}
-                    pendingMessages={pendingUsageMessages}
-                    preferences={localSettings.tokenUsage}
-                    onPreferencesChange={(preferences) =>
-                      setLocalSettings("tokenUsage", preferences)
-                    }
+          <ChatSurface
+            isWelcomeMode={isWelcomeMode}
+            header={
+              <>
+                {!isMock && <SidebarTrigger className="md:hidden" />}
+                <div className="flex min-w-0 flex-1 items-center gap-2 text-sm font-medium">
+                  <ThreadTitle
+                    threadId={threadId}
+                    thread={thread}
+                    canonicalTitle={threadMetadata.data?.values?.title}
                   />
-                ) : (
-                  <ContextUsageBadge contextUsage={contextUsage} />
-                )}
-                <SidecarTrigger />
-                {browserEnabled && <BrowserTrigger />}
-                <ExportTrigger threadId={threadId} />
-                <ArtifactTrigger />
-              </div>
-            </header>
-            <main className="flex min-h-0 max-w-full grow flex-col">
-              <div className="flex min-h-0 flex-1 justify-center">
-                <MessageList
-                  archiveDownloadsEnabled={
-                    isNewThread || isMock || threadMetadata.data != null
-                  }
-                  className={cn("size-full", !isWelcomeMode && "pt-10")}
-                  testId="main-message-list"
-                  threadId={threadId}
-                  thread={thread}
-                  enableConversationOutline
-                  paddingBottom={MESSAGE_LIST_DEFAULT_PADDING_BOTTOM}
-                  hasMoreHistory={hasMoreHistory}
-                  loadMoreHistory={loadMoreHistory}
-                  isHistoryLoading={isHistoryLoading}
-                  tokenUsageInlineMode={tokenUsageInlineMode}
-                  canRegenerate={
-                    !isNewThread &&
+                  {!isNewThread &&
                     !isMock &&
-                    env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY !== "true" &&
-                    !isUploading &&
-                    !thread.isLoading
-                  }
-                  onRegenerateMessage={handleRegenerate}
-                  canEdit={
-                    !isNewThread &&
-                    !isMock &&
-                    env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY !== "true" &&
-                    !isUploading &&
-                    !thread.isLoading &&
-                    !branchThread.isPending &&
-                    !hasGoal &&
-                    !hasOpenHumanInputCard
-                  }
-                  onEditAndRegenerateMessage={handleEditAndRegenerate}
-                  onSubmitHumanInput={
-                    isMock || env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY === "true"
-                      ? undefined
-                      : handleSubmitHumanInput
-                  }
-                  canBranch={
-                    !isNewThread &&
-                    !isMock &&
-                    env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY !== "true" &&
-                    !isUploading &&
-                    !thread.isLoading &&
-                    !branchThread.isPending
-                  }
-                  onBranchTurn={handleBranchTurn}
-                />
-              </div>
-              <div
-                className={cn(
-                  "right-0 bottom-0 left-0 z-30 flex justify-center px-3 sm:px-4",
-                  isWelcomeMode ? "absolute" : "relative shrink-0 pb-4",
-                )}
-              >
-                <div
-                  className={cn(
-                    "relative w-full",
-                    isWelcomeMode &&
-                      "-translate-y-[calc(50vh-48px)] sm:-translate-y-[calc(50vh-96px)]",
-                    isWelcomeMode
-                      ? "max-w-(--container-width-sm)"
-                      : "max-w-(--container-width-md)",
-                  )}
-                >
-                  {(hasGoal || hasTodos) && (
-                    <div
-                      className={cn(
-                        "right-0 left-0 z-0",
-                        isWelcomeMode ? "absolute -top-4" : "relative",
-                      )}
-                    >
-                      <div
-                        className={cn(
-                          "right-0 bottom-0 left-0 flex flex-col",
-                          isWelcomeMode ? "absolute" : "relative",
-                        )}
-                      >
-                        {activeGoal && <GoalStatus goal={activeGoal} />}
-                        {hasTodos && (
-                          <TodoList
-                            className="bg-background/5"
-                            todos={thread.values.todos ?? []}
-                            hidden={false}
-                          />
-                        )}
-                      </div>
-                    </div>
-                  )}
-                  {mountedRef.current ? (
-                    <InputBox
-                      className={cn(
-                        "bg-background/5 w-full",
-                        isWelcomeMode && "-translate-y-2 sm:-translate-y-4",
-                      )}
-                      isWelcomeMode={isWelcomeMode}
-                      threadId={threadId}
-                      draftThreadId={isNewThread ? "new" : threadId}
-                      autoFocus={isWelcomeMode}
-                      status={
-                        thread.error
-                          ? "error"
-                          : thread.isLoading
-                            ? "streaming"
-                            : "ready"
-                      }
-                      context={settings.context}
-                      extraHeader={
-                        isWelcomeMode &&
-                        !hasGoal &&
-                        !hasTodos && <Welcome mode={settings.context.mode} />
-                      }
-                      disabled={
-                        isMock ||
-                        env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY === "true" ||
-                        isUploading ||
-                        (!isNewThread && isHistoryLoading)
-                      }
-                      onContextChange={(context) =>
-                        setSettings("context", context)
-                      }
-                      onGoalChange={setLocalGoal}
-                      onPrepareThread={ensureProjectThread}
-                      onSubmit={handleSubmit}
-                      onStop={handleStop}
-                    />
-                  ) : (
-                    <div
-                      aria-hidden="true"
-                      className={cn(
-                        "bg-background/5 h-32 w-full rounded-2xl",
-                        isWelcomeMode && "-translate-y-2 sm:-translate-y-4",
-                      )}
-                    />
-                  )}
-                  {env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY === "true" && (
-                    <div className="text-muted-foreground/67 w-full translate-y-12 text-center text-xs">
-                      {t.common.notAvailableInDemoMode}
-                    </div>
+                    env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY !== "true" && (
+                      <ThreadArchiveStatus
+                        threadId={threadId}
+                        metadata={threadMetadata.data?.metadata}
+                      />
+                    )}
+                  {affiliatedProjectId && (
+                    <ProjectAffiliationBadge projectId={affiliatedProjectId} />
                   )}
                 </div>
-              </div>
-            </main>
-          </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  {!isNewThread &&
+                    !isMock &&
+                    env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY !== "true" && (
+                      <ThreadBackgroundTasks threadId={threadId} />
+                    )}
+                  {!isNewThread &&
+                    !isMock &&
+                    env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY !== "true" && (
+                      <ThreadSubagentBatches threadId={threadId} />
+                    )}
+                  {!isNewThread && !isMock && (
+                    <ThreadScheduledTasksLink threadId={threadId} />
+                  )}
+                  {tokenUsageEnabled ? (
+                    <TokenUsageIndicator
+                      threadId={isNewThread ? undefined : threadId}
+                      backendUsage={backendTokenUsage}
+                      contextUsage={contextUsage}
+                      enabled={tokenUsageEnabled}
+                      messages={thread.messages}
+                      pendingMessages={pendingUsageMessages}
+                      preferences={localSettings.tokenUsage}
+                      onPreferencesChange={(preferences) =>
+                        setLocalSettings("tokenUsage", preferences)
+                      }
+                    />
+                  ) : (
+                    <ContextUsageBadge contextUsage={contextUsage} />
+                  )}
+                  <SidecarTrigger />
+                  {browserEnabled && <BrowserTrigger />}
+                  <ExportTrigger threadId={threadId} />
+                  <ArtifactTrigger />
+                </div>
+              </>
+            }
+            messages={
+              <MessageList
+                archiveDownloadsEnabled={
+                  isNewThread || isMock || threadMetadata.data != null
+                }
+                className={cn("size-full", !isWelcomeMode && "pt-10")}
+                testId="main-message-list"
+                threadId={threadId}
+                thread={thread}
+                enableConversationOutline
+                paddingBottom={MESSAGE_LIST_DEFAULT_PADDING_BOTTOM}
+                hasMoreHistory={hasMoreHistory}
+                loadMoreHistory={loadMoreHistory}
+                isHistoryLoading={isHistoryLoading}
+                tokenUsageInlineMode={tokenUsageInlineMode}
+                canRegenerate={
+                  !isNewThread &&
+                  !isMock &&
+                  env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY !== "true" &&
+                  !isUploading &&
+                  !thread.isLoading
+                }
+                onRegenerateMessage={handleRegenerate}
+                canEdit={
+                  !isNewThread &&
+                  !isMock &&
+                  env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY !== "true" &&
+                  !isUploading &&
+                  !thread.isLoading &&
+                  !branchThread.isPending &&
+                  !hasGoal &&
+                  !hasOpenHumanInputCard
+                }
+                onEditAndRegenerateMessage={handleEditAndRegenerate}
+                onSubmitHumanInput={
+                  isMock || env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY === "true"
+                    ? undefined
+                    : handleSubmitHumanInput
+                }
+                canBranch={
+                  !isNewThread &&
+                  !isMock &&
+                  env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY !== "true" &&
+                  !isUploading &&
+                  !thread.isLoading &&
+                  !branchThread.isPending
+                }
+                onBranchTurn={handleBranchTurn}
+              />
+            }
+            composer={
+              <>
+                {(hasGoal || hasTodos) && (
+                  <div
+                    className={cn(
+                      "right-0 left-0 z-0",
+                      isWelcomeMode ? "absolute -top-4" : "relative",
+                    )}
+                  >
+                    <div
+                      className={cn(
+                        "right-0 bottom-0 left-0 flex flex-col",
+                        isWelcomeMode ? "absolute" : "relative",
+                      )}
+                    >
+                      {activeGoal && <GoalStatus goal={activeGoal} />}
+                      {hasTodos && (
+                        <TodoList
+                          className="bg-background/5"
+                          todos={thread.values.todos ?? []}
+                          hidden={false}
+                        />
+                      )}
+                    </div>
+                  </div>
+                )}
+                {mountedRef.current ? (
+                  <InputBox
+                    className={cn(
+                      "bg-background/5 w-full",
+                      isWelcomeMode && "-translate-y-2 sm:-translate-y-4",
+                    )}
+                    isWelcomeMode={isWelcomeMode}
+                    threadId={threadId}
+                    draftThreadId={isNewThread ? "new" : threadId}
+                    autoFocus={isWelcomeMode}
+                    status={
+                      thread.error
+                        ? "error"
+                        : thread.isLoading
+                          ? "streaming"
+                          : "ready"
+                    }
+                    context={settings.context}
+                    extraHeader={
+                      isWelcomeMode &&
+                      !hasGoal &&
+                      !hasTodos && <Welcome mode={settings.context.mode} />
+                    }
+                    disabled={
+                      isMock ||
+                      env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY === "true" ||
+                      isUploading ||
+                      (!isNewThread && isHistoryLoading)
+                    }
+                    onContextChange={(context) =>
+                      setSettings("context", context)
+                    }
+                    onGoalChange={setLocalGoal}
+                    onPrepareThread={ensureProjectThread}
+                    onSubmit={handleSubmit}
+                    onStop={handleStop}
+                  />
+                ) : (
+                  <div
+                    aria-hidden="true"
+                    className={cn(
+                      "bg-background/5 h-32 w-full rounded-2xl",
+                      isWelcomeMode && "-translate-y-2 sm:-translate-y-4",
+                    )}
+                  />
+                )}
+                {env.NEXT_PUBLIC_STATIC_WEBSITE_ONLY === "true" && (
+                  <div className="text-muted-foreground/67 w-full translate-y-12 text-center text-xs">
+                    {t.common.notAvailableInDemoMode}
+                  </div>
+                )}
+              </>
+            }
+          />
         </ChatBox>
       </SidecarProvider>
     </ThreadContext.Provider>

@@ -302,6 +302,7 @@ export function MessageList({
   sidecarSurface = false,
   initialScroll = "smooth",
   resizeScroll = "smooth",
+  renderMessage,
 }: {
   archiveDownloadsEnabled?: boolean;
   className?: string;
@@ -337,6 +338,8 @@ export function MessageList({
   sidecarSurface?: boolean;
   initialScroll?: ConversationProps["initial"];
   resizeScroll?: ConversationProps["resize"];
+  /** Domain cards can supply a body while retaining native grouping/scrolling. */
+  renderMessage?: (message: Message) => ReactNode | undefined;
 }) {
   const { t } = useI18n();
   const sidecar = useMaybeSidecar();
@@ -1118,7 +1121,7 @@ export function MessageList({
                     )}
                   >
                     {group.messages.map((msg) => {
-                      const item = (
+                      const item = renderMessage?.(msg) ?? (
                         <MessageListItem
                           message={msg}
                           isLoading={

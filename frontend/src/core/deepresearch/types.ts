@@ -2,9 +2,9 @@ export type Origin = "internal" | "external";
 export type Budget = {
   max_iterations: number;
   max_units: number;
-  max_tool_calls: number;
-  max_elapsed_seconds: number;
-  max_model_tokens: number;
+  max_tool_calls: number | null;
+  max_elapsed_seconds: number | null;
+  max_model_tokens: number | null;
 };
 export type Unit = {
   id: string;
@@ -26,6 +26,13 @@ export type Plan = {
   constraints: string[];
   expected_output: string;
   plan_version: number;
+  clarification_questions?: string[];
+  report_style?: "brief" | "standard" | "detailed";
+  source_policy?: {
+    allowed_domains: string[];
+    excluded_url_prefixes: string[];
+    require_original: boolean;
+  };
 };
 export type Segment = {
   text: string;
@@ -44,17 +51,32 @@ export type Evidence = {
   published_at: string | null;
   snippet: string;
   unit_ids: string[];
+  source_id?: string | null;
+  provenance?:
+    | "document"
+    | "tool_output"
+    | "observed_source"
+    | "fetched_document";
+  document_hash?: string | null;
 };
 export type Report = {
   version: number;
   report: {
     title: string;
     executive_summary: Segment[];
+    comparison_table?: {
+      headers: string[];
+      rows: { label: string; cells: Segment[] }[];
+    } | null;
     sections: { heading: string; unit_ids: string[]; segments: Segment[] }[];
     conclusion: Segment[];
   };
   markdown: string;
-  citations: (Evidence & { number: number })[];
+  citations: (Evidence & {
+    number: number;
+    evidence_ids?: string[];
+    excerpts?: { evidence_id: string; text: string }[];
+  })[];
   citation_map: Record<string, number>;
   limitations: string[];
   demo: boolean;
@@ -82,6 +104,54 @@ export type Run = {
   error: { code: string; message: string; recoverable: boolean } | null;
   demo: boolean;
   budget: Budget;
+  auto_start_at?: string | null;
+  auto_start_paused?: boolean;
+  server_time?: string;
+  /** Client-only monotonic receipt time; never sent back or persisted. */
+  client_received_at?: number;
+  cycle?: number;
+  conversation?: ResearchMessage[];
+};
+export type ResearchMessage = {
+  id: string;
+  role: "user" | "assistant";
+  kind: "text" | "plan" | "report" | "clarification";
+  text: string;
+  at: string;
+  plan?: Plan;
+  report?: Report;
+  cycle?: number;
+};
+export type DiscoveredSource = {
+  id: string;
+  url: string;
+  domain: string;
+  title: string;
+  title_observed: boolean;
+  connector: string | null;
+  origin: Origin | "runtime";
+  status: "discovered" | "read";
+  call_ids: string[];
+  excerpt: string;
+};
+export type ResearchCall = {
+  id: string;
+  tool_name: string;
+  agent_name?: string;
+  unit_id?: string;
+  execution_id?: string;
+  provider_call_id?: string;
+  started_at?: string;
+  ended_at?: string;
+  status: "running" | "success" | "error";
+  duration_ms?: number;
+  domains?: string[];
+  source_ids?: string[];
+  error_type?: string;
+};
+export type ResearchSources = {
+  sources: DiscoveredSource[];
+  calls: ResearchCall[];
 };
 export type Capabilities = {
   mode: string;
@@ -89,6 +159,7 @@ export type Capabilities = {
   skills: Record<string, { description: string; agent: string }>;
   sources: { name: string; origin: Origin; level: string }[];
   budget_ceiling: Budget;
+  plan_countdown_seconds: number;
 };
 export type ResearchEvent = {
   seq: number;

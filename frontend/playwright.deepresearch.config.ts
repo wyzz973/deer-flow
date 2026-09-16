@@ -5,7 +5,8 @@ const frontendUrl = `http://127.0.0.1:${frontendPort}`;
 
 export default defineConfig({
   testDir: "./tests/deepresearch",
-  timeout: 60_000,
+  timeout: 90_000,
+  workers: 2,
   use: { baseURL: frontendUrl, trace: "retain-on-failure" },
   reporter: [
     ["list"],
@@ -17,10 +18,12 @@ export default defineConfig({
         "python -m uvicorn deepresearch.demo:app --app-dir ../backend --host 127.0.0.1 --port 8022",
       url: "http://127.0.0.1:8022/docs",
       timeout: 60_000,
-      reuseExistingServer: false,
+      reuseExistingServer: process.env.DEEPRESEARCH_E2E_REUSE_BACKEND === "1",
       env: {
         DEEPRESEARCH_DEMO_DATA_DIR: ".deerflow/deepresearch/e2e",
         DEEPRESEARCH_DEMO_FRONTEND_PORT: frontendPort,
+        DEEPRESEARCH_DEMO_PLAN_COUNTDOWN: "5",
+        DEEPRESEARCH_DEMO_STEP_DELAY: "0.2",
       },
     },
     {

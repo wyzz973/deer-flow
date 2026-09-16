@@ -19,17 +19,27 @@ async def run_structured(runner, run, skill_name, payload, schema, tools=None, a
 
     spec, configured = await runner._agent_config(skill_name)
     context = get_runtime().context or {}
-    execution = await execute_role(runner.settings, runner.store, run, skill_name, payload, tools, agent or configured, context)
+    # Ask the native role for our output contract up front. This is ordinary
+    # prompt text, not provider JSON mode; conversion remains a fallback.
+    native_payload = {**payload, "output_schema": schema.model_json_schema()}
+    execution = await execute_role(runner.settings, runner.store, run, skill_name, native_payload, tools, agent or configured, context)
     return await convert_answer(runner, run, skill_name, payload, schema, execution.answer, context)
 
 
-async def convert_answer(runner, run, skill_name, payload, schema, answer, context):
+async def convert_answer(runner, run, skill_name, payload, schema, answer, context, *, validator=None):
     """Validate our own output contract; never normalize a tool's return value."""
     from deerflow.models import create_chat_model
 
     spec, configured = await runner._agent_config(skill_name)
+
+    def validated(text):
+        value = parse_contract(text, schema)
+        if validator is not None:
+            validator(value)
+        return value
+
     try:
-        return parse_contract(answer, schema)
+        return validated(answer)
     except ValueError:
         pass
     settings = runner.settings
@@ -50,17 +60,26 @@ async def convert_answer(runner, run, skill_name, payload, schema, answer, conte
     async with trace.span("contract:" + schema.__name__, "conversion") as output:
         callbacks = model_callbacks(trace, model_name=model_name)
         for attempt in range(settings.output_retries + 1):
-            response = await asyncio.wait_for(model.ainvoke(messages, config={"callbacks": [callbacks]}), timeout=spec.timeout_seconds)
+            try:
+                response = await asyncio.wait_for(model.ainvoke(messages, config={"callbacks": [callbacks]}), timeout=spec.timeout_seconds)
+            except Exception:
+                if getattr(callbacks, "provider_error", None):
+                    raise callbacks.provider_error from None
+                raise
             text = visible_text(response.content)
             try:
-                value = parse_contract(text, schema)
+                value = validated(text)
                 output.update(attempts=attempt + 1, contract=value.model_dump(mode="json"))
                 return value
-            except ValueError:
+            except ValueError as error:
                 await runner.store.event(run["run_id"], "research.output.retry", {"skill": skill_name, "contract": schema.__name__, "attempt": attempt + 1})
                 # Keep one failed answer, not an ever-growing retry transcript.
                 messages = messages[:2] + [
                     {"role": "assistant", "content": text},
-                    {"role": "user", "content": "The previous reply did not satisfy the schema. Return the complete object with all required fields and the exact supplied IDs. Do not include explanatory text outside the object."},
+                    {
+                        "role": "user",
+                        "content": "The previous reply failed validation: " + str(error)[:2000] + "\nReturn the complete object with all required fields and the exact supplied IDs. "
+                        "Do not guess or fabricate references. Do not include explanatory text outside the object.",
+                    },
                 ]
     raise ResearchError("OUTPUT_SCHEMA", "Output conversion failed after bounded retries; inspect the local trace")

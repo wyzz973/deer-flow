@@ -19,15 +19,18 @@ class SkillSpec(Contract):
     description: str
     model: str | None = None
     system_prompt: str = ""
-    max_turns: int = Field(default=12, ge=1, le=60)
+    # The host interprets this as graph recursion steps, not model exchanges.
+    # Inherit its configured limit unless the operator explicitly tightens it.
+    max_turns: int | None = Field(default=None, ge=1, le=1000)
     timeout_seconds: int = Field(default=180, ge=5, le=1800)
 
 
 class SourceSpec(Contract):
     name: Identifier
     origin: Origin
-    server: str
-    tool: str  # Exact exposed MCP tool name; no prefix guessing.
+    kind: Literal["mcp", "native"] = "mcp"
+    server: str | None = None
+    tool: str  # Exact host tool name; no prefix guessing or response adapter.
     level: Level = "L4"
     priority: int = 100
     publisher: str = "unclassified"
@@ -47,6 +50,14 @@ class SourceSpec(Contract):
         }
     )
 
+    @model_validator(mode="after")
+    def valid_binding(self):
+        if self.kind == "mcp" and not self.server:
+            raise ValueError("MCP sources need an explicit server name")
+        if self.kind == "native" and self.server is not None:
+            raise ValueError("Native sources do not select an MCP server")
+        return self
+
 
 class Settings(Contract):
     _skill_cache: dict[str, str] = PrivateAttr(default_factory=dict)
@@ -59,9 +70,10 @@ class Settings(Contract):
     source_fallback: list[str] = Field(default_factory=list)
     max_concurrency: int = Field(default=3, ge=1, le=8)
     max_active_runs: int = Field(default=8, ge=1, le=100)
+    plan_countdown_seconds: float = Field(default=45, ge=0.05, le=600)
     tool_timeout_seconds: int = Field(default=45, ge=1, le=300)
     tool_retries: int = Field(default=1, ge=0, le=3)
-    max_output_tokens: int = Field(default=4096, ge=128, le=32000)
+    max_output_tokens: int = Field(default=4096, ge=128, le=393216)
     output_retries: int = Field(default=2, ge=0, le=4)
     extraction_model: str | None = None
     native_tools: list[str] | None = None  # Optional ceiling; native Agent/Skill authorization is authoritative.
@@ -89,7 +101,7 @@ class Settings(Contract):
         if self.runner == "deerflow" and not self.sources:
             raise ValueError("DeerFlow mode needs at least one configured source")
         if self.runner == "deerflow" and self.require_dual_source and {s.origin for s in self.sources} != {"internal", "external"}:
-            raise ValueError("DeerFlow mode needs explicit internal and external MCP bindings")
+            raise ValueError("DeerFlow mode needs explicit internal and external source bindings")
         if not set(self.source_fallback).issubset(names):
             raise ValueError("Unknown fallback source")
         return self

@@ -1,8 +1,8 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "DeerFlow DeepResearch API",
-    "version": "1.0.0"
+    "title": "DeepResearch local synthetic demo",
+    "version": "0.1.0"
   },
   "paths": {
     "/api/deepresearch/capabilities": {
@@ -212,6 +212,196 @@
         }
       }
     },
+    "/api/deepresearch/{run_id}/plan/pause": {
+      "post": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Pause",
+        "operationId": "pause_api_deepresearch__run_id__plan_pause_post",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlanDecision"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/deepresearch/{run_id}/plan/resume": {
+      "post": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Resume",
+        "operationId": "resume_api_deepresearch__run_id__plan_resume_post",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlanDecision"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/deepresearch/{run_id}/messages": {
+      "post": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Message",
+        "operationId": "message_api_deepresearch__run_id__messages_post",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConversationMessage"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/deepresearch/{run_id}/sources": {
+      "get": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Sources",
+        "operationId": "sources_api_deepresearch__run_id__sources_get",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/deepresearch/{run_id}/plan/edit": {
       "post": {
         "tags": [
@@ -370,6 +560,23 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/RetryResearch"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
         "responses": {
           "202": {
             "description": "Successful Response",
@@ -634,6 +841,23 @@
               "default": "json",
               "title": "Format"
             }
+          },
+          {
+            "name": "version",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Version"
+            }
           }
         ],
         "responses": {
@@ -661,6 +885,40 @@
   },
   "components": {
     "schemas": {
+      "ConversationMessage": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 12000,
+            "minLength": 1,
+            "title": "Text"
+          },
+          "client_message_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$",
+            "title": "Client Message Id"
+          },
+          "plan_version": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plan Version"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "text",
+          "client_message_id"
+        ],
+        "title": "ConversationMessage"
+      },
       "CreateResearch": {
         "properties": {
           "query": {
@@ -761,23 +1019,44 @@
             "default": 12
           },
           "max_tool_calls": {
-            "type": "integer",
-            "maximum": 1000.0,
-            "minimum": 2.0,
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 1000.0,
+                "minimum": 2.0
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Max Tool Calls",
             "default": 60
           },
           "max_elapsed_seconds": {
-            "type": "integer",
-            "maximum": 14400.0,
-            "minimum": 10.0,
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 14400.0,
+                "minimum": 10.0
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Max Elapsed Seconds",
             "default": 900
           },
           "max_model_tokens": {
-            "type": "integer",
-            "maximum": 2000000.0,
-            "minimum": 1000.0,
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 2000000.0,
+                "minimum": 1000.0
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Max Model Tokens",
             "default": 120000
           }
@@ -821,6 +1100,27 @@
             "minimum": 1.0,
             "title": "Plan Version",
             "default": 1
+          },
+          "clarification_questions": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 3,
+            "title": "Clarification Questions"
+          },
+          "source_policy": {
+            "$ref": "#/components/schemas/SourcePolicy"
+          },
+          "report_style": {
+            "type": "string",
+            "enum": [
+              "brief",
+              "standard",
+              "detailed"
+            ],
+            "title": "Report Style",
+            "default": "standard"
           }
         },
         "additionalProperties": false,
@@ -975,6 +1275,53 @@
           "type"
         ],
         "title": "ValidationError"
+      },
+      "RetryResearch": {
+        "properties": {
+          "allow_limited_report": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Allow Limited Report"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "RetryResearch"
+      },
+      "SourcePolicy": {
+        "properties": {
+          "allowed_domains": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 50,
+            "title": "Allowed Domains"
+          },
+          "excluded_url_prefixes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 50,
+            "title": "Excluded Url Prefixes"
+          },
+          "require_original": {
+            "type": "boolean",
+            "title": "Require Original",
+            "default": false
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "SourcePolicy",
+        "description": "Intent-derived citation scope, not a schema imposed on MCP results."
       }
     }
   }
