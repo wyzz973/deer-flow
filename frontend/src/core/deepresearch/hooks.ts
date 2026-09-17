@@ -37,6 +37,10 @@ export function useResearchConversation(initialRunId?: string, apiBase = "") {
     () => ["research-sources", api.root, runId],
     [api.root, runId],
   );
+  const activityKey = useMemo(
+    () => ["research-activity", api.root, runId],
+    [api.root, runId],
+  );
   const cap = useQuery({
     queryKey: ["research-capabilities", api.root],
     queryFn: api.capabilities,
@@ -54,6 +58,12 @@ export function useResearchConversation(initialRunId?: string, apiBase = "") {
   const sources = useQuery({
     queryKey: sourcesKey,
     queryFn: () => api.sources(runId!),
+    enabled: Boolean(runId),
+    retry: false,
+  });
+  const activity = useQuery({
+    queryKey: activityKey,
+    queryFn: () => api.activity(runId!),
     enabled: Boolean(runId),
     retry: false,
   });
@@ -82,6 +92,7 @@ export function useResearchConversation(initialRunId?: string, apiBase = "") {
       if (selectedId.current !== runId) return;
       void client.invalidateQueries({ queryKey: runKey });
       void client.invalidateQueries({ queryKey: sourcesKey });
+      void client.invalidateQueries({ queryKey: activityKey });
     };
     // A process restart can change durable status without emitting a new event.
     // Reconcile on reconnect even when the replay cursor has no new frames.
@@ -108,14 +119,17 @@ export function useResearchConversation(initialRunId?: string, apiBase = "") {
       stream.close();
       if (refresh) clearTimeout(refresh);
     };
-  }, [api.root, client, epoch, runId, runKey, sourcesKey, status]);
+  }, [api.root, client, epoch, runId, runKey, sourcesKey, activityKey, status]);
 
   useEffect(() => {
-    if (status && terminal.has(status))
+    if (status && terminal.has(status)) {
       void client.invalidateQueries({
         queryKey: ["research-history", api.root],
       });
-  }, [api.root, client, runId, status]);
+      // The stream closes on terminal status; fetch the final timeline once.
+      void client.invalidateQueries({ queryKey: activityKey });
+    }
+  }, [activityKey, api.root, client, runId, status]);
 
   const commitUrl = useCallback(
     (id?: string) => {
@@ -177,6 +191,7 @@ export function useResearchConversation(initialRunId?: string, apiBase = "") {
           save(updated);
           setEpoch((value) => value + 1);
           void client.invalidateQueries({ queryKey: sourcesKey });
+          void client.invalidateQueries({ queryKey: activityKey });
         }
         return updated;
       } catch (cause) {
@@ -189,7 +204,7 @@ export function useResearchConversation(initialRunId?: string, apiBase = "") {
         finish(ticket);
       }
     },
-    [api, begin, client, finish, runId, runKey, save, sourcesKey],
+    [api, activityKey, begin, client, finish, runId, runKey, save, sourcesKey],
   );
 
   const send = useCallback(
@@ -290,6 +305,7 @@ export function useResearchConversation(initialRunId?: string, apiBase = "") {
     runId,
     cap: cap.data,
     sources: sources.data,
+    activity: activity.data,
     events,
     loading: Boolean(runId && run.isPending),
     busy,

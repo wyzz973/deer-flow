@@ -29,6 +29,9 @@ sources:
     origin: internal
     server: your-internal-mcp
     tool: your-internal-mcp_search
+    # data: the tool returns citable records. Use search for discovery-only tools
+    # and read for tools that open a document.
+    role: data
     level: L1
     publisher: your-organization
     priority: 10
@@ -36,6 +39,7 @@ sources:
     origin: external
     server: your-external-mcp
     tool: your-external-mcp_search
+    role: data
     level: L4
     publisher: external-search-unclassified
     priority: 20
@@ -46,8 +50,17 @@ tool_timeout_seconds: 45
 tool_retries: 1
 max_output_tokens: 4096
 require_dual_source: true
-allow_limited_report: false
+# Write a report with explicit caveats when bounded supplementation cannot close
+# every gap. Evidence-free runs still fail. Set false to require owner consent.
+allow_limited_report: true
+# Search result snippets and merely discovered links are not citable by default.
+cite_search_results: false
 max_synthesis_repairs: 1
+max_report_sections: 8
+# Site icons for cited domains are fetched by the Gateway (public hosts only,
+# raster images only, cached) so browsers never contact cited sites. Set false
+# without outbound access; the UI then shows letter badges.
+favicons: true
 budget_ceiling:
   max_iterations: 2
   max_units: 12

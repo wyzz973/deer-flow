@@ -1,53 +1,13 @@
-"""Deterministic citation eligibility; never interprets an MCP business payload."""
+"""Deterministic citation eligibility and editorial targets.
+
+Nothing here interprets an MCP business payload. Eligibility is derived from the
+evidence provenance recorded after native execution, the operator-configured
+source role and the user's plan-level source policy.
+"""
 
 from urllib.parse import urlsplit
 
-from pydantic import Field, create_model
-
-from .contracts import ComparisonRow, ComparisonTable, ReportSection, Segment, SourcePolicy, StructuredReport
-
-
-class BriefParagraph(Segment):
-    """Local editing bounds are easier to repair than a whole-report word count."""
-
-    text: str = Field(min_length=1, max_length=280, description="One concise paragraph, at most 280 characters; keep conditions attached to facts.")
-    evidence_ids: list[str] = Field(default_factory=list, max_length=3)
-
-
-class BriefCell(Segment):
-    text: str = Field(min_length=1, max_length=120, description="A short comparison-table cell, not a paragraph copied from research notes.")
-    evidence_ids: list[str] = Field(default_factory=list, max_length=2)
-
-
-class BriefRow(ComparisonRow):
-    cells: list[BriefCell] = Field(min_length=2, max_length=4)
-
-
-class BriefTable(ComparisonTable):
-    rows: list[BriefRow] = Field(min_length=1, max_length=5)
-
-
-class BriefSection(ReportSection):
-    segments: list[BriefParagraph] = Field(min_length=1, max_length=2)
-
-
-def report_schema(plan):
-    """Narrow the output boundary, never the provider's budget or tool results.
-
-    The public/stored report AST stays backward-compatible. Only generation of
-    a newly requested brief report uses these paragraph-level editing bounds;
-    historical reports remain readable and exportable under StructuredReport.
-    """
-    if plan.report_style != "brief":
-        return StructuredReport
-    return create_model(
-        "BriefStructuredReport",
-        __base__=StructuredReport,
-        executive_summary=(list[BriefParagraph], Field(min_length=1, max_length=2)),
-        comparison_table=(BriefTable | None, None),
-        sections=(list[BriefSection], Field(min_length=len(plan.research_units), max_length=len(plan.research_units) + 1)),
-        conclusion=(list[BriefParagraph], Field(min_length=1, max_length=2)),
-    )
+from .contracts import SourcePolicy
 
 
 def source_allowed(evidence, policy):
@@ -69,5 +29,54 @@ def source_allowed(evidence, policy):
     return True
 
 
-def report_character_limit(style):
-    return {"brief": 6000, "standard": 12000, "detailed": 36000}[style]
+def source_roles(settings):
+    return {source.name: source.role for source in settings.sources}
+
+
+def citable(evidence, roles, cite_search_results=False):
+    """Whether evidence may back a report citation, independent of scope.
+
+    A fetched page is an original read. A declared data tool's own output is a
+    citable record. Search result bodies and links merely observed in any tool
+    output only prove discovery, so they stay out of citations unless the
+    operator declares that search returns complete documents. Undeclared runtime
+    tools (file reads, shell, raw browser output) are working material, not
+    sources; a runtime read linked to a page is registered as that page instead.
+    """
+    item = evidence.model_dump() if hasattr(evidence, "model_dump") else evidence
+    provenance = item.get("provenance", "document")
+    if provenance in {"document", "fetched_document"}:
+        return True
+    if provenance == "observed_source":
+        return cite_search_results
+    role = roles.get(item.get("source_name"))
+    if role is None:
+        return False
+    return role != "search" or cite_search_results
+
+
+def eligible_evidence(pool, policy, settings):
+    roles = source_roles(settings)
+    return {eid for eid, evidence in pool.items() if source_allowed(evidence, policy) and citable(evidence, roles, settings.cite_search_results)}
+
+
+# Per-section character targets. They guide the writer and trigger no failure:
+# a long, well-cited analysis is better than a truncated or rejected report.
+SECTION_TARGETS = {"brief": (500, 1200), "standard": (1200, 3000), "detailed": (2200, 5200)}
+SUMMARY_TARGETS = {"brief": (300, 700), "standard": (600, 1400), "detailed": (900, 2000)}
+SECTION_COUNTS = {"brief": (3, 4), "standard": (5, 7), "detailed": (6, 9)}
+
+
+def section_target(style):
+    low, high = SECTION_TARGETS[style]
+    return {"target_characters": low, "soft_maximum_characters": high}
+
+
+def summary_target(style):
+    low, high = SUMMARY_TARGETS[style]
+    return {"target_characters": low, "soft_maximum_characters": high}
+
+
+def section_count(style, ceiling):
+    low, high = SECTION_COUNTS[style]
+    return min(low, ceiling), min(high, ceiling)

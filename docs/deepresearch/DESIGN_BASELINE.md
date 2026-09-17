@@ -1,5 +1,7 @@
 # DeepResearch 完整实现设计文档（v1.0）
 
+> 历史文档：记录 2026-09-14 时的设计或验收状态。与当前实现不一致之处，以 [ARCHITECTURE.md](ARCHITECTURE.md) 和 [HANDOFF.md](HANDOFF.md) 为准。
+
 **项目基线**：DeerFlow Harness + Custom Agents + Skills + 白名单 MCP  
 **目标架构**：DeerFlow Agent/Skill 执行 + LangGraph 工作流编排 + Evidence/Citation 确定性服务  
 **日期**：2026-09-14  

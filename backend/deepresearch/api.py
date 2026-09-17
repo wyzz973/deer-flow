@@ -94,6 +94,24 @@ def build_router(service, *, local_demo=False, demo_origins=None):
             "plan_countdown_seconds": service.settings.plan_countdown_seconds,
         }
 
+    @router.get("/favicon")
+    async def favicon(domain: str = Query(min_length=1, max_length=253), owner=Depends(principal)):
+        # Declared before /{run_id}. Icons are shared public site assets, but the
+        # route still requires a user so it cannot serve as an open fetch proxy.
+        from .favicons import normalize_domain
+
+        host = normalize_domain(domain)
+        if host is None:
+            raise HTTPException(422, "Invalid domain")
+        icon = await service.favicons.get(host)
+        headers = {"X-Content-Type-Options": "nosniff", "Content-Security-Policy": "default-src 'none'"}
+        if icon.get("pending"):
+            # Still fetching in the background; the browser must ask again later.
+            return Response(status_code=404, headers={**headers, "Cache-Control": "no-store"})
+        if not icon.get("body"):
+            return Response(status_code=404, headers={**headers, "Cache-Control": "private, max-age=86400"})
+        return Response(icon["body"], media_type=icon["content_type"], headers={**headers, "Cache-Control": "private, max-age=604800"})
+
     @router.post("", status_code=202)
     async def create(body: CreateResearch, request: Request, owner=Depends(principal), idempotency_key: str | None = Header(default=None)):
         if service.graph is None or service.stopping:
@@ -140,6 +158,15 @@ def build_router(service, *, local_demo=False, demo_origins=None):
     @router.get("/{run_id}/sources")
     async def sources(run=Depends(owned)):
         return {"sources": await service.store.sources(run["run_id"]), "calls": await service.store.calls(run["run_id"])}
+
+    @router.get("/{run_id}/activity")
+    async def research_activity(run=Depends(owned)):
+        # A concise user-facing projection; the full trace stays separate.
+        from .activity import build, tool_roles
+
+        events = await service.store.activity_events(run["run_id"])
+        calls = await service.store.calls(run["run_id"])
+        return build(run, events, calls, tool_roles(service.settings))
 
     @router.post("/{run_id}/plan/edit", status_code=202)
     async def edit(body: PlanEdit, request: Request, run=Depends(owned)):
@@ -189,7 +216,9 @@ def build_router(service, *, local_demo=False, demo_origins=None):
                     yield ": heartbeat\n\n"
                 await asyncio.sleep(0.5)
 
-        return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+        # no-transform keeps compressing proxies (for example the Next.js dev
+        # rewrite) from buffering sparse progress events until the stream ends.
+        return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-store, no-transform", "X-Accel-Buffering": "no"})
 
     @router.get("/{run_id}/evidences")
     async def evidences(run=Depends(owned)):
@@ -233,9 +262,12 @@ def build_router(service, *, local_demo=False, demo_origins=None):
         if format == "json":
             return value
         if format == "docx":
-            from .render import docx_report
+            if value.get("format") == "markdown-v2":
+                from .report import docx_document as export
+            else:
+                from .render import docx_report as export  # Historical AST reports.
 
-            data = await asyncio.to_thread(docx_report, value)
+            data = await asyncio.to_thread(export, value)
             media = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         else:
             data = value["markdown" if format == "md" else "html"]

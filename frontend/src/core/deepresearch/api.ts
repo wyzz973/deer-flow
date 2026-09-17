@@ -3,10 +3,17 @@ import { getBackendBaseURL } from "@/core/config";
 
 import type {
   Capabilities,
+  ResearchActivity,
   ResearchEvent,
   ResearchSources,
   Run,
 } from "./types";
+
+/** Site icon for a cited domain. The gateway fetches and caches it, so the
+ * browser never contacts the cited site just to render a source list. */
+export function faviconUrl(domain: string) {
+  return `${getBackendBaseURL().replace(/\/$/, "")}/api/deepresearch/favicon?domain=${encodeURIComponent(domain)}`;
+}
 
 // Defaults to the same-origin authenticated DeerFlow gateway.
 // The separate demo page explicitly passes http://127.0.0.1:8022.
@@ -75,6 +82,8 @@ export function researchApi(base = "") {
     get: (id: string) => snapshot(`/${encodeURIComponent(id)}`),
     sources: (id: string) =>
       json<ResearchSources>(`/${encodeURIComponent(id)}/sources`),
+    activity: (id: string) =>
+      json<ResearchActivity>(`/${encodeURIComponent(id)}/activity`),
     message: (id: string, text: string, messageId: string, version?: number) =>
       snapshot(`/${encodeURIComponent(id)}/messages`, {
         text,

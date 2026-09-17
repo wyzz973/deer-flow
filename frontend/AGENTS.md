@@ -76,6 +76,37 @@ history occupies the native sidebar history slot; do not add an in-page history
 list or a separate constraints form. The research stream projection is read-only;
 mutations use the authenticated research API, not invented SDK methods.
 
+The interaction follows ChatGPT deep research (see
+`docs/deepresearch/CHATGPT_BENCHMARK_2026-09-16.md`). The plan card shows the
+plan title and short step titles with a ring countdown and “编辑 / 取消 / 开始”.
+While research runs it shows step status, the live status from `/activity`, the
+search count, a progress bar, stop, and “更新”, which quotes the plan in the
+composer and sends a non-interrupting update. Editing uses the same quote bar;
+a sent revision starts immediately. Completed reports show the
+“研究完成情况” stats line, a report card, and a full-screen reader with a hover TOC.
+The side panel tabs are “来源” and “活动 · elapsed”. Use `firstText` for plan/step
+labels because historical records store empty strings. Retries send
+`retryRequest(...)`: never persist a limited-report refusal the owner did not make.
+Failed steps (`unit_failures`, activity `step_failed`) render as failed while the
+run continues. The research page passes `runDurationEnabled={false}` to
+`MessageList`, because the native per-message duration is not the research time;
+the stats line and activity tab own elapsed time. Report Markdown uses GFM
+without remark-math (prices contain `$`). Source excerpts go through
+`readableExcerpt`, which drops externalization notices and fetch headers.
+Hovering an in-text citation or a cited source opens `CitationPreview`: site,
+title and the excerpt for that evidence (`excerptPreview` strips Markdown syntax),
+labeled as page text only for `fetched_document`. Touch devices keep click-to-locate.
+Site icons render through `SiteIcon` from the gateway's `/api/deepresearch/favicon`
+(never a third-party favicon URL). A failed icon shows a letter badge and retries
+once after 4 s with `retry=1`, because a cold icon may still be fetching. The
+source list shows the title, a `sourceSummary` (repeated title removed) and the
+URL without scheme.
+Source labels go through `sourceTitle` (and `readLabel` in the activity tab): a
+missing, "Untitled" or URL-valued title shows the URL without scheme, including
+for immutable historical reports.
+The activity tab follows new items only while its end sentinel is visible and the
+run is live; never pull a reader away from earlier steps.
+
 Plan deadlines are server-owned. Render their remaining time from a server
 snapshot plus monotonic elapsed time; do not start research in a browser timer.
 Anchor elapsed time when the API response arrives, not when a cached card mounts.

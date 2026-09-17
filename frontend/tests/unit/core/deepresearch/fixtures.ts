@@ -1,4 +1,8 @@
-import type { Capabilities, Run } from "@/core/deepresearch/types";
+import type {
+  Capabilities,
+  ResearchActivity,
+  Run,
+} from "@/core/deepresearch/types";
 
 export function makeRun(
   runId = "run",
@@ -70,5 +74,19 @@ export function capabilities(): Capabilities {
     sources: [],
     budget_ceiling: makeRun().budget,
     plan_countdown_seconds: 45,
+  };
+}
+
+export function activity(
+  status = "AWAITING_PLAN_CONFIRMATION",
+): ResearchActivity {
+  return {
+    status,
+    started_at: null,
+    finished_at: null,
+    elapsed_seconds: null,
+    counts: { searches: 0, pages_read: 0, steps: 1, steps_done: 0 },
+    current: null,
+    items: [],
   };
 }

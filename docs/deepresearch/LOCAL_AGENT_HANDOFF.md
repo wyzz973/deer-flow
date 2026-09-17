@@ -1,6 +1,6 @@
 # 本地 / 公司 Agent 交接入口
 
-请以 [HANDOFF.md](HANDOFF.md) 为当前迁移与验收清单，并阅读
+请以 [HANDOFF.md](HANDOFF.md) 为当前迁移与验收清单，以 [ARCHITECTURE.md](ARCHITECTURE.md) 为架构与工作流说明，并阅读
 [NATIVE_RUNTIME.md](NATIVE_RUNTIME.md)、[API.md](API.md) 和
 [REUSE_AUDIT.md](REUSE_AUDIT.md)。
 

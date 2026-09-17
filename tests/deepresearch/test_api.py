@@ -44,6 +44,11 @@ async def test_owner_authorization_and_demo_origin(settings, monkeypatch):
         assert (await client.get("/api/deepresearch/private-run/trace/export", headers={"x-test-user": "bob"})).status_code == 404
         trace = await client.get("/api/deepresearch/private-run/trace", headers={"x-test-user": "alice"})
         assert trace.json()["items"][0]["data"]["span_id"] == "s"
+        assert (await client.get("/api/deepresearch/private-run/activity", headers={"x-test-user": "bob"})).status_code == 404
+        activity = await client.get("/api/deepresearch/private-run/activity", headers={"x-test-user": "alice"})
+        assert activity.status_code == 200 and activity.json()["status"] == "COMPLETED"
+        # The activity projection never carries trace payloads.
+        assert "trace.started" not in activity.text
     demo = FastAPI()
     demo.include_router(build_router(service, local_demo=True))
     transport = httpx.ASGITransport(app=demo, client=("127.0.0.1", 1234))

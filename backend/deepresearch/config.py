@@ -22,7 +22,8 @@ class SkillSpec(Contract):
     # The host interprets this as graph recursion steps, not model exchanges.
     # Inherit its configured limit unless the operator explicitly tightens it.
     max_turns: int | None = Field(default=None, ge=1, le=1000)
-    timeout_seconds: int = Field(default=180, ge=5, le=1800)
+    # A deep-research unit reads many pages; the native Agent timeout still applies.
+    timeout_seconds: int = Field(default=600, ge=5, le=1800)
 
 
 class SourceSpec(Contract):
@@ -31,6 +32,10 @@ class SourceSpec(Contract):
     kind: Literal["mcp", "native"] = "mcp"
     server: str | None = None
     tool: str  # Exact host tool name; no prefix guessing or response adapter.
+    # How the tool participates in research, chosen by the operator rather than
+    # inferred from its payload: search results are discovery only, read tools
+    # open documents, data tools return citable records (e.g. a knowledge base).
+    role: Literal["search", "read", "data"] = "data"
     level: Level = "L4"
     priority: int = 100
     publisher: str = "unclassified"
@@ -79,8 +84,18 @@ class Settings(Contract):
     native_tools: list[str] | None = None  # Optional ceiling; native Agent/Skill authorization is authoritative.
     trace_capture_content: bool = True
     trace_max_chars: int = Field(default=16000, ge=1000, le=100000)
-    allow_limited_report: bool = False
+    # When bounded supplementation cannot close every gap, write the report
+    # with explicit caveats (ChatGPT-style) instead of failing. Evidence-free
+    # runs still fail, and strict deployments can require owner consent.
+    allow_limited_report: bool = True
+    # Search results and links merely seen in tool output are discovery aids.
+    # Enable only for deployments whose search tool returns full documents.
+    cite_search_results: bool = False
     max_synthesis_repairs: int = Field(default=1, ge=0, le=3)
+    max_report_sections: int = Field(default=8, ge=2, le=12)
+    # Site icons for cited domains are fetched by the gateway (public hosts only).
+    # Disable for deployments without outbound access; the UI shows letter badges.
+    favicons: bool = True
     require_dual_source: bool = True
     # Automatic LangSmith tracing is disabled; local spans redact captured content.
     budget_ceiling: ResearchBudget = Field(default_factory=ResearchBudget)

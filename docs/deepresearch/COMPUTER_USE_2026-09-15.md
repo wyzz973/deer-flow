@@ -1,5 +1,7 @@
 # DeepResearch computer-use acceptance, 2026-09-15
 
+> 历史文档：记录 2026-09-15 时的设计或验收状态。与当前实现不一致之处，以 [ARCHITECTURE.md](ARCHITECTURE.md) 和 [HANDOFF.md](HANDOFF.md) 为准。
+
 ## Status
 
 Partial acceptance only. This is not a release sign-off and does not establish

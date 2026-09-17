@@ -89,6 +89,8 @@ class Store:
             CREATE TABLE IF NOT EXISTS research_tool_call (
               run_id TEXT NOT NULL REFERENCES research_run(id), id TEXT NOT NULL,
               body TEXT NOT NULL, PRIMARY KEY(run_id,id));
+            CREATE TABLE IF NOT EXISTS research_favicon (
+              domain TEXT PRIMARY KEY, content_type TEXT, body BLOB, fetched_at REAL NOT NULL);
             PRAGMA user_version=1;
             """)
 
@@ -186,6 +188,24 @@ class Store:
     async def events(self, run_id, after=0, limit=200):
         return await self.call(lambda db: [json.loads(row[0]) for row in db.execute("SELECT body FROM research_event WHERE run_id=? AND seq>? ORDER BY seq LIMIT ?", (run_id, after, limit))])
 
+    async def favicon(self, domain):
+        """Shared site-icon cache; icons are public and not tied to a run."""
+
+        def op(db):
+            row = db.execute("SELECT content_type, body, fetched_at FROM research_favicon WHERE domain=?", (domain,)).fetchone()
+            return {"domain": domain, "content_type": row[0], "body": row[1], "fetched_at": row[2]} if row else None
+
+        return await self.call(op)
+
+    async def save_favicon(self, value):
+        def op(db):
+            db.execute(
+                "INSERT INTO research_favicon VALUES (?,?,?,?) ON CONFLICT(domain) DO UPDATE SET content_type=excluded.content_type, body=excluded.body, fetched_at=excluded.fetched_at",
+                (value["domain"], value["content_type"], value["body"], value["fetched_at"]),
+            )
+
+        await self.call(op)
+
     async def cached(self, run_id, key):
         def op(db):
             row = db.execute("SELECT body FROM research_cache WHERE run_id=? AND key=?", (run_id, key)).fetchone()
@@ -222,6 +242,18 @@ class Store:
 
     async def calls(self, run_id):
         return await self.call(lambda db: [json.loads(row[0]) for row in db.execute("SELECT body FROM research_tool_call WHERE run_id=? ORDER BY rowid", (run_id,))])
+
+    async def activity_events(self, run_id, limit=10000):
+        """Lifecycle and activity events without trace payloads or metering."""
+        return await self.call(
+            lambda db: [
+                json.loads(row[0])
+                for row in db.execute(
+                    "SELECT body FROM research_event WHERE run_id=? AND json_extract(body, '$.type') NOT LIKE 'trace.%' AND json_extract(body, '$.type') NOT LIKE 'usage.%' ORDER BY seq LIMIT ?",
+                    (run_id, limit),
+                )
+            ]
+        )
 
     async def trace_events(self, run_id, after=0, limit=100):
         """Page trace records in SQL, not after limiting the mixed event stream."""
@@ -347,9 +379,10 @@ class Store:
                 published = {**body, "version": version}
                 at = utcnow()
                 db.execute("INSERT INTO research_report VALUES (?,?,?)", (run_id, version, dumps(published)))
-                run.setdefault("conversation", []).append({"id": f"report-{version}", "role": "assistant", "kind": "report", "text": published["report"]["title"], "report": published, "cycle": run.get("cycle", 0), "at": at})
+                title = published.get("title") or published["report"]["title"]
+                run.setdefault("conversation", []).append({"id": f"report-{version}", "role": "assistant", "kind": "report", "text": title, "report": published, "cycle": run.get("cycle", 0), "at": at})
                 seq = db.execute("SELECT COALESCE(MAX(seq),0)+1 FROM research_event WHERE run_id=?", (run_id,)).fetchone()[0]
-                event = {"seq": seq, "type": "report.completed", "run_id": run_id, "at": at, "data": {"version": version, "limitations": published["limitations"]}}
+                event = {"seq": seq, "type": "report.completed", "run_id": run_id, "at": at, "data": {"version": version, "title": title, "limitations": published["limitations"]}}
                 db.execute("INSERT INTO research_event VALUES (?,?,?,?)", (run_id, seq, f"report-completed-{version}", dumps(event)))
                 db.execute("INSERT INTO research_cache VALUES (?,?,?)", (run_id, key, dumps(published)))
             run.update(report=published, status="COMPLETED", error=None, updated_at=utcnow())

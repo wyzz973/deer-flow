@@ -96,3 +96,35 @@ async def test_reference_validation_never_accepts_persistent_fabrication(setting
     with pytest.raises(ResearchError, match="bounded retries"):
         await convert_answer(runner, {"run_id": "r"}, "technical-route", {}, Answer, "notes", {}, validator=reject)
     assert len(calls) == settings.output_retries + 1
+
+
+@pytest.mark.asyncio
+async def test_final_conversion_attempt_prunes_unverifiable_references_without_inventing(settings, tmp_path, monkeypatch):
+    class Answer(BaseModel):
+        evidence_ids: list[str]
+
+    store = Store(tmp_path / "prune.sqlite")
+    await store.start()
+    await store.create({"run_id": "r", "owner": "u"}, "key", "hash")
+    calls = []
+
+    class Model:
+        async def ainvoke(self, messages, **kwargs):
+            calls.append(1)
+            return SimpleNamespace(content='{"evidence_ids":["known","invented"]}')
+
+    async def agent_config(name):
+        return settings.skills[name], SimpleNamespace(model="local")
+
+    def validate(value):
+        if set(value.evidence_ids) - {"known"}:
+            raise ValueError("Unknown evidence ID")
+
+    def prune(value):
+        return value.model_copy(update={"evidence_ids": [item for item in value.evidence_ids if item == "known"]})
+
+    monkeypatch.setattr("deerflow.models.create_chat_model", lambda **kwargs: Model())
+    runner = SimpleNamespace(settings=settings, store=store, _agent_config=agent_config)
+    result = await convert_answer(runner, {"run_id": "r"}, "technical-route", {}, Answer, "notes", {}, validator=validate, repair=prune)
+    assert result.evidence_ids == ["known"]
+    assert len(calls) == settings.output_retries + 1

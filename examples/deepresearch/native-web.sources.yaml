@@ -6,12 +6,16 @@ sources:
   - name: public-web-search
     kind: native
     tool: web_search
+    # Search results are discovery only; they are never cited.
+    role: search
     origin: external
     level: L4
     publisher: web-search-unclassified
   - name: public-web-read
     kind: native
     tool: web_fetch
+    # Opened pages are the citable originals.
+    role: read
     origin: external
     level: L4
     publisher: web-content-unclassified

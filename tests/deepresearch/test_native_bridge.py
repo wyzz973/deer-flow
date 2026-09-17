@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from deepresearch.native import execute_role, native_thread_id
+from deepresearch.native import execute_role, native_thread_id, output_instruction
 from deepresearch.store import Store
 
 
@@ -91,3 +91,12 @@ async def test_roles_use_native_executor_with_scoped_tools_and_credentials(setti
     assert [tool.name for tool in captured["tools"]] == ["read_file"]
     await execute_role(settings, store, run, "report-synthesis", {}, [], Agent(name="writer"), {})
     assert [tool.name for tool in captured["tools"]] == ["read_file"]
+
+
+def test_progress_sentences_name_the_reader_language():
+    researcher = output_instruction("technical-route", {"language": "Simplified Chinese (简体中文)"})
+    assert "in Simplified Chinese (简体中文) saying what you will check next" in researcher
+    assert "never mention skill files" in researcher
+    assert "the language of the user's request" in output_instruction("technical-route", {})
+    assert "Markdown" in output_instruction("report-synthesis", {"language": "English"})
+    assert "output_schema" in output_instruction("technical-route", {"output_schema": {}, "language": "English"})

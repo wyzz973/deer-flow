@@ -1,6 +1,7 @@
 # DeepResearch runtime
 
-The authoritative current design is [NATIVE_RUNTIME.md](NATIVE_RUNTIME.md).
+The authoritative current architecture and workflow are in [ARCHITECTURE.md](ARCHITECTURE.md);
+[NATIVE_RUNTIME.md](NATIVE_RUNTIME.md) explains the native-runtime reuse decisions. This page is a 2026-09-14 summary.
 See [API.md](API.md) and the generated [openapi.json](openapi.json) for HTTP contracts.
 
 Research uses native SubagentExecutor, MCP cache/session pool and original tools.

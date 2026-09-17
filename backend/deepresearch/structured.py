@@ -14,28 +14,39 @@ from .output import parse_contract, visible_text
 from .trace import LocalTrace, model_callbacks
 
 
-async def run_structured(runner, run, skill_name, payload, schema, tools=None, agent=None):
-    from langgraph.runtime import get_runtime
+async def run_structured(runner, run, skill_name, payload, schema, tools=None, agent=None, *, validator=None, repair=None, task_id=None):
+    from .trace import current_context
 
     spec, configured = await runner._agent_config(skill_name)
-    context = get_runtime().context or {}
+    context = current_context()
     # Ask the native role for our output contract up front. This is ordinary
     # prompt text, not provider JSON mode; conversion remains a fallback.
     native_payload = {**payload, "output_schema": schema.model_json_schema()}
-    execution = await execute_role(runner.settings, runner.store, run, skill_name, native_payload, tools, agent or configured, context)
-    return await convert_answer(runner, run, skill_name, payload, schema, execution.answer, context)
+    kwargs = {"task_id": task_id} if task_id else {}
+    execution = await execute_role(runner.settings, runner.store, run, skill_name, native_payload, tools, agent or configured, context, **kwargs)
+    return await convert_answer(runner, run, skill_name, payload, schema, execution.answer, context, validator=validator, repair=repair)
 
 
-async def convert_answer(runner, run, skill_name, payload, schema, answer, context, *, validator=None):
-    """Validate our own output contract; never normalize a tool's return value."""
+async def convert_answer(runner, run, skill_name, payload, schema, answer, context, *, validator=None, repair=None):
+    """Validate our own output contract; never normalize a tool's return value.
+
+    ``repair`` may only remove what the validator rejects on the final bounded
+    attempt (for example unverifiable references). It must never add data.
+    """
     from deerflow.models import create_chat_model
 
     spec, configured = await runner._agent_config(skill_name)
 
-    def validated(text):
+    def validated(text, final=False):
         value = parse_contract(text, schema)
         if validator is not None:
-            validator(value)
+            try:
+                validator(value)
+            except ValueError:
+                if not (final and repair is not None):
+                    raise
+                value = repair(value)
+                validator(value)
         return value
 
     try:
@@ -68,7 +79,7 @@ async def convert_answer(runner, run, skill_name, payload, schema, answer, conte
                 raise
             text = visible_text(response.content)
             try:
-                value = validated(text)
+                value = validated(text, final=attempt == settings.output_retries)
                 output.update(attempts=attempt + 1, contract=value.model_dump(mode="json"))
                 return value
             except ValueError as error:

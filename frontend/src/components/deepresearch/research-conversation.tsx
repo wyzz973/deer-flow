@@ -4,6 +4,7 @@ import type { Message } from "@langchain/langgraph-sdk";
 import type { BaseStream } from "@langchain/langgraph-sdk/react";
 import {
   ArrowLeft,
+  CornerDownRight,
   FlaskConical,
   ListTree,
   Plus,
@@ -31,6 +32,14 @@ import { MessageList } from "@/components/workspace/messages";
 import { ThreadContext } from "@/components/workspace/messages/context";
 import { useResearchConversation } from "@/core/deepresearch/hooks";
 import {
+  firstText,
+  formatElapsed,
+  reportTitle,
+  retryRequest,
+} from "@/core/deepresearch/presentation";
+import {
+  reviewStatuses,
+  steerableStatuses,
   terminal,
   type Report,
   type ResearchMessage,
@@ -39,11 +48,9 @@ import type { AgentThreadState } from "@/core/threads";
 import { cn } from "@/lib/utils";
 
 import { ResearchPlanCard } from "./plan-card";
-import {
-  ResearchReportActions,
-  ResearchReportCard,
-  ResearchReportContent,
-} from "./report-view";
+import { ResearchReportReader } from "./report-reader";
+import { ResearchReportActions, ResearchReportCard } from "./report-view";
+import { ResearchGallery } from "./research-gallery";
 import { ResearchActivityPanel, ResearchSourcesPanel } from "./sources-panel";
 import { ResearchTraceInspector } from "./trace-panel";
 
@@ -68,7 +75,7 @@ function ResearchView({
   apiBase?: string;
 }) {
   const state = useResearchConversation(initialRunId, apiBase);
-  const { run, runId, cap, api } = state;
+  const { run, runId, cap, api, activity } = state;
   const controller = usePromptInputController();
   const { isMobile } = useSidebar();
   const [panel, setPanel] = useState<Panel | null>(null);
@@ -77,16 +84,21 @@ function ResearchView({
   const [selectedCitation, setSelectedCitation] = useState<string>();
   const [traceFocus, setTraceFocus] = useState<string>();
   const [reading, setReading] = useState<Report | null>(null);
+  const [updating, setUpdating] = useState(false);
   const composer = useRef<HTMLDivElement>(null);
   const welcome = !runId;
-  const editable = [
-    "AWAITING_PLAN_CONFIRMATION",
-    "EDITING_PLAN",
-    "AWAITING_CLARIFICATION",
-    "COMPLETED",
-  ].includes(run?.status ?? "");
-  const running = Boolean(run && !terminal.has(run.status) && !editable);
-  const editing = run?.status === "EDITING_PLAN";
+  const status = run?.status ?? "";
+  const reviewing = reviewStatuses.has(status);
+  const editable = reviewing || status === "COMPLETED";
+  const steerable = steerableStatuses.has(status);
+  const running = Boolean(run && !terminal.has(status) && !reviewing);
+  const editing = status === "EDITING_PLAN";
+  // An update is a non-interrupting message to a running research, like
+  // ChatGPT's “更新”. It ends automatically once research stops accepting it.
+  const steering = updating && steerable;
+  const planTitle = run?.plan
+    ? firstText(run.plan.title, run.plan.goal)
+    : undefined;
   const records = useMemo<ResearchMessage[]>(() => {
     if (!run) return [];
     if (run.conversation?.length) return run.conversation;
@@ -117,7 +129,7 @@ function ResearchView({
               id: "legacy-report",
               role: "assistant",
               kind: "report",
-              text: run.report.report.title,
+              text: reportTitle(run.report),
               report: run.report,
               at: run.updated_at,
             } as ResearchMessage,
@@ -153,12 +165,12 @@ function ResearchView({
           title: run?.query ?? "DeepResearch",
           artifacts: [],
         },
-        isLoading: running || state.busy,
+        isLoading: (running && !steerable) || state.busy,
         isThreadLoading: state.loading,
         error: null,
         getMessagesMetadata: () => undefined,
       }) as unknown as BaseStream<AgentThreadState>,
-    [messages, run?.query, running, state.busy, state.loading],
+    [messages, run?.query, running, steerable, state.busy, state.loading],
   );
   const { action } = state;
   const safeAction = useCallback(
@@ -167,14 +179,17 @@ function ResearchView({
     },
     [action],
   );
+  const focusComposer = useCallback(() => {
+    requestAnimationFrame(() =>
+      composer.current?.querySelector("textarea")?.focus(),
+    );
+  }, []);
   const edit = useCallback(() => {
     if (!run?.plan) return;
     void action("plan/pause", { plan_version: run.plan.plan_version })
-      .then(() => {
-        composer.current?.querySelector("textarea")?.focus();
-      })
+      .then(focusComposer)
       .catch(() => undefined);
-  }, [run?.plan, action]);
+  }, [run?.plan, action, focusComposer]);
   const citation = useCallback((report: Report, id: string) => {
     setReading(report);
     setSelectedCitation(id);
@@ -202,7 +217,9 @@ function ResearchView({
           <ResearchPlanCard
             message={record}
             run={run}
+            activity={activity}
             busy={state.busy}
+            countdownTotal={cap?.plan_countdown_seconds}
             onEdit={edit}
             onStart={() =>
               safeAction("plan/approve", {
@@ -210,15 +227,16 @@ function ResearchView({
               })
             }
             onCancel={() => safeAction("cancel")}
-            onResume={() =>
-              safeAction("plan/resume", {
-                plan_version: record.plan!.plan_version,
-              })
-            }
             onDetails={() => setPanel("activity")}
+            // Only an explicit limited-report choice is sent. Other retries must
+            // not persist a refusal the owner never expressed.
             onRetry={(allowLimitedReport = false) =>
-              safeAction("retry", { allow_limited_report: allowLimitedReport })
+              safeAction("retry", retryRequest(allowLimitedReport))
             }
+            onUpdate={() => {
+              setUpdating(true);
+              focusComposer();
+            }}
           />
         );
       if (record.kind === "report" && record.report)
@@ -232,7 +250,18 @@ function ResearchView({
         );
       return undefined;
     },
-    [byId, citation, download, edit, run, safeAction, state.busy],
+    [
+      activity,
+      byId,
+      cap?.plan_countdown_seconds,
+      citation,
+      download,
+      edit,
+      focusComposer,
+      run,
+      safeAction,
+      state.busy,
+    ],
   );
   const panelReport = reading ?? run?.report;
   const pane = (
@@ -261,7 +290,11 @@ function ResearchView({
                 aria-selected={lastPanel.current === tab}
                 onClick={() => setPanel(tab)}
               >
-                {tab === "sources" ? "来源" : "活动"}
+                {tab === "sources"
+                  ? "来源"
+                  : activity?.elapsed_seconds != null
+                    ? `活动 · ${formatElapsed(activity.elapsed_seconds)}`
+                    : "活动"}
               </Button>
             ))}
           </div>
@@ -310,7 +343,7 @@ function ResearchView({
             }}
           />
         ) : lastPanel.current === "activity" ? (
-          <ResearchActivityPanel data={state.sources} onInspect={inspect} />
+          <ResearchActivityPanel activity={activity} onInspect={inspect} />
         ) : (
           runId && (
             <ResearchTraceInspector
@@ -326,6 +359,7 @@ function ResearchView({
       </div>
     </div>
   );
+  const quoted = editing || steering;
   return (
     <ThreadContext.Provider value={{ thread, isMock: Boolean(apiBase) }}>
       <ChatBox
@@ -341,60 +375,73 @@ function ResearchView({
         <ChatSurface
           isWelcomeMode={welcome}
           header={
-            <>
-              <SidebarTrigger className="md:hidden" />
-              {reading && (
+            reading ? (
+              <>
                 <Button
                   variant="ghost"
                   size="icon-sm"
-                  aria-label="返回研究对话"
+                  aria-label="关闭报告"
                   onClick={() => setReading(null)}
                 >
-                  <ArrowLeft className="size-4" />
+                  <X className="size-4" />
                 </Button>
-              )}
-              <span className="min-w-0 flex-1 truncate text-sm font-medium">
-                {run?.query ?? "DeepResearch"}
-              </span>
-              {runId && (
-                <>
-                  <Button
-                    variant="ghost"
-                    size="icon-sm"
-                    aria-label="来源与活动"
-                    onClick={() => setPanel(panel ? null : "activity")}
-                  >
-                    <ListTree className="size-4" />
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon-sm"
-                    aria-label="查看 Trace"
-                    onClick={() => inspect()}
-                  >
-                    <ScrollText className="size-4" />
-                  </Button>
-                </>
-              )}
-              {reading && (
+                <span className="min-w-0 flex-1 truncate text-sm font-medium">
+                  {reportTitle(reading)}
+                </span>
                 <ResearchReportActions
                   onDownload={(format) => download(format, reading.version)}
                 />
-              )}
-              <Button
-                variant="ghost"
-                size="icon-sm"
-                aria-label="新建研究"
-                onClick={() => {
-                  state.newResearch();
-                  setReading(null);
-                  setPanel(null);
-                  controller.textInput.setInput("");
-                }}
-              >
-                <Plus className="size-4" />
-              </Button>
-            </>
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="来源与活动"
+                  onClick={() => setPanel(panel ? null : "sources")}
+                >
+                  <ListTree className="size-4" />
+                </Button>
+              </>
+            ) : (
+              <>
+                <SidebarTrigger className="md:hidden" />
+                <span className="min-w-0 flex-1 truncate text-sm font-medium">
+                  {planTitle ?? run?.query ?? "DeepResearch"}
+                </span>
+                {runId && (
+                  <>
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label="来源与活动"
+                      onClick={() => setPanel(panel ? null : "activity")}
+                    >
+                      <ListTree className="size-4" />
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label="查看 Trace"
+                      onClick={() => inspect()}
+                    >
+                      <ScrollText className="size-4" />
+                    </Button>
+                  </>
+                )}
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="新建研究"
+                  onClick={() => {
+                    state.newResearch();
+                    setReading(null);
+                    setPanel(null);
+                    setUpdating(false);
+                    controller.textInput.setInput("");
+                  }}
+                >
+                  <Plus className="size-4" />
+                </Button>
+              </>
+            )
           }
           messages={
             <>
@@ -407,32 +454,14 @@ function ResearchView({
                   enableSidecarActions={false}
                   renderMessage={renderMessage}
                   archiveDownloadsEnabled={false}
+                  runDurationEnabled={false}
                 />
               </div>
               {reading && (
-                <div
-                  data-research-report-reader
-                  className="size-full overflow-y-auto px-6 pt-20 pb-12"
-                >
-                  <article className="mx-auto max-w-(--container-width-md)">
-                    <ResearchReportContent
-                      report={reading}
-                      onCitation={(id) => citation(reading, id)}
-                    />
-                    {reading.limitations.length > 0 && (
-                      <details className="text-muted-foreground mt-8 border-t pt-4 text-xs">
-                        <summary className="cursor-pointer">
-                          研究范围与限制
-                        </summary>
-                        {reading.limitations.map((text) => (
-                          <p className="mt-2 leading-5" key={text}>
-                            {text}
-                          </p>
-                        ))}
-                      </details>
-                    )}
-                  </article>
-                </div>
+                <ResearchReportReader
+                  report={reading}
+                  onCitation={(id) => citation(reading, id)}
+                />
               )}
             </>
           }
@@ -444,25 +473,6 @@ function ResearchView({
                     你想研究什么？
                   </h1>
                 )}
-                {editing && (
-                  <div className="border-border/60 bg-muted/40 mb-2 flex items-center justify-between gap-2 rounded-xl border px-3 py-2 text-xs">
-                    <span className="truncate">
-                      正在修改：{run?.plan?.goal}
-                    </span>
-                    <Button
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label="放弃计划修改"
-                      onClick={() =>
-                        safeAction("plan/resume", {
-                          plan_version: run?.plan?.plan_version,
-                        })
-                      }
-                    >
-                      <X className="size-3" />
-                    </Button>
-                  </div>
-                )}
                 {state.error && (
                   <p role="alert" className="text-destructive mb-3 text-sm">
                     {state.error}
@@ -470,26 +480,60 @@ function ResearchView({
                 )}
                 <PromptInput
                   className="bg-background/5 w-full"
-                  disabled={state.busy || (Boolean(runId) && !editable)}
+                  disabled={
+                    state.busy || (Boolean(runId) && !editable && !steering)
+                  }
                   maxFiles={0}
                   onError={() =>
                     toast.error("请通过已接入的研究来源提供资料。")
                   }
                   onSubmit={async ({ text }) => {
-                    if (text.trim()) await state.send(text.trim());
+                    if (!text.trim()) return;
+                    await state.send(text.trim());
+                    setUpdating(false);
                   }}
                 >
+                  {quoted && planTitle && (
+                    <div className="border-border/60 flex w-full items-center gap-2 border-b px-3 py-2 text-xs">
+                      <CornerDownRight className="text-muted-foreground size-3.5 shrink-0" />
+                      <span className="text-muted-foreground min-w-0 flex-1 truncate">
+                        “{planTitle}”
+                      </span>
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        aria-label={editing ? "放弃计划修改" : "取消更新"}
+                        onClick={() => {
+                          if (editing)
+                            safeAction("plan/resume", {
+                              plan_version: run?.plan?.plan_version,
+                            });
+                          setUpdating(false);
+                        }}
+                      >
+                        <X className="size-3" />
+                      </Button>
+                    </div>
+                  )}
                   <PromptInputBody>
                     <PromptInputTextarea
                       aria-label="研究消息"
                       placeholder={
-                        editing
-                          ? "告诉我如何调整计划…"
-                          : run?.status === "AWAITING_CLARIFICATION"
+                        quoted
+                          ? "跟进问题或调整"
+                          : status === "AWAITING_CLARIFICATION"
                             ? "补充你的需求…"
                             : welcome
                               ? "描述你想研究的问题…"
-                              : "继续提问或调整研究…"
+                              : running
+                                ? steerable
+                                  ? "研究进行中，点击计划上的“更新”补充要求"
+                                  : ["PLANNING", "CREATED"].includes(status)
+                                    ? "正在制定研究计划…"
+                                    : status === "RESPONDING"
+                                      ? "正在思考…"
+                                      : "正在整理报告…"
+                                : "继续提问或调整研究…"
                       }
                       autoFocus
                     />
@@ -498,10 +542,10 @@ function ResearchView({
                     <PromptInputTools>
                       <span className="text-muted-foreground flex items-center gap-1.5 px-1 text-xs">
                         <FlaskConical className="size-3.5" />
-                        DeepResearch
+                        深度研究
                       </span>
                     </PromptInputTools>
-                    {running ? (
+                    {running && !steering ? (
                       <Button
                         variant="ghost"
                         size="sm"
@@ -512,7 +556,13 @@ function ResearchView({
                       </Button>
                     ) : (
                       <PromptInputSubmit
-                        aria-label={welcome ? "发送研究请求" : "发送消息"}
+                        aria-label={
+                          welcome
+                            ? "发送研究请求"
+                            : steering
+                              ? "发送更新"
+                              : "发送消息"
+                        }
                         status={state.busy ? "submitted" : "ready"}
                         disabled={
                           state.busy ||
@@ -530,6 +580,15 @@ function ResearchView({
                   >
                     演示模式：合成测试数据，不代表真实研究结论。
                   </p>
+                )}
+                {welcome && (
+                  <ResearchGallery
+                    api={api}
+                    onSuggestion={(text) => {
+                      controller.textInput.setInput(text);
+                      focusComposer();
+                    }}
+                  />
                 )}
               </div>
             )

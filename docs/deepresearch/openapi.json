@@ -24,6 +24,48 @@
         }
       }
     },
+    "/api/deepresearch/favicon": {
+      "get": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Favicon",
+        "operationId": "favicon_api_deepresearch_favicon_get",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 253,
+              "title": "Domain"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/deepresearch": {
       "post": {
         "tags": [
@@ -369,6 +411,46 @@
         ],
         "summary": "Sources",
         "operationId": "sources_api_deepresearch__run_id__sources_get",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/deepresearch/{run_id}/activity": {
+      "get": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Research Activity",
+        "operationId": "research_activity_api_deepresearch__run_id__activity_get",
         "parameters": [
           {
             "name": "run_id",
@@ -1073,6 +1155,18 @@
             "minLength": 3,
             "title": "Goal"
           },
+          "title": {
+            "type": "string",
+            "maxLength": 120,
+            "title": "Title",
+            "default": ""
+          },
+          "brief": {
+            "type": "string",
+            "maxLength": 12000,
+            "title": "Brief",
+            "default": ""
+          },
           "research_units": {
             "items": {
               "$ref": "#/components/schemas/ResearchUnit"
@@ -1089,6 +1183,14 @@
             "type": "array",
             "maxItems": 30,
             "title": "Constraints"
+          },
+          "assumptions": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 10,
+            "title": "Assumptions"
           },
           "expected_output": {
             "type": "string",
@@ -1108,6 +1210,12 @@
             "type": "array",
             "maxItems": 3,
             "title": "Clarification Questions"
+          },
+          "acknowledgement": {
+            "type": "string",
+            "maxLength": 1000,
+            "title": "Acknowledgement",
+            "default": ""
           },
           "source_policy": {
             "$ref": "#/components/schemas/SourcePolicy"
@@ -1142,6 +1250,12 @@
             "type": "string",
             "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$",
             "title": "Skill"
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 80,
+            "title": "Title",
+            "default": ""
           },
           "objective": {
             "type": "string",
@@ -1188,6 +1302,53 @@
           "objective"
         ],
         "title": "ResearchUnit"
+      },
+      "RetryResearch": {
+        "properties": {
+          "allow_limited_report": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Allow Limited Report"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "RetryResearch"
+      },
+      "SourcePolicy": {
+        "properties": {
+          "allowed_domains": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 50,
+            "title": "Allowed Domains"
+          },
+          "excluded_url_prefixes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 50,
+            "title": "Excluded Url Prefixes"
+          },
+          "require_original": {
+            "type": "boolean",
+            "title": "Require Original",
+            "default": false
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "SourcePolicy",
+        "description": "Intent-derived citation scope, not a schema imposed on MCP results."
       },
       "SourceStrategy": {
         "properties": {
@@ -1275,53 +1436,6 @@
           "type"
         ],
         "title": "ValidationError"
-      },
-      "RetryResearch": {
-        "properties": {
-          "allow_limited_report": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Allow Limited Report"
-          }
-        },
-        "additionalProperties": false,
-        "type": "object",
-        "title": "RetryResearch"
-      },
-      "SourcePolicy": {
-        "properties": {
-          "allowed_domains": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array",
-            "maxItems": 50,
-            "title": "Allowed Domains"
-          },
-          "excluded_url_prefixes": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array",
-            "maxItems": 50,
-            "title": "Excluded Url Prefixes"
-          },
-          "require_original": {
-            "type": "boolean",
-            "title": "Require Original",
-            "default": false
-          }
-        },
-        "additionalProperties": false,
-        "type": "object",
-        "title": "SourcePolicy",
-        "description": "Intent-derived citation scope, not a schema imposed on MCP results."
       }
     }
   }

@@ -1,5 +1,7 @@
 # 验收记录
 
+> 历史文档：记录 2026-09-16 时的设计或验收状态。与当前实现不一致之处，以 [ARCHITECTURE.md](ARCHITECTURE.md) 和 [HANDOFF.md](HANDOFF.md) 为准。
+
 ## 当前真实集成验证（2026-09-16，未完成最终验收）
 
 后续无模型调用的 UI 验收已补齐：15 项前端回归通过；computer use 验证了合成环境

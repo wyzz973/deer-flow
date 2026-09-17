@@ -1,0 +1,594 @@
+# DeepResearch 架构与工作流
+
+更新时间：2026-09-17。本文描述当前代码的实际设计，是 DeepResearch 架构的权威说明。
+`DESIGN_BASELINE.md`、`RUNTIME.md` 是早期设计记录；`NATIVE_RUNTIME.md`、`REUSE_AUDIT.md`
+是原生复用专题。接口契约以 [API.md](API.md) 与 [openapi.json](openapi.json) 为准，交接状态见
+[HANDOFF.md](HANDOFF.md)，交互对标依据见 [CHATGPT_BENCHMARK_2026-09-16.md](CHATGPT_BENCHMARK_2026-09-16.md)。
+
+## 1. 定位与原则
+
+DeepResearch 是 DeerFlow 的可选扩展：`backend/deepresearch/extension.py` 向 Gateway 注册一个
+`ResearchService` 和 `/api/deepresearch` 路由，普通聊天、全局工具与模型配置不受影响。
+
+| 原则 | 含义 |
+| --- | --- |
+| 复用原生运行时 | 规划、研究、写报告等角色都通过 `SubagentExecutor` 运行真正的 DeerFlow Agent，复用模型、工具、MCP、Skill、沙箱、授权和生命周期；不另建 Agent loop 或中间件链 |
+| 工具返回不做业务映射 | MCP 与原生工具的参数 schema 和返回值原样交给模型；研究结束后才从消息与 receipts 中观察来源和证据 |
+| 不依赖 JSON mode | 结构化输出用普通文本解析加有限修复；报告正文直接是 Markdown |
+| 引用必须真实 | 报告只能引用本次运行中真正读取过、且有资格引用的证据；编号绑定由代码完成，无法验证的陈述被删除，绝不猜测替换 ID 或 URL |
+| 交互对标 ChatGPT 深度研究 | 研究简报式计划、倒计时与编辑、修改即开始、研究中更新、活动时间线、全屏阅读器与来源面板 |
+| 本地可观测 | 完整 Trace 存在本地数据库，受 owner/ACL 保护，不需要 LangSmith |
+| 部署边界明确 | 单 worker、SQLite；外部工具至多保证 at-least-once；不宣称 exactly-once 或事实正确 |
+
+## 2. 系统上下文
+
+```mermaid
+flowchart TB
+  Browser["浏览器：Next.js 研究页面"] -->|REST + SSE| Proxy["Nginx 或 Next rewrite"]
+  Proxy --> Router["api.py：/api/deepresearch 路由"]
+  Router --> Service["service.py + conversation.py：准入、倒计时、消息、恢复"]
+  Service --> Graph["workflow.py：LangGraph 研究流程"]
+  Graph --> Runner["runner.py：DeerFlowRunner / DemoRunner"]
+  Runner --> Native["native.py：execute_role"]
+  Native --> Executor["DeerFlow SubagentExecutor"]
+  Executor --> Model["模型提供方（Chat Completions）"]
+  Executor --> Tools["原生工具 web_search / web_fetch / read_file ... 与 MCP"]
+  Executor --> Skills["Skills 与沙箱"]
+  Service --> Store[("research.sqlite3：运行、事件、证据、报告、缓存")]
+  Graph --> Checkpoints[("checkpoints.sqlite3：LangGraph 检查点")]
+  Native --> Trace["trace.py：本地 span、用量与活动事件"]
+  Trace --> Store
+  Router --> Favicons["favicons.py：网站图标代取"]
+  Favicons --> Store
+```
+
+一次研究对应一个 `run`（`run_id`、`thread_id = dr-<run_id>`）。LangGraph 以 `thread_id` 保存检查点；
+业务快照、事件与证据保存在研究数据库。两者职责不同，恢复时都需要。
+
+## 3. 代码地图
+
+### 3.1 后端 `backend/deepresearch/`
+
+| 模块 | 职责 |
+| --- | --- |
+| `extension.py` | DeerFlow 扩展入口：加载配置、创建服务、注册路由 |
+| `api.py` | 认证、owner 与 ACL 校验、公开投影、SSE、报告/Trace 导出、活动与图标接口 |
+| `service.py` | 创建与幂等、容量准入、执行驱动 `_drive`、计划决策、重试、取消、启动恢复与停止 |
+| `conversation.py` | 服务端倒计时、暂停/恢复、消息路由（修改计划、研究中更新、报告追问） |
+| `workflow.py` | LangGraph 节点与边：规划、审核、研究、合并、缺口、补研、写作、绑定、终检、发布、追问 |
+| `runner.py` | 角色任务的提示词与载荷；研究结果转换；报告大纲/章节/摘要写作与修订；演示 Runner |
+| `native.py` | 把角色交给原生 `SubagentExecutor`：工具候选、私有模型配置、线程 ID、Trace 回调、取消与清理 |
+| `structured.py` / `output.py` | 普通文本到契约的解析与有限修复（校验器、最终一次的删除式修复） |
+| `observations.py` / `sources.py` | 从原生消息、receipts、`deerflow.web_page.v1` 元数据中观察读取页面、工具记录和发现链接 |
+| `evidence.py` | 证据合并：稳定 `E###` 编号、去重、lineage、URL 规范化 |
+| `report_policy.py` | 来源策略、引用资格（`citable`）、章节与摘要长度目标 |
+| `validators.py` | 缺口识别、补研单元生成、单一来源提示 |
+| `report.py` | Markdown 报告：标记解析、清理、句级删除、组装、目录、引用绑定、终检、导出（md/html/docx） |
+| `render.py` | 引用元数据分组与历史 AST 报告的 Word 导出 |
+| `activity.py` | 把事件与调用投影为面向用户的活动时间线与计数 |
+| `trace.py` | 本地 span、脱敏、模型/工具回调、用量预留与结算、进展说明事件 |
+| `store.py` | SQLite 存储、事务、事件序号、原子发布、缓存、图标缓存 |
+| `favicons.py` | 网站图标代取：公网地址校验、位图识别、缓存 |
+| `config.py` / `contracts.py` | 配置 schema 与领域契约（计划、单元、结果、证据、大纲、错误、状态） |
+| `live.py` / `demo.py` / `doctor.py` | 隔离真实验收启动器、合成演示应用、配置检查 |
+
+### 3.2 前端 `frontend/src/`
+
+| 位置 | 职责 |
+| --- | --- |
+| `app/workspace/deepresearch/page.tsx`、`[run_id]/page.tsx` | 新研究与研究会话路由 |
+| `components/deepresearch/research-conversation.tsx` | 复用原生 `ChatSurface`、`MessageList`、`PromptInput`、`ChatBox`，接线所有研究交互 |
+| `components/deepresearch/plan-card.tsx` | 计划卡、倒计时环、编辑/取消/开始、进度卡、更新、失败与重试 |
+| `components/deepresearch/report-view.tsx` / `report-reader.tsx` | 报告卡、正文渲染与引用编号、导出菜单、全屏阅读器与悬停目录 |
+| `components/deepresearch/sources-panel.tsx` | “来源”（按域名分组的引用）与“活动”（研究时间线）页签 |
+| `components/deepresearch/citation-preview.tsx` | 引用悬浮卡（原文片段）与网站图标 `SiteIcon` |
+| `components/deepresearch/trace-panel.tsx` | 本地 Trace 浏览与导出 |
+| `components/deepresearch/research-history.tsx` / `research-gallery.tsx` | 侧栏研究历史；空白页“推荐/报告” |
+| `components/deepresearch/workbench.tsx` | 兼容旧入口的别名导出 |
+| `core/deepresearch/api.ts` / `hooks.ts` / `events.ts` | 研究 API 客户端、查询与 SSE、事件解析与快照合并 |
+| `core/deepresearch/presentation.ts` / `types.ts` / `trace-model.ts` | 展示计算、类型、Trace 模型 |
+
+### 3.3 配置、Skill 与测试
+
+- `deepresearch.example.yaml`：研究配置示例；`examples/deepresearch/`：宿主配置片段、原生 web 来源、Skills。
+- `tests/deepresearch/`：后端契约、工作流、恢复、证据、报告、活动、图标等测试。
+- `frontend/tests/unit/**/deepresearch/`：前端展示、hooks、计划卡、活动面板、引用预览测试。
+
+## 4. 运行状态
+
+`RunStatus`（`contracts.py`）：
+
+```mermaid
+stateDiagram-v2
+  [*] --> CREATED
+  CREATED --> PLANNING
+  PLANNING --> AWAITING_PLAN_CONFIRMATION
+  PLANNING --> AWAITING_CLARIFICATION
+  AWAITING_PLAN_CONFIRMATION --> EDITING_PLAN: 点击编辑
+  EDITING_PLAN --> AWAITING_PLAN_CONFIRMATION: 放弃编辑
+  AWAITING_PLAN_CONFIRMATION --> PLANNING: 对话修改
+  EDITING_PLAN --> PLANNING: 对话修改
+  AWAITING_CLARIFICATION --> PLANNING: 回答澄清
+  AWAITING_PLAN_CONFIRMATION --> RESEARCHING: 倒计时结束或开始
+  PLANNING --> RESEARCHING: 修改后直接开始
+  RESEARCHING --> VALIDATING
+  VALIDATING --> GAP_FOUND
+  GAP_FOUND --> RESEARCHING: 补研
+  VALIDATING --> RESEARCH_COMPLETE
+  RESEARCH_COMPLETE --> SYNTHESIZING
+  SYNTHESIZING --> CITATION_BINDING
+  CITATION_BINDING --> FINAL_VALIDATING
+  FINAL_VALIDATING --> SYNTHESIZING: 有限重写
+  FINAL_VALIDATING --> RENDERING
+  RENDERING --> COMPLETED
+  COMPLETED --> RESPONDING: 追问
+  RESPONDING --> COMPLETED: 直接回答
+  RESPONDING --> SYNTHESIZING: 改写报告
+  RESPONDING --> PLANNING: 需要新研究
+  COMPLETED --> [*]
+  FAILED --> RESEARCHING: 可恢复时重试
+```
+
+任意非终态都可能进入 `FAILED`（带 `{code, message, recoverable}`）或 `CANCELLED`。
+
+| 集合 | 状态 | 用途 |
+| --- | --- | --- |
+| `TERMINAL` | `COMPLETED`、`FAILED`、`CANCELLED` | 事件流在终态且无活动任务时结束 |
+| `REVIEW_STATUSES` | `AWAITING_PLAN_CONFIRMATION`、`EDITING_PLAN`、`AWAITING_CLARIFICATION` | 计划决策与计划修改消息的前提 |
+| `STEERABLE_STATUSES` | `RESEARCHING`、`VALIDATING`、`GAP_FOUND`、`RESEARCH_COMPLETE`、`SYNTHESIZING` | 消息作为研究中更新（steering） |
+
+`CITATION_BINDING`、`FINAL_VALIDATING`、`RENDERING` 期间的新消息返回 `RUN_BUSY`，不假装已采纳。
+
+## 5. LangGraph 工作流
+
+### 5.1 图结构
+
+```mermaid
+flowchart LR
+  START((START)) -->|input_mode = follow_up| FU[follow_up]
+  START -->|其他| PL[planner]
+  FU -->|answer| E((END))
+  FU -->|revise| SY[synthesis]
+  FU -->|research| PL
+  PL --> RV[plan_review]
+  RV -->|edit| PL
+  RV -->|approve| DI[dispatch]
+  RV -->|reject| RJ[rejected] --> E
+  DI --> ME[evidence_merge] --> VA[validator]
+  VA -->|GAP_FOUND| SU[supplement] --> DI
+  VA -->|RESEARCH_COMPLETE| SY
+  SY --> CB[citation_binder] --> FV[final_validator]
+  FV -->|有错误且未超修复次数| SY
+  FV -->|通过| RE[renderer] --> E
+```
+
+每个节点都包在 `traced()` 中，产生 `node` 类型的本地 span。`service._drive` 以
+`recursion_limit=200` 调用 `graph.ainvoke`，并关闭 LangSmith 自动追踪。
+
+### 5.2 节点说明
+
+| 节点 | 状态 | 做什么 | 关键事件 | 持久化与缓存 |
+| --- | --- | --- | --- | --- |
+| `planner` | `PLANNING` | 调用 `deepresearch` 角色生成 `ResearchPlan`：研究简报 `brief`、短标题、3–6 个带短标题的单元、前提假设、报告风格、来源策略；对话修改时写 `acknowledgement` 并设置 `auto_start` | `plan.created` / `plan.updated` | 缓存键 `plan:`；写入 `plan` 与 `units`；追加 `ack-N` 与 `plan-N` 对话消息 |
+| `plan_review` | 等待确认 | `auto_start` 时记录 `plan.auto_started`（`source=revision`）并直接批准；否则 `interrupt` 等待决策 | `plan.waiting_confirmation`（由服务写入）、`plan.auto_started` | 中断前无副作用，恢复时节点重跑 |
+| `dispatch` | `RESEARCHING` | 按依赖分批并行（`max_concurrency`）运行研究单元；已提交结果直接复用；非致命失败降级为占位结果；致命错误或整批失败使运行失败 | `research.unit.started` / `completed` / `failed` | `research_unit` 结果；`unit_statuses`、`unit_failures` |
+| `evidence_merge` | — | `merge_results` 按计划顺序把原始证据合并为稳定的 `E###`，生成 `BoundFinding` 与 lineage | `evidence.pool.updated` | `research_evidence`；`evidence_count` |
+| `validator` | `VALIDATING` | 计算可引用证据集合与缺口；无缺口则完成；补研预算耗尽或结果饱和时：无可引用证据报 `NO_EVIDENCE`，否则默认带局限继续 | `validator.passed` / `validator.gap_found` / `report.limitations.auto` | `research_gap`；`gaps`、`limitations` |
+| `supplement` | — | 按缺口严重度生成补研单元（`S<iter>-<hash>`，依赖原单元）；截断的缺口发出事件 | `research.supplement.deferred` | `units`、`iteration` |
+| `synthesis` | `SYNTHESIZING` | 新报告调用 `write_report`；报告追问的改写调用 `revise_report` | `report.synthesizing`、`report.outline.ready`、`report.section.*`、`report.draft.repair` | 缓存键 `synthesis:…:retry-N` 及大纲/章节/摘要各自的缓存 |
+| `citation_binder` | `CITATION_BINDING` | `report.bind` 把标记映射为页面编号 | `citation.bound` | 状态内 `citation_map` |
+| `final_validator` | `FINAL_VALIDATING` | `report.validate`：未知或不合格引用、数字引用、URL、无引用、无标题；有错误时回到写作，超过 `max_synthesis_repairs` 报 `FINAL_VALIDATION` | — | `final_errors`、`synthesis_repairs` |
+| `renderer` | `RENDERING` | 生成 `markdown-v2` 报告体与统计，原子发布 | `report.completed`（发布事务内） | `research_report` 新版本、对话报告消息、`COMPLETED` |
+| `follow_up` | `RESPONDING` | 对完成后的消息调用 `respond`：`answer` 直接回复；`revise` 改写现有文档；`research` 开启新 `cycle` | `conversation.answered`、`research.cycle.started` | 缓存键 `followup:<message_id>`；新 cycle 清空单元、缺口、局限和更新 |
+
+### 5.3 研究单元失败语义
+
+`FATAL_UNIT_ERRORS`：`MODEL_AUTH_REQUIRED`、`MODEL_ACCESS_DENIED`、`MODEL_BILLING_REQUIRED`、
+`MODEL_NOT_CONFIGURED`、`BUDGET_EXHAUSTED`、`TIME_BUDGET`、`RUN_CANCELLED`、`AGENT_NOT_CONFIGURED`、
+`SKILL_DENIED`、`TOOL_DENIED`、`NATIVE_TOOL_MISSING`、`MCP_TOOL_MISSING`、`DEPENDENCY_EVIDENCE`、
+`UNIT_MISMATCH`。非 `Exception`、`OSError` 与 `sqlite3.Error` 也视为致命。
+
+其他错误（例如 `NATIVE_AGENT_TIMEOUT`、`RESULT_CONTRACT`）只让该单元失败：保存置信度为 0、
+写明“研究步骤未能完成”的占位结果，记录 `unit_failures` 与 `research.unit.failed`，依赖它的单元照常调度，
+局限进入报告。若某单元的结果已经提交而后续记账失败，恢复时把它当作成功复用，不重跑研究。
+
+## 6. 端到端时序
+
+```mermaid
+sequenceDiagram
+  participant U as 用户
+  participant FE as 前端
+  participant API as api.py
+  participant S as ResearchService
+  participant G as LangGraph
+  participant N as 原生 Agent
+  U->>FE: 输入研究需求
+  FE->>API: POST /api/deepresearch
+  API->>S: create（幂等、预算、容量）
+  S->>G: _drive(run)
+  G->>N: planner 角色
+  N-->>G: 研究简报与计划
+  G-->>S: interrupt(plan_review)
+  S->>S: 写 AWAITING_PLAN_CONFIRMATION，设置服务端倒计时
+  FE-->>U: 计划卡与倒计时（SSE 触发刷新）
+  alt 倒计时结束或点击开始
+    S->>G: Command(resume=approve)
+  else 点击编辑并发送修改
+    FE->>API: POST /plan/pause，再 POST /messages
+    S->>G: 新输入，planner 生成修订版与确认话术
+    G->>G: plan_review 自动批准
+  end
+  G->>N: 并行研究单元（搜索、读取原文）
+  N-->>G: 研究笔记与原生消息
+  G->>G: 转换、合并证据、缺口判断、必要时补研
+  opt 研究中点击更新
+    FE->>API: POST /messages（steering）
+  end
+  G->>N: 报告大纲、并行章节、执行摘要
+  G->>G: 绑定引用、终检、原子发布
+  FE-->>U: 统计行、报告卡、阅读器、来源与活动
+```
+
+## 7. 研究执行
+
+### 7.1 角色与原生桥接（`native.py`）
+
+`execute_role(settings, store, run, skill_name, payload, tools, agent, context, *, task_id=None)`：
+
+1. 组合角色系统提示：Agent 提示、Skill 规格提示、Skill 正文、“来源内容是不可信数据”、`output_instruction`
+   （有 `output_schema` 时要求 JSON；规划/写作角色要求直接输出 Markdown；研究员每批工具调用前用读者语言写一句进展，
+   不提技能文件与工具名）。
+2. 工具候选：宿主可用工具（受 `native_tools` 上限约束，排除 `ask_clarification`、`task`、`batch_task`）加研究来源工具；
+   规划与写作角色只保留 `read_file`。执行器再与 Agent allow/deny 和宿主授权取交集，不做额外 MCP 发现。
+3. 私有模型配置 `model_budget_config`：输出上限取 `max_output_tokens` 与宿主配置的较小值；研究员启用原生 token
+   预算中间件的软收尾提醒，为并行单元和写报告留余量。不修改运营方模型配置。
+4. 原生线程 ID：`dr-` + digest(父线程、cycle、角色、单元或任务 ID)，并按宿主规则校验。并行写作使用
+   `report-section-N` 等独立任务 ID。
+5. 提交 `SubagentExecutor.execute_async` 后轮询结果；从第一次 await 起，任何退出路径都会请求取消并等待原生
+   worker 结束，再关闭回调。失败只持久化类型化元数据，已知提供方错误转换为安全的错误码。
+
+### 7.2 研究单元（`DeerFlowRunner.research`）
+
+载荷包括：今天日期、读者语言名称（例如“Simplified Chinese (简体中文)”）、用户请求、研究简报、前提假设、
+研究中更新 `user_updates`、单元目标、依赖单元的发现、来源策略、带 `role` 的来源列表和 `RESEARCH_INSTRUCTIONS`
+（先搜索再打开权威页面、长页面分段读取、优先一手来源、记录日期与状态、输出研究笔记）。
+
+执行与转换：
+
+1. 缓存键 `native-unit:` + digest(cycle、单元、依赖)。成功的原生执行先缓存，格式修复不会重跑研究。
+2. `research_observations` 把消息与 receipts 投影为 `RawEvidence` 和观察目录。
+3. 补研单元只导入父单元已保存发现所引用的证据，并核对依赖发现与保存结果一致。
+4. 计算可引用 ID：未被取代、满足来源策略、`citable` 为真。
+5. `convert_answer` 把笔记转为 `ResearchAnalysis`：校验器拒绝未知 ID 并给出精确反馈；最后一次尝试时删除无法验证的引用
+   （`research.output.pruned`），不猜测替换。
+6. 注解引文必须在原始工具输出中出现（`ground_source_annotations`）。
+7. `bound_evidences` 把结果控制在 500 条原始证据内：保留被引用的证据、已读取页面和工具记录，先裁掉多余的发现链接，
+   再裁已被取代的运行时副本（`research.evidence.trimmed`）。
+8. 构造 `ResearchResult`；契约错误区分 `EVIDENCE_REFERENCE`（引用了未观察的证据）与 `RESULT_CONTRACT`（超出字段限制）。
+
+### 7.3 观察到的证据（`observations.py`）
+
+| provenance | 来源 | 默认可引用 |
+| --- | --- | --- |
+| `fetched_document` | 声明为 `read` 的原生抓取返回的页面（`deerflow.web_page.v1`）；被 `read_file` 续读的外置化长页面；确认导航后的 `browser_get_text` | 是 |
+| `tool_output` | 声明为 `data` 的来源工具（例如 MCP 业务记录）返回 | 是 |
+| `tool_output`（search 角色） | 搜索工具的结果正文 | 仅 `cite_search_results: true` |
+| `observed_source` | 任意工具输出中出现的链接（每个输出最多 100 条） | 仅 `cite_search_results: true` |
+| 运行时工具输出 | 未声明的工具（文件、命令行、未确认页面的浏览器输出） | 否 |
+
+宿主 `ToolOutputBudgetMiddleware` 会把超长工具输出外置到 `/mnt/user-data/outputs/.tool-results/*.log`；
+研究员随后用 `read_file` 读取该文件时，读取内容登记为原网页（URL、标题、文档哈希），匿名文件副本标为已取代。
+不会从文件内容推断 URL。
+
+### 7.4 证据合并（`evidence.py`）
+
+`merge_results` 按计划顺序处理结果，身份键为（origin、source_name、canonical_url 或 source_uri、内容哈希）。
+同一身份复用已有 `E###` 并追加单元 ID；相同的有序输入总是得到相同编号。URL 规范化去掉跟踪参数与片段，保留业务参数。
+
+### 7.5 缺口与补研（`validators.py`）
+
+缺口类型与优先级：`coverage`（单元没有可引用发现）、`unsupported`、`missing-internal` / `missing-external`
+（部署要求双来源时）、`date`、`open-questions`（研究员列出的可公开检索的问题）。用户私有背景
+（`assumptions_needed`）只成为报告假设，不算缺口；单一站点支持的高风险结论只要求写作时加限定（`single_source`）。
+
+补研单元按缺口严重度排序并受 `max_units` 限制，被截断的缺口发出 `research.supplement.deferred`。
+达到 `max_iterations`、单元上限，或缺口签名不变且证据池不再增长时停止补研：
+有可引用证据时默认写带局限的报告（`allow_limited_report: true`，事件 `report.limitations.auto`）；
+严格部署需 owner 通过重试同意；没有可引用证据时失败为 `NO_EVIDENCE`。
+
+## 8. 引用资格与来源策略
+
+- `SourceSpec.role`（`search` / `read` / `data`）由运营方声明，`report_policy.citable` 据此判断。
+- `SourcePolicy` 来自用户计划：`allowed_domains`、`excluded_url_prefixes`、`require_original`（只允许读取过的原文）。
+- `eligible_evidence(pool, policy, settings)` 同时约束研究转换、缺口判断、写作输入和终检。
+- 发现链接、读取原文、报告引用是三件不同的事，界面和计数都分开，不把发现当成“已核实”。
+
+## 9. 报告生成
+
+### 9.1 写作流水线（`DeerFlowRunner.write_report`）
+
+```mermaid
+flowchart LR
+  F["发现与可引用证据"] --> O["大纲 ReportOutline"]
+  O --> S1["章节 1"]
+  O --> S2["章节 2"]
+  O --> Sn["章节 N"]
+  S1 --> SUM["执行摘要"]
+  S2 --> SUM
+  Sn --> SUM
+  SUM --> A["组装 Markdown 文档"]
+```
+
+1. **大纲**：输入研究简报、原单元、单元摘要、编号发现（含 `high_risk`、`single_source`）、前提假设、原始局限、章节数量范围。
+   校验要求每个原单元都被覆盖、章节数不超过 `max_report_sections`，且不得规划执行摘要、研究范围与局限、参考来源这类由系统组装的章节；
+   最后一次尝试由 `tidy` 删除这类章节并把单元覆盖并入其他章节。标题去掉“一、”“1.”等编号。缓存键 `report-outline:`。
+2. **章节**：按 `max_concurrency` 并行，每节只拿到本节单元（补研映射回原单元）的发现与证据目录，使用独立原生任务 ID，
+   缓存键 `report-section:`。写作要求：先给判断、跨来源综合、事实句紧跟 `[[E012]]` 标记、保留状态与日期、
+   区分厂商宣称与独立证据、需要时使用表格或 Mermaid。
+3. **摘要**：基于章节草稿写执行摘要，只复制草稿中已有的标记。缓存键 `report-summary:`。
+4. **修复与清理**（`_markdown`）：先用精确反馈修复一次（`report.draft.repair`），再 `sanitize`：删除含未知或不合格标记的句子、
+   列表项或表格单元格内容，去掉链接、裸 URL 与数字引用，并在 `audit` 中计数。`clean_answer` 去掉包裹代码块、重复标题、
+   首行写作元话语和描述生成过程的段落（例如“未新增证据 ID”）。
+5. **组装**：`# 标题`、`## 执行摘要`、各章节、`## 研究范围与局限`（前提假设与最多 5 条合并局限）。长度只是目标，不因超长失败。
+
+对话式改写调用 `revise_report`，在现有文档上最小修改，标记同样校验与清理；不会为改写重新搜索。
+
+### 9.2 绑定、终检与导出（`report.py`）
+
+- `bind(document, pool)`：按首次出现给页面编号。同一页面（忽略协议、`www.` 与结尾斜杠，查询参数不同视为不同页面）
+  共享编号；没有 URL 的记录各自编号。未知 ID 抛错，交给终检重写。
+- `validate`：检查未知或不合格引用、数字引用和 URL、存在可引用证据却没有引用、缺少标题。
+- `display_markdown`：`[n](#citation-E012)` 链接，前端变成引用编号；`$` 转义，避免被当成公式。
+- `citations`：每个编号包含域名、`evidence_ids` 与每条摘录（清理后的文本和各自的 `document_hash`）；
+  标题取组内第一个真实标题，否则显示去掉协议的 URL。
+- 导出：Markdown（`[n](#ref-n)` 与参考文献）、HTML（markdown-it 渲染，引用上标，导出响应带严格 CSP）、Word（python-docx，
+  标题、列表、表格、代码块与参考文献）。历史 AST 报告由 `render.docx_report` 导出。
+
+### 9.3 发布内容
+
+`renderer` 发布 `format: "markdown-v2"` 报告：`title`、`document`、`display_markdown`、`markdown`、`html`、`toc`、
+`citations`、`citation_map`、`limitations`、`assumptions`、`audit`（原始局限、缺口 ID、修复与删除计数）、
+`stats`（用时、搜索、读取页面、引用数）、`demo`。发布键不包含 `stats`。报告版本、对话中的报告消息、`COMPLETED`
+和 `report.completed` 在同一 SQLite 事务写入。
+
+## 10. 对话与控制面
+
+### 10.1 计划确认
+
+- 倒计时由服务端拥有：进入 `AWAITING_PLAN_CONFIRMATION` 时写 `auto_start_at` 并挂起定时任务；到期后通过与手动批准相同的互斥入口启动。
+  浏览器不启动研究，刷新与多标签页不会获得新的倒计时。
+- `plan/pause` 进入 `EDITING_PLAN` 并清除期限；`plan/resume` 恢复倒计时；`plan/approve` / `plan/reject` / `plan/edit` 需要匹配 `plan_version`。
+- 对话中的计划修改视为批准：planner 生成修订版与确认话术后直接开始；仍有澄清问题时继续等待。结构化 `plan/edit` 保持重新审核的语义。
+
+### 10.2 消息路由（`conversation.message`）
+
+| 当前状态 | 行为 |
+| --- | --- |
+| `REVIEW_STATUSES` | 持久化用户消息与 `pending_operation`，进入 `PLANNING`，以修订输入重新运行图 |
+| `STEERABLE_STATUSES` | 追加用户消息与确认消息 `update-<id>`，写入 `steering`，发出 `conversation.steering`；不启动新执行、不需要凭据 |
+| `COMPLETED` | 进入 `RESPONDING`，由 `follow_up` 决定回答、改写或开启新研究 |
+| 其他 | `RUN_BUSY` |
+
+同一 `client_message_id` 与相同内容的重试是幂等的；相同 ID 不同内容返回冲突。系统消息 ID 不能作为客户端幂等键。
+
+### 10.3 重试、取消、重启
+
+- `retry`：只接受可恢复失败、owner 明确同意带局限（`allow_limited_report: true` 且错误为 `RESEARCH_GAPS`）或
+  `FINAL_VALIDATION`。终检重试重置修复次数并推进草稿缓存代数，避免复用被拒绝的草稿。普通重试不得发送 `false`。
+- `cancel`：先持久化取消请求作为屏障，再取消并等待原生 worker 与数据库 I/O 收尾，单元状态标为已取消；已完成报告不会被覆盖。
+- 启动恢复：带取消请求的非完成运行标为 `CANCELLED`；待确认计划暂停倒计时（不保存旧凭据）；其他非终态标为
+  `FAILED/PROCESS_INTERRUPTED`（可恢复）。停止服务时拒绝新执行并等待活动任务结束。
+- 已接受但尚未执行的决策与消息以不含凭据的 `pending_operation` 记录；恢复时比较检查点中的 `operation_id`，
+  只重放未应用的输入。新 cycle 由消息身份约束，节点重放不会重复推进。
+
+## 11. 持久化
+
+### 11.1 研究数据库 `research.sqlite3`
+
+| 表 | 内容 |
+| --- | --- |
+| `research_run` | 运行 JSON 快照：owner、请求幂等键与哈希、状态、计划、单元、对话、用量、报告、错误、待执行操作 |
+| `research_unit` | 单元结果（按 cycle 与单元 ID，带输入哈希） |
+| `research_evidence` / `research_gap` | 证据池与缺口 |
+| `research_report` | 按版本的不可变报告 |
+| `research_event` | 单调 `seq` 的事件与幂等键（SSE 与活动的来源） |
+| `research_cache` | 计划、原生执行、转换、大纲、章节、摘要、写作、追问等阶段缓存 |
+| `research_source` / `research_tool_call` | 发现的来源与原生工具调用（状态、耗时、角色、查询词或 URL） |
+| `research_favicon` | 网站图标缓存（按域名，与运行无关） |
+
+LangGraph 检查点在 `checkpoints.sqlite3`。运营日志轮转写入数据目录。进程锁 `worker.lock` 阻止多个 worker 使用同一目录。
+备份与迁移需要同时考虑两个数据库；多 worker 与分布式执行不在当前边界内。
+
+### 11.2 幂等与原子性
+
+- 创建请求按（owner、Idempotency-Key）去重，重放仍重新检查访问策略，不占用新的执行名额。
+- 单元结果、原生执行和各写作阶段都有内容寻址的缓存键，重试不会重复完成过的工作。
+- 报告发布是单事务；事件键包含 cycle，避免新一轮研究与旧事件冲突。
+- 外部工具至多保证 at-least-once：进程可能在远端成功后、结果落库前崩溃。
+
+## 12. 可观测性
+
+### 12.1 本地 Trace（`trace.py`）
+
+workflow、节点、原生 Agent、模型调用、工具调用、结构化转换都有 span（`trace.started` / `trace.ended`），
+带父子关系、耗时、状态与有界且脱敏的载荷（`trace_capture_content`、`trace_max_chars`）。普通 SSE 中不包含载荷；
+`GET /{id}/trace` 分页读取，`/trace/export` 导出 JSONL，均受 owner/ACL 保护。回调与原生子循环无关；
+缺失终态的历史子 span 仅在祖先已结束时补记中断，不伪造成功。
+
+模型用量先按估算预留（`usage.reserved`），拿到提供方用量后结算（`usage.settled`）；未知用量保留预留。
+工具与 token 超出预算时报 `BUDGET_EXHAUSTED`。
+
+### 12.2 活动时间线（`activity.py`）
+
+`GET /{id}/activity` 从本轮 cycle 的事件与调用投影出结构化条目：`plan`、`step`、`note`（研究员进展说明）、
+`search`（同一单元连续搜索合并，带查询词与结果域名）、`read`、`tool`、`step_done`、`step_failed`、`gap`、
+`limited`、`update`、`writing`、`outline`、`section`、`done`、`failed`、`cancelled`，以及 `current`
+（正在规划、搜索、阅读或写作的内容）和计数（搜索、读取页面、计划步骤及已结束步骤）。进展说明只展示读者语言，
+描述技能文件或工具名的句子只留在 Trace。查询词与 URL 只从声明为 `search` / `read` 的工具参数提取。
+
+### 12.3 事件流
+
+`GET /{id}/events` 以 `after` 或 `Last-Event-ID` 为游标回放持久事件，约每 0.5 秒拉取、每 10 秒心跳，
+在终态且无活动任务时结束。响应头 `Cache-Control: no-store, no-transform` 防止压缩代理缓冲进度事件。
+
+主要事件：`run.created`、`plan.created`、`plan.updated`、`plan.waiting_confirmation`、`plan.editing`、
+`plan.countdown_resumed`、`plan.auto_started`、`conversation.message`、`conversation.steering`、`conversation.answered`、
+`research.cycle.started`、`research.unit.started/completed/failed`、`research.agent.started`、`research.source_policy`、
+`research.output.retry/pruned`、`research.evidence.trimmed`、`research.supplement.deferred`、`evidence.pool.updated`、
+`validator.passed`、`validator.gap_found`、`report.limitations.auto/policy`、`report.synthesizing`、`report.outline.ready`、
+`report.section.started/completed`、`report.draft.repair`、`citation.bound`、`report.validation.retry`、`report.completed`、
+`run.failed`、`run.cancelled`、`activity.tool.started/completed`、`activity.note`、`usage.reserved/settled`、`trace.started/ended`。
+
+## 13. HTTP 接口摘要
+
+所有接口位于 `/api/deepresearch`，详细契约见 [API.md](API.md)。
+
+| 分类 | 接口 |
+| --- | --- |
+| 能力与创建 | `GET /capabilities`、`POST /`、`GET /`（历史） |
+| 运行与计划 | `GET /{id}`、`POST /{id}/plan/approve`、`pause`、`resume`、`edit`、`reject` |
+| 对话与控制 | `POST /{id}/messages`、`POST /{id}/cancel`、`POST /{id}/retry` |
+| 过程 | `GET /{id}/events`（SSE）、`GET /{id}/activity`、`GET /{id}/sources`、`GET /{id}/evidences` |
+| 报告与审计 | `GET /{id}/report?format=json\|md\|html\|docx&version=N`、`GET /{id}/trace`、`GET /{id}/trace/export` |
+| 资源 | `GET /favicon?domain=`（网站图标） |
+
+错误映射：`SERVICE_STOPPING` → 503；`RUN_BUSY`、`PLAN_VERSION`、`NOT_RETRYABLE`、`IDEMPOTENCY_CONFLICT`、`CONFIG_CHANGED`
+→ 409；`CAPACITY` → 429；其他研究错误 → 422。owner 不匹配与不存在同样返回 404。
+
+## 14. 前端架构
+
+### 14.1 数据流
+
+`useResearchConversation`（`core/deepresearch/hooks.ts`）：
+
+- React Query 维护 `capabilities`、`run`、`sources`、`activity`、`history` 查询。
+- 非终态运行建立 `EventSource(/events?after=<seq>)`；收到事件、连接建立或出错时让运行、来源和活动查询失效重取，
+  以覆盖进程重启这类不产生新事件的状态变化。
+- 操作（创建、消息、暂停/恢复、批准、取消、重试）走认证的研究 API；迟到响应按会话选择与请求时间隔离，
+  网络不确定时保留消息幂等键。
+- 倒计时剩余时间基于服务端快照与本地单调时钟计算，浏览器不发起批准。
+
+### 14.2 界面与 ChatGPT 对照
+
+| ChatGPT 深度研究 | DeerFlow 实现 |
+| --- | --- |
+| 研究简报与计划卡、圆环倒计时、编辑/取消/开始 | `plan-card.tsx` 等待状态 |
+| 编辑时输入框上方引用计划，修改后回复确认并直接开始，旧卡折叠为“计划已更新” | `research-conversation.tsx` 引用条、`ack-N` 消息、折叠计划 |
+| 研究中步骤状态、实时状态行、搜索计数、进度条、停止、更新 | `plan-card.tsx` 运行状态与 `liveStatus` |
+| “研究完成情况：用时 · 引用 · 搜索”与报告卡 | `reportSummaryLine`、`ResearchReportCard` |
+| 全屏阅读器、悬停目录、滚动高亮 | `report-reader.tsx` |
+| 来源按域名分组（网站图标）、活动时间线（网站标签） | `sources-panel.tsx`、`SiteIcon` |
+| 正文上标引用与来源卡片 | `report-view.tsx` 引用编号与 `CitationPreview` 悬浮卡（原文片段） |
+| 空白页“推荐”“报告” | `research-gallery.tsx` |
+
+研究页向原生 `MessageList` 传 `runDurationEnabled={false}`（单条消息耗时不是研究用时）。报告渲染使用 GFM，不启用数学公式。
+移动端的来源与活动使用原生 Sheet 抽屉。
+
+### 14.3 网站图标
+
+`SiteIcon` 只请求 `/api/deepresearch/favicon?domain=`，失败时显示首字母，并在 4 秒后以 `retry=1` 重试一次。
+Gateway 依次尝试主机与上级站点的 `/favicon.ico`、首页声明的最多 3 个非 SVG 图标；每一跳做公网地址校验；
+单个响应不超过 256 KB；只按文件头接受 ico/png/gif/jpeg/webp；命中缓存 7 天、未命中 1 天；
+首次超过 2 秒时返回 `no-store` 的 404 并在后台继续。`favicons: false` 关闭所有外部请求。
+
+## 15. 配置
+
+### 15.1 研究配置（`Settings`）
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `runner` / `runner_factory` | `demo` / 无 | `deerflow` 为真实执行；工厂由管理员指定 |
+| `data_dir` | `.deerflow/deepresearch` | 数据库、检查点、日志 |
+| `skills` | 必填 | 必须包含 `deepresearch` 与 `report-synthesis`；研究 Skill 的 `agent`、`model`、`max_turns`、`timeout_seconds` |
+| `sources` | `[]` | `name`、`kind`（`native` / `mcp`）、`tool`、`server`、`origin`（internal / external）、`level`、`role`（search / read / data） |
+| `max_concurrency` / `max_active_runs` | 3 / 8 | 单运行并行度与全局容量 |
+| `plan_countdown_seconds` | 45 | 计划倒计时 |
+| `max_output_tokens` / `output_retries` / `extraction_model` | 4096 / 2 / 无 | 单次输出上限与转换修复 |
+| `native_tools` | 无 | 宿主工具候选上限 |
+| `allow_limited_report` / `cite_search_results` | true / false | 带局限写报告；搜索结果是否可引用 |
+| `max_synthesis_repairs` / `max_report_sections` | 1 / 8 | 终检重写次数、章节上限 |
+| `favicons` | true | 网站图标代取 |
+| `require_dual_source` | true | 是否要求内外部来源并存 |
+| `budget_ceiling` | 有限值 | 部署级预算上限；客户端不能用 `null` 取消有限上限 |
+| `trace_capture_content` / `trace_max_chars` | true / 16000 | Trace 内容采集 |
+| `local_secret_env` / `request_secret_headers` / `access_policy` | 空 | 本地密钥环境变量名、请求头到凭据键的映射、读取时 ACL 钩子 |
+
+示例见仓库根 `deepresearch.example.yaml`、`examples/deepresearch/host-config.fragment.yaml`
+（研究角色超时 600 秒）与 `examples/deepresearch/native-web.sources.yaml`（原生搜索为 `search`、抓取为 `read`）。
+
+### 15.2 Skills
+
+`examples/deepresearch/skills/`：`deepresearch`（规划规则）、`report-synthesis`（大纲、章节、摘要规则）、
+`industry-trend`、`technical-route`、`product-benchmark`（研究方法与笔记格式）。Skill 正文参与配置指纹；
+配置或 Skill 变化后，旧运行的恢复会被 `CONFIG_CHANGED` 拒绝。
+
+### 15.3 验收启动器
+
+`python -m deepresearch.live --allow-live --model <宿主模型名>` 在隔离目录 `.deerflow/deepresearch/live-*` 生成私有配置，
+复用真实 Gateway。可选 `--jina-no-key`、`--unlimited-budget`、`--max-output-tokens`、`--resume-dir`、`--port`、`--frontend-port`。
+它不修改运营方文件，凭据只在进程环境中，不能在 CI 中调用真实提供方。
+
+## 16. 安全边界
+
+- 身份：生产由宿主 `resolve_principal` 提供；owner 不匹配与不存在同样 404；可选 `access_policy` 在读取、历史、导出和幂等重放时复核。
+  演示模式只接受回环地址和允许的 Origin。
+- 凭据：只通过显式请求头映射或本地环境变量进入运行上下文，不写入消息、检查点、缓存或 `pending_operation`，执行结束后清除。
+  提供方错误正文不回显。
+- 内容：来源文本是不可信数据；报告 HTML 导出带 `default-src 'none'` CSP；前端 Markdown 清理保持开启。
+- 出站：研究工具出站由原生工具与宿主策略控制；网站图标是唯一的研究外出站，使用与原生抓取相同的公网地址校验，
+  存在同样的 DNS 重绑定限制，只返回按文件头识别的位图。
+- Trace：本地、脱敏、受访问控制；脱敏不等于可以公开上传运行目录。
+
+## 17. 失败与恢复速查
+
+| 代码 | 含义 | 可恢复 | 处理 |
+| --- | --- | --- | --- |
+| `PROCESS_INTERRUPTED` | 进程重启或停止 | 是 | 页面重试，从检查点继续 |
+| `NATIVE_AGENT_TIMEOUT` / `MODEL_TIMEOUT` / `MODEL_RATE_LIMIT` / `MODEL_UNAVAILABLE` | 超时或上游问题 | 是 | 单元级降级；整体失败时重试 |
+| `MODEL_AUTH_REQUIRED` / `MODEL_ACCESS_DENIED` / `MODEL_BILLING_REQUIRED` | 提供方认证、权限或计费 | 是（运行整体失败，不做单元降级） | 修正凭据或账户后从检查点重试 |
+| `NO_EVIDENCE` | 没有任何可引用证据 | 是 | 检查搜索/读取工具后重试 |
+| `RESEARCH_GAPS` | 严格部署下缺口未闭合 | 否（owner 可同意带局限） | 重试并传 `allow_limited_report: true` |
+| `FINAL_VALIDATION` | 报告多次未通过引用校验 | 是 | 重试获得新的有限重写机会 |
+| `EVIDENCE_REFERENCE` / `RESULT_CONTRACT` | 单元结果引用或容量问题 | 单元级 | 该单元降级，局限进入报告 |
+| `BUDGET_EXHAUSTED` / `TIME_BUDGET` / `UNIT_BUDGET` | 预算耗尽 | 否 | 调整预算后新建 |
+| `CONFIG_CHANGED` | 配置或 Skill 已变 | 否 | 恢复原配置或新建 |
+| `RUN_BUSY` / `PLAN_VERSION` / `CAPACITY` | 并发或版本冲突 | — | 刷新后再操作 |
+
+## 18. 扩展点
+
+- 新研究角度：新增 Skill 与 Agent，在配置中登记，planner 可选用（详见 [EXTENDING.md](EXTENDING.md)）。
+- 新来源：先让工具在普通 DeerFlow 中可用，再在 `sources` 声明 `kind`、`origin`、`level` 和正确的 `role`。
+  不为 MCP 写返回字段映射，不创建旁路 MCP 客户端。
+- 自定义 Runner：`runner_factory` 指向管理员控制的工厂，需实现 `AgentRunner` 协议。
+- 企业访问控制：`access_policy` 指向 `callable(request, run) -> bool`。
+
+## 19. 测试
+
+后端（`backend/`）：
+
+```bash
+uv run --no-sync python -m pytest ../tests/deepresearch \
+  tests/test_subagent_executor.py tests/test_jina_client.py \
+  tests/test_web_fetch_paging.py tests/test_remote_list_dir.py \
+  tests/test_aio_sandbox.py -q
+uv run --no-sync ruff check deepresearch ../tests/deepresearch
+uv run --no-sync ruff format --check deepresearch ../tests/deepresearch
+```
+
+前端（`frontend/`）：
+
+```bash
+python3 ../scripts/pnpm.py rstest run deepresearch message-list
+python3 ../scripts/pnpm.py check
+```
+
+| 测试 | 覆盖 |
+| --- | --- |
+| `test_workflow.py` / `test_conversation.py` / `test_stability.py` | 状态流转、倒计时、修改即开始、研究中更新、单元降级、带局限报告、终检重试、恢复与幂等 |
+| `test_runner.py` / `test_structured_role.py` / `test_dependency_evidence.py` | 研究载荷、证据裁剪、结果错误分类、写作流水线、转换修复 |
+| `test_report_quality.py` / `test_core.py` | 引用资格、页面级编号、清理、导出、大纲规则、外置化页面关联 |
+| `test_activity.py` / `test_favicons.py` / `test_api.py` | 活动投影、图标代取与安全头、接口权限 |
+| `test_native_bridge.py` / `test_native_cleanup.py` / `test_metering.py` / `test_trace_finalization.py` | 原生桥接、取消清理、用量计量、Trace 终态 |
+| 前端 `presentation`、`hooks`、`plan-card`、`activity-panel`、`citation-preview` | 展示计算、SSE 与重连、计划卡、活动跟随、引用悬浮与网站图标 |
+
+单元测试使用伪造提供方，只能证明适配与生命周期行为；真实研究质量需要用真实模型与浏览器验收（见 [HANDOFF.md](HANDOFF.md)）。

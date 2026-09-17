@@ -12,6 +12,7 @@ from uuid import uuid4
 from .contracts import TERMINAL, CreateResearch, ResearchError, ResearchPlan, utcnow
 from .conversation import REVIEW_STATUSES, ConversationLifecycle
 from .evidence import digest
+from .favicons import Favicons
 from .runner import DeerFlowRunner, DemoRunner
 from .store import ProcessLock, Store
 from .trace import LocalTrace, install_log, logger
@@ -21,6 +22,7 @@ class ResearchService(ConversationLifecycle):
     def __init__(self, settings, runner=None):
         self.settings = settings
         self.store = Store(settings.resolve(settings.data_dir) / "research.sqlite3")
+        self.favicons = Favicons(self.store, enabled=settings.favicons)
         self.lock = ProcessLock(settings.resolve(settings.data_dir) / "worker.lock")
         if runner is not None:
             self.runner = runner

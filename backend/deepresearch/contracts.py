@@ -71,6 +71,9 @@ class SourceStrategy(Contract):
 class ResearchUnit(Contract):
     id: Identifier
     skill: Identifier
+    # Short, user-facing step label shown on the plan card. The objective keeps
+    # the detailed researcher instruction; historical plans have no title.
+    title: str = Field(default="", max_length=80)
     objective: str = Field(min_length=3, max_length=4000)
     priority: int = Field(default=10, ge=0, le=1000)
     source_strategy: SourceStrategy = Field(default_factory=SourceStrategy)
@@ -104,11 +107,23 @@ class SourcePolicy(Contract):
 
 class ResearchPlan(Contract):
     goal: str = Field(min_length=3, max_length=12000)
+    # A short plan title for the card and report defaults.
+    title: str = Field(default="", max_length=120)
+    # The rewritten research brief: focus areas, time anchor, source
+    # preferences, evidence distinctions and expected report structure. It is
+    # the shared specification for researchers and the report writer.
+    brief: str = Field(default="", max_length=12000)
     research_units: list[ResearchUnit] = Field(min_length=1, max_length=64)
     constraints: list[str] = Field(default_factory=list, max_length=30)
+    # Explicit scenario assumptions replace questions about the user's private
+    # context. They are shown to the user and stated in the report.
+    assumptions: list[str] = Field(default_factory=list, max_length=10)
     expected_output: str = "有证据支撑的结构化研究报告"
     plan_version: int = Field(default=1, ge=1)
     clarification_questions: list[str] = Field(default_factory=list, max_length=3)
+    # One or two sentences confirming a conversational revision, shown before
+    # the revised plan. Empty for the first plan.
+    acknowledgement: str = Field(default="", max_length=1000)
     source_policy: SourcePolicy = Field(default_factory=SourcePolicy)
     report_style: Literal["brief", "standard", "detailed"] = "standard"
 
@@ -193,12 +208,25 @@ class SourceAnnotation(Contract):
     quote: str = Field(default="", max_length=20000)
 
 
+# Bounds on one unit's durable result. A long unit can observe more links than
+# this; the runner trims surplus discovery links rather than failing the unit.
+RAW_EVIDENCE_LIMIT = 500
+LIMITATION_LIMIT = 30
+
+
 class ResearchResult(Contract):
     unit_id: Identifier
     findings: list[Finding] = Field(default_factory=list, max_length=100)
-    raw_evidences: list[RawEvidence] = Field(default_factory=list, max_length=500)
+    raw_evidences: list[RawEvidence] = Field(default_factory=list, max_length=RAW_EVIDENCE_LIMIT)
+    # Only publicly researchable questions that would change the conclusions.
+    # They are the sole researcher-reported input to gap review.
     open_questions: list[str] = Field(default_factory=list, max_length=50)
-    limitations: list[str] = Field(default_factory=list, max_length=30)
+    limitations: list[str] = Field(default_factory=list, max_length=LIMITATION_LIMIT)
+    # Unknown user-private context (scale, budget, deployment). These become
+    # stated assumptions, never research gaps.
+    assumptions_needed: list[str] = Field(default_factory=list, max_length=20)
+    # A short user-facing summary for the activity timeline and the writer.
+    summary: str = Field(default="", max_length=2000)
     confidence: float = Field(ge=0, le=1)
     searched_origins: list[Origin] = Field(default_factory=list)
 
@@ -294,6 +322,28 @@ class StructuredReport(Contract):
         for section in self.sections:
             yield from section.segments
         yield from self.conclusion
+
+
+class OutlineSection(Contract):
+    heading: str = Field(min_length=1, max_length=200)
+    # What this section must establish for the reader; not a research task.
+    purpose: str = Field(min_length=1, max_length=2000)
+    unit_ids: list[Identifier] = Field(default_factory=list, max_length=64)
+    # Optional presentation intent, e.g. "table: priority matrix" or
+    # "mermaid: target architecture". The section writer decides the syntax.
+    visuals: list[str] = Field(default_factory=list, max_length=4)
+
+
+class ReportOutline(Contract):
+    """Writer plan for a Markdown report. Sections follow decision logic, not
+    the order of research units or tools."""
+
+    title: str = Field(min_length=1, max_length=300)
+    key_conclusions: list[str] = Field(min_length=1, max_length=8)
+    sections: list[OutlineSection] = Field(min_length=1, max_length=12)
+    assumptions: list[str] = Field(default_factory=list, max_length=10)
+    # Reader-facing caveats merged from the raw limitation records.
+    limitations: list[str] = Field(default_factory=list, max_length=6)
 
 
 class CreateResearch(Contract):

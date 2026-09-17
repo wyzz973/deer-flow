@@ -15,6 +15,15 @@ from uuid import uuid4
 from .contracts import ResearchError, utcnow
 
 REVIEW_STATUSES = {"AWAITING_PLAN_CONFIRMATION", "EDITING_PLAN", "AWAITING_CLARIFICATION"}
+# Research can still use an owner's update while evidence is gathered or the
+# report is being written. Later phases only format an already written draft.
+STEERABLE_STATUSES = {"RESEARCHING", "VALIDATING", "GAP_FOUND", "RESEARCH_COMPLETE", "SYNTHESIZING"}
+
+
+def steering_acknowledgement(text):
+    if any("\u4e00" <= char <= "\u9fff" for char in text):
+        return "收到。我会把这项调整用于尚未完成的研究步骤和报告撰写，已经完成的步骤不会重跑。"
+    return "Got it. I will apply this to the remaining research steps and the report; completed steps are not repeated."
 
 
 class ConversationLifecycle:
@@ -93,6 +102,8 @@ class ConversationLifecycle:
                 if previous["role"] != "user" or previous["id"] == "initial" or previous["text"] != text or previous.get("request_plan_version") != plan_version:
                     raise ResearchError("IDEMPOTENCY_CONFLICT", "同一消息幂等键不能绑定不同内容", recoverable=False)
                 return run
+            if run["status"] in STEERABLE_STATUSES:
+                return await self._steer(run_id, text, client_message_id, plan_version)
             self._admit(run_id)
             if run["fingerprint"] != self.fingerprint:
                 raise ResearchError("CONFIG_CHANGED", "配置已变化，请创建新研究", recoverable=False)
@@ -103,7 +114,8 @@ class ConversationLifecycle:
                 raise ResearchError("PLAN_VERSION", "计划版本已变化，请刷新后再修改")
             operation = {"id": str(uuid4()), "kind": "decision" if editing else "follow_up"}
             if editing:
-                operation["decision"] = {"action": "edit", "plan": run["plan"], "revision": text}
+                # Revising the plan in conversation approves the revised plan.
+                operation["decision"] = {"action": "edit", "plan": run["plan"], "revision": text, "start": True}
 
             def accept(current):
                 current.setdefault("conversation", []).append({"id": client_message_id, "role": "user", "kind": "text", "text": text, "at": utcnow(), "request_plan_version": plan_version})
@@ -117,3 +129,27 @@ class ConversationLifecycle:
             await self.store.event(run_id, "conversation.message", {"message_id": client_message_id})
             self._launch(run, payload, secrets)
             return run
+
+    async def _steer(self, run_id, text, client_message_id, plan_version):
+        """Record an update for a running research without touching the graph.
+
+        Units that have not started and the report writer read the durable
+        list; completed tool work is never repeated. No credentials are needed
+        because no execution is launched.
+        """
+        now = utcnow()
+
+        def accept(current):
+            if current["status"] not in STEERABLE_STATUSES:
+                raise ResearchError("RUN_BUSY", "报告即将完成，请在完成后继续提出修改")
+            current.setdefault("conversation", []).extend(
+                [
+                    {"id": client_message_id, "role": "user", "kind": "text", "text": text, "at": now, "request_plan_version": plan_version, "steering": True},
+                    {"id": "update-" + client_message_id, "role": "assistant", "kind": "text", "text": steering_acknowledgement(text), "at": now},
+                ]
+            )
+            current.setdefault("steering", []).append({"id": client_message_id, "text": text, "at": now})
+
+        run = await self.store.mutate(run_id, accept)
+        await self.store.event(run_id, "conversation.steering", {"message_id": client_message_id, "text": text[:400]}, key="steering-" + client_message_id)
+        return run

@@ -9,6 +9,8 @@ export type Budget = {
 export type Unit = {
   id: string;
   skill: string;
+  /** Short user-facing step label; historical plans only have an objective. */
+  title?: string;
   objective: string;
   priority: number;
   depends_on: string[];
@@ -22,8 +24,13 @@ export type Unit = {
 };
 export type Plan = {
   goal: string;
+  title?: string;
+  /** Rewritten research brief shared by researchers and the writer. */
+  brief?: string;
   research_units: Unit[];
   constraints: string[];
+  assumptions?: string[];
+  acknowledgement?: string;
   expected_output: string;
   plan_version: number;
   clarification_questions?: string[];
@@ -59,24 +66,42 @@ export type Evidence = {
     | "fetched_document";
   document_hash?: string | null;
 };
+export type ReportStats = {
+  elapsed_seconds: number | null;
+  searches: number;
+  pages_read: number;
+  citations: number;
+};
+export type Citation = Evidence & {
+  number: number;
+  domain?: string;
+  evidence_ids?: string[];
+  excerpts?: { evidence_id: string; text: string }[];
+};
+/** A published, immutable report version.
+ * `markdown-v2` reports are Markdown documents whose citations were bound by
+ * the server; historical reports keep the structured `report` AST. */
 export type Report = {
   version: number;
+  format?: "markdown-v2";
+  title?: string;
+  document?: string;
+  display_markdown?: string;
+  toc?: { level: number; text: string }[];
+  assumptions?: string[];
+  stats?: ReportStats;
   report: {
     title: string;
-    executive_summary: Segment[];
+    executive_summary?: Segment[];
     comparison_table?: {
       headers: string[];
       rows: { label: string; cells: Segment[] }[];
     } | null;
-    sections: { heading: string; unit_ids: string[]; segments: Segment[] }[];
-    conclusion: Segment[];
+    sections?: { heading: string; unit_ids: string[]; segments: Segment[] }[];
+    conclusion?: Segment[];
   };
   markdown: string;
-  citations: (Evidence & {
-    number: number;
-    evidence_ids?: string[];
-    excerpts?: { evidence_id: string; text: string }[];
-  })[];
+  citations: Citation[];
   citation_map: Record<string, number>;
   limitations: string[];
   demo: boolean;
@@ -91,6 +116,8 @@ export type Run = {
   plan: Plan | null;
   units: Unit[];
   unit_statuses: Record<string, string>;
+  /** Steps that could not finish; research continued and discloses the gap. */
+  unit_failures?: Record<string, string>;
   evidence_count: number;
   iteration: number;
   gaps: { gap_id: string; description: string }[];
@@ -111,6 +138,7 @@ export type Run = {
   client_received_at?: number;
   cycle?: number;
   conversation?: ResearchMessage[];
+  steering?: { id: string; text: string; at: string }[];
 };
 export type ResearchMessage = {
   id: string;
@@ -121,6 +149,8 @@ export type ResearchMessage = {
   plan?: Plan;
   report?: Report;
   cycle?: number;
+  /** A user update accepted while research was running. */
+  steering?: boolean;
 };
 export type DiscoveredSource = {
   id: string;
@@ -153,6 +183,91 @@ export type ResearchSources = {
   sources: DiscoveredSource[];
   calls: ResearchCall[];
 };
+export type ActivityItem =
+  | { kind: "plan"; at: string; title: string; version?: number }
+  | { kind: "step"; at: string; unit_id: string; title: string }
+  | { kind: "note"; at: string; unit_id?: string; text: string }
+  | {
+      kind: "search";
+      at: string;
+      unit_id?: string;
+      count: number;
+      queries: string[];
+      domains: string[];
+    }
+  | {
+      kind: "read";
+      at: string;
+      unit_id?: string;
+      url?: string | null;
+      domain: string;
+      title: string;
+      status?: string;
+    }
+  | {
+      kind: "tool";
+      at: string;
+      unit_id?: string;
+      name: string;
+      status?: string;
+    }
+  | {
+      kind: "step_done";
+      at: string;
+      unit_id: string;
+      title: string;
+      summary: string;
+      findings?: number;
+    }
+  | {
+      kind: "step_failed";
+      at: string;
+      unit_id: string;
+      title: string;
+      code?: string;
+    }
+  | { kind: "gap" | "limited"; at: string; count: number }
+  | { kind: "update"; at: string; text: string }
+  | { kind: "writing"; at: string }
+  | { kind: "outline"; at: string; sections: string[] }
+  | { kind: "section"; at: string; title: string }
+  | { kind: "done"; at: string; title: string; version?: number }
+  | {
+      kind: "failed" | "cancelled";
+      at: string;
+      code?: string;
+      message?: string;
+    };
+export type ActivityCurrent = {
+  kind:
+    | "planning"
+    | "responding"
+    | "writing"
+    | "note"
+    | "search"
+    | "read"
+    | "researching";
+  text?: string;
+  title?: string;
+  query?: string;
+  url?: string;
+  domain?: string;
+};
+/** Concise, user-facing research timeline; the Trace stays the debug record. */
+export type ResearchActivity = {
+  status: string;
+  started_at: string | null;
+  finished_at: string | null;
+  elapsed_seconds: number | null;
+  counts: {
+    searches: number;
+    pages_read: number;
+    steps: number;
+    steps_done: number;
+  };
+  current: ActivityCurrent | null;
+  items: ActivityItem[];
+};
 export type Capabilities = {
   mode: string;
   ready: boolean;
@@ -169,6 +284,19 @@ export type ResearchEvent = {
   data: Record<string, unknown>;
 };
 export const terminal = new Set(["COMPLETED", "FAILED", "CANCELLED"]);
+export const reviewStatuses = new Set([
+  "AWAITING_PLAN_CONFIRMATION",
+  "EDITING_PLAN",
+  "AWAITING_CLARIFICATION",
+]);
+/** Statuses in which a message becomes a non-interrupting research update. */
+export const steerableStatuses = new Set([
+  "RESEARCHING",
+  "VALIDATING",
+  "GAP_FOUND",
+  "RESEARCH_COMPLETE",
+  "SYNTHESIZING",
+]);
 export function mergeEvents(
   old: ResearchEvent[],
   incoming: ResearchEvent,

@@ -49,10 +49,20 @@ async def test_server_countdown_starts_without_browser(settings):
 
 
 @pytest.mark.asyncio
-async def test_edit_pauses_countdown_and_revises_same_run(settings):
+async def test_edit_pauses_countdown_and_a_conversational_revision_starts_research(settings):
     settings.plan_countdown_seconds = 0.15
     service = ResearchService(settings)
     await service.start()
+    demo_plan = service.runner.plan
+
+    async def revised_units(run, proposed=None):
+        # A revision may replace units; the run snapshot must follow the plan.
+        plan = await demo_plan(run, proposed)
+        if proposed and "revision" in proposed:
+            plan.research_units = [unit.model_copy(update={"id": unit.id + "-v2"}) for unit in plan.research_units]
+        return plan
+
+    service.runner.plan = revised_units
     try:
         run = await service.create("u", CreateResearch(query="比较两种数据库"), "edit")
         await wait_status(service, run["run_id"], {"AWAITING_PLAN_CONFIRMATION"})
@@ -61,16 +71,69 @@ async def test_edit_pauses_countdown_and_revises_same_run(settings):
         await asyncio.sleep(0.2)
         assert (await service.store.get(run["run_id"]))["usage"]["tool_calls"] == 0
         await service.message(run["run_id"], "只关注运维成本", "message-1", plan_version=1)
-        revised = await wait_status(service, run["run_id"], {"AWAITING_PLAN_CONFIRMATION"})
+        revised = await settled(service, run["run_id"])
+        # Like ChatGPT: the revision is the approval, with no second countdown.
         assert revised["run_id"] == run["run_id"]
         assert revised["plan"]["plan_version"] == 2
         assert "只关注运维成本" in revised["plan"]["constraints"]
+        planned = [unit["id"] for unit in revised["plan"]["research_units"]]
+        assert all(unit_id.endswith("-v2") for unit_id in planned)
+        assert [unit["id"] for unit in revised["units"]] == planned
+        assert set(revised["unit_statuses"]) == set(planned)
+        ids = [message["id"] for message in revised["conversation"]]
+        assert ids.index("message-1") < ids.index("ack-2") < ids.index("plan-2")
+        assert revised["conversation"][ids.index("ack-2")]["text"].endswith("只关注运维成本")
         assert len([m for m in revised["conversation"] if m["kind"] == "plan"]) == 2
+        events = await service.store.events(run["run_id"], limit=1000)
+        assert [e["data"].get("source") for e in events if e["type"] == "plan.auto_started"] == ["revision"]
+        assert revised["usage"]["tool_calls"] == 4
         duplicate = await service.message(run["run_id"], "只关注运维成本", "message-1", plan_version=1)
         assert duplicate["plan"]["plan_version"] == 2
         with pytest.raises(ResearchError, match="幂等"):
             await service.message(run["run_id"], "a different instruction", "message-1", plan_version=2)
     finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_messages_during_research_become_updates_without_restarting(settings):
+    from deepresearch.runner import DemoRunner
+
+    settings.max_concurrency = 1
+    service = ResearchService(settings)
+    entered, release, seen = asyncio.Event(), asyncio.Event(), []
+
+    class Slow(DemoRunner):
+        async def research(self, run, unit, dependencies):
+            current = await self.store.get(run["run_id"])
+            seen.append((unit.id, [item["text"] for item in current.get("steering", [])]))
+            if unit.id == "R1":
+                entered.set()
+                await release.wait()
+            return await super().research(run, unit, dependencies)
+
+    service.runner = Slow(settings, service.store)
+    await service.start()
+    try:
+        run = await service.create("u", CreateResearch(query="比较两种数据库"), "steer")
+        rid = run["run_id"]
+        await wait_status(service, rid, {"AWAITING_PLAN_CONFIRMATION"})
+        await service.decision(rid, 1, "approve")
+        await asyncio.wait_for(entered.wait(), 3)
+        updated = await service.message(rid, "加上运维成本", "update-1")
+        assert updated["status"] == "RESEARCHING" and rid in service.tasks
+        assert updated["steering"][0]["text"] == "加上运维成本"
+        assert [m["id"] for m in updated["conversation"][-2:]] == ["update-1", "update-update-1"]
+        again = await service.message(rid, "加上运维成本", "update-1")
+        assert len(again["steering"]) == 1
+        release.set()
+        completed = await settled(service, rid)
+        assert seen == [("R1", []), ("R2", ["加上运维成本"])]
+        assert completed["usage"]["tool_calls"] == 4
+        events = await service.store.events(rid, limit=1000)
+        assert sum(e["type"] == "conversation.steering" for e in events) == 1
+    finally:
+        release.set()
         await service.stop()
 
 
@@ -128,6 +191,8 @@ async def test_followups_preserve_reports_and_do_not_repeat_search_for_rewrites(
             assert old.status_code == 200 and old.json() == original_report
             missing = await client.get(f"/api/deepresearch/{run_id}/report?version=999")
             assert missing.status_code == 404
+            stream = await client.get(f"/api/deepresearch/{run_id}/events?after=999999")
+            assert stream.status_code == 200 and "no-transform" in stream.headers["cache-control"]
             exported = await client.get(f"/api/deepresearch/{run_id}/trace/export")
             assert exported.status_code == 200 and "application/x-ndjson" in exported.headers["content-type"]
             assert "trace.started" in exported.text

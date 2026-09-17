@@ -16,6 +16,9 @@ jobs:
         with:
           python-version: "3.12"
       - uses: astral-sh/setup-uv@v7
+        with:
+          # Must match backend/Dockerfile's UV_IMAGE tag; pinned by backend/tests/test_ci_uv_version_pin.py
+          version: "0.11.1"
       - run: uv sync --locked
         working-directory: backend
       - run: uv run --directory backend --no-sync python -c "import langgraph; from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver"
@@ -37,6 +40,9 @@ jobs:
         with:
           python-version: "3.12"
       - uses: astral-sh/setup-uv@v7
+        with:
+          # Must match backend/Dockerfile's UV_IMAGE tag; pinned by backend/tests/test_ci_uv_version_pin.py
+          version: "0.11.1"
       - run: uv sync --locked
       - run: uv run --no-sync python -m pytest tests/test_subagent_executor.py -q
       - run: uv run --no-sync ruff check deepresearch packages/harness/deerflow/subagents/executor.py

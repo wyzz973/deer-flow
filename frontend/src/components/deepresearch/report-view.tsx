@@ -2,6 +2,7 @@
 
 import { Download, FileText, Maximize2 } from "lucide-react";
 import { useMemo } from "react";
+import remarkGfm from "remark-gfm";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -10,53 +11,29 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import {
+  HoverCard,
+  HoverCardContent,
+  HoverCardTrigger,
+} from "@/components/ui/hover-card";
 import { MarkdownContent } from "@/components/workspace/messages/markdown-content";
 import {
   citationId,
-  escapeReportText,
-  uniqueCitationIds,
+  reportMarkdown,
+  reportSummaryLine,
+  reportTitle,
 } from "@/core/deepresearch/presentation";
-import type { Report, Segment } from "@/core/deepresearch/types";
+import type { Report } from "@/core/deepresearch/types";
 
-function reportMarkdown(report: Report) {
-  const render = (segments: Segment[]) =>
-    segments
-      .map(
-        (segment) =>
-          escapeReportText(segment.text) +
-          uniqueCitationIds(segment.evidence_ids, report.citation_map)
-            .map((id) => `[${report.citation_map[id]}](#citation-${id})`)
-            .join(""),
-      )
-      .join("\n\n");
-  const table = report.report.comparison_table;
-  const cell = (value: string) =>
-    value.replace(/\|/g, "\\|").replace(/\n/g, " ");
-  const comparison = table
-    ? `## 快速对比\n\n| 维度 | ${table.headers.map(cell).join(" | ")} |\n| ${table.headers
-        .map(() => "---")
-        .concat("---")
-        .join(" | ")} |\n` +
-      table.rows
-        .map(
-          (row) =>
-            `| ${cell(row.label)} | ${row.cells.map((item) => cell(render([item]))).join(" | ")} |`,
-        )
-        .join("\n") +
-      "\n\n"
-    : "";
-  return (
-    `# ${escapeReportText(report.report.title)}\n\n## 执行摘要\n\n${render(report.report.executive_summary)}\n\n` +
-    comparison +
-    report.report.sections
-      .map(
-        (section) =>
-          `## ${escapeReportText(section.heading)}\n\n${render(section.segments)}`,
-      )
-      .join("\n\n") +
-    `\n\n## 结论\n\n${render(report.report.conclusion)}`
-  );
-}
+import { CitationPreview } from "./citation-preview";
+
+type RemarkPlugins = Parameters<typeof MarkdownContent>[0]["remarkPlugins"];
+
+// Research reports quote prices such as "$19" and "$39"; inline math parsing
+// would turn the text between them into a formula. Reports never need LaTeX.
+const REPORT_REMARK_PLUGINS = [
+  [remarkGfm, { singleTilde: false }],
+] as RemarkPlugins;
 
 export function ResearchReportContent({
   report,
@@ -66,8 +43,8 @@ export function ResearchReportContent({
   onCitation: (id: string) => void;
 }) {
   const content = useMemo(() => reportMarkdown(report), [report]);
-  const citationTitles = useMemo(
-    () => new Map(report.citations.map((item) => [item.number, item.title])),
+  const byNumber = useMemo(
+    () => new Map(report.citations.map((item) => [item.number, item])),
     [report.citations],
   );
   const components = useMemo(
@@ -81,17 +58,26 @@ export function ResearchReportContent({
       }) => {
         const id = citationId(href, report.citation_map);
         if (id) {
+          const source = byNumber.get(report.citation_map[id]!);
           return (
-            <button
-              type="button"
-              data-evidence-id={id}
-              aria-label={`查看引用 ${report.citation_map[id]}`}
-              title={citationTitles.get(report.citation_map[id]!)}
-              className="text-muted-foreground hover:bg-muted mx-0.5 inline-flex min-w-4 items-center justify-center rounded-full px-1 align-super text-[10px] tabular-nums"
-              onClick={() => onCitation(id)}
-            >
-              {children}
-            </button>
+            <HoverCard openDelay={150} closeDelay={80}>
+              <HoverCardTrigger asChild>
+                <button
+                  type="button"
+                  data-evidence-id={id}
+                  aria-label={`查看引用 ${report.citation_map[id]}`}
+                  className="bg-muted text-muted-foreground hover:bg-foreground hover:text-background mx-0.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 align-super text-[10px] leading-none tabular-nums"
+                  onClick={() => onCitation(id)}
+                >
+                  {children}
+                </button>
+              </HoverCardTrigger>
+              {source && (
+                <HoverCardContent align="start" className="w-96 p-3">
+                  <CitationPreview citation={source} evidenceId={id} />
+                </HoverCardContent>
+              )}
+            </HoverCard>
           );
         }
         return (
@@ -101,13 +87,14 @@ export function ResearchReportContent({
         );
       },
     }),
-    [onCitation, report.citation_map, citationTitles],
+    [byNumber, onCitation, report.citation_map],
   );
   return (
-    <div className="research-report text-[15px] leading-7 [&_h1]:text-2xl [&_h1]:leading-snug [&_h2]:mt-8 [&_h2]:text-xl [&_h3]:text-base [&_p]:leading-7 [&_table]:text-sm">
+    <div className="research-report text-[15px] leading-7 [&_h1]:text-2xl [&_h1]:leading-snug [&_h2]:mt-10 [&_h2]:scroll-mt-20 [&_h2]:text-xl [&_h3]:scroll-mt-20 [&_h3]:text-base [&_p]:leading-7 [&_table]:text-sm">
       <MarkdownContent
         content={content}
         isLoading={false}
+        remarkPlugins={REPORT_REMARK_PLUGINS}
         components={components}
       />
     </div>
@@ -130,7 +117,7 @@ export function ResearchReportActions({
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">
-          {(["md", "docx", "html"] as const).map((format) => (
+          {(["docx", "md", "html"] as const).map((format) => (
             <DropdownMenuItem key={format} onClick={() => onDownload(format)}>
               导出为 {format === "docx" ? "Word" : format.toUpperCase()}
             </DropdownMenuItem>
@@ -141,7 +128,7 @@ export function ResearchReportActions({
         <Button
           variant="ghost"
           size="icon-sm"
-          aria-label="展开报告"
+          aria-label="全屏阅读报告"
           onClick={onExpand}
         >
           <Maximize2 className="size-4" />
@@ -165,19 +152,21 @@ export function ResearchReportCard({
   return (
     <section aria-label="研究报告预览" className="space-y-2">
       <p className="text-muted-foreground text-xs">
-        研究完成 · {report.citations.length} 条引用
+        {reportSummaryLine(report)}
       </p>
       <div className="border-border/60 bg-muted/10 overflow-hidden rounded-2xl border">
         <div className="border-border/40 flex items-center justify-between gap-2 border-b px-4 py-2">
           <span className="flex min-w-0 items-center gap-2 text-sm font-medium">
-            <FileText className="size-4 shrink-0" />
-            <span className="truncate">{report.report.title}</span>
+            <span className="bg-primary text-primary-foreground flex size-5 shrink-0 items-center justify-center rounded-md">
+              <FileText className="size-3.5" />
+            </span>
+            <span className="truncate">{reportTitle(report)}</span>
           </span>
           <ResearchReportActions onDownload={onDownload} onExpand={onExpand} />
         </div>
-        <div className="relative max-h-72 overflow-hidden px-5 pt-4 pb-10">
+        <div className="relative max-h-80 overflow-hidden px-6 pt-4 pb-12">
           <ResearchReportContent report={report} onCitation={onCitation} />
-          <div className="from-background pointer-events-none absolute inset-x-0 bottom-0 h-16 bg-linear-to-t to-transparent" />
+          <div className="from-background pointer-events-none absolute inset-x-0 bottom-0 h-20 bg-linear-to-t to-transparent" />
         </div>
         <Button
           variant="ghost"

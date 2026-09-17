@@ -29,7 +29,7 @@ async def test_supplement_keeps_parent_provenance_without_repeating_native_work(
     async def agent_config(name):
         return settings.skills[name], SimpleNamespace(tools=None, disallowed_tools=[])
 
-    async def convert(_runner, _run, _name, payload, _schema, _answer, _context, *, validator):
+    async def convert(_runner, _run, _name, payload, _schema, _answer, _context, *, validator, repair=None):
         assert {item["raw_id"] for item in payload["observed_calls"]} == {"raw-internal", "raw-external"}
         good = ResearchAnalysis(findings=[Finding(claim="Dependent conclusion", raw_evidence_refs=["raw-external"], confidence=0.8)], confidence=0.8)
         validator(good)

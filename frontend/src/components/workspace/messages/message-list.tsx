@@ -303,6 +303,7 @@ export function MessageList({
   initialScroll = "smooth",
   resizeScroll = "smooth",
   renderMessage,
+  runDurationEnabled = true,
 }: {
   archiveDownloadsEnabled?: boolean;
   className?: string;
@@ -340,6 +341,9 @@ export function MessageList({
   resizeScroll?: ConversationProps["resize"];
   /** Domain cards can supply a body while retaining native grouping/scrolling. */
   renderMessage?: (message: Message) => ReactNode | undefined;
+  /** Domain views whose work outlives a loading phase (for example research
+   * that keeps running behind a progress card) can hide turn durations. */
+  runDurationEnabled?: boolean;
 }) {
   const { t } = useI18n();
   const sidecar = useMaybeSidecar();
@@ -1044,9 +1048,11 @@ export function MessageList({
     groupIndex: number,
     content: ReactNode,
   ) => {
-    const persistedDisplays = runDurationDisplaysByGroupIndex[groupIndex] ?? [];
+    const persistedDisplays = runDurationEnabled
+      ? (runDurationDisplaysByGroupIndex[groupIndex] ?? [])
+      : [];
     const clientDuration =
-      !thread.error && group.id
+      runDurationEnabled && !thread.error && group.id
         ? clientDurationsByGroupId.get(`${threadId}:${group.id}`)
         : undefined;
     const displays =

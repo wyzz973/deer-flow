@@ -160,14 +160,43 @@ class LocalTrace:
             _parent.reset(token)
 
 
+def tool_detail(role, inputs):
+    """Show what a search or read step is doing, from the call's own arguments.
+
+    Only the operator-declared role decides which common argument is shown.
+    Tool results are never inspected here, and other tools show just a name.
+    """
+    from .contracts import safe_http_url
+
+    if isinstance(inputs, str):
+        try:
+            inputs = json.loads(inputs)
+        except ValueError:
+            inputs = {"query": inputs} if role == "search" else {}
+    if not isinstance(inputs, dict):
+        return {}
+    if role == "search":
+        value = next((inputs[key] for key in ("query", "q", "keywords", "search_query", "question") if isinstance(inputs.get(key), str)), None)
+        return {"query": " ".join(value.split())[:300]} if value else {}
+    if role == "read":
+        value = next((inputs[key] for key in ("url", "uri", "link") if isinstance(inputs.get(key), str)), None)
+        try:
+            return {"url": safe_http_url(value)[:2000]} if value else {}
+        except ValueError:
+            return {}
+    return {}
+
+
 def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
     """Build lazily so demo/API imports need no model SDK installation."""
     from langchain_core.callbacks import AsyncCallbackHandler
 
+    from .activity import HIDDEN_TOOLS, NATIVE_ROLES
     from .contracts import ResearchError, utcnow
     from .sources import fetched_source, observed_sources
 
     scope = scope or {}
+    roles = {**NATIVE_ROLES, **{source.tool: source.role for source in trace.settings.sources}}
 
     class LocalCallbacks(AsyncCallbackHandler):
         raise_error = True
@@ -242,6 +271,15 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
                 for generation in batch:
                     message = getattr(generation, "message", None)
                     answers.append({"content": visible_text(getattr(message, "content", generation.text)), "tool_calls": getattr(message, "tool_calls", [])})
+                    # A researcher's visible sentence beside its tool calls is
+                    # the live progress note. Hidden reasoning never qualifies.
+                    calls = answers[-1]["tool_calls"] or []
+                    note = " ".join((answers[-1]["content"] or "").split())
+                    if note and scope.get("unit_id") and any(call.get("name") not in HIDDEN_TOOLS for call in calls):
+                        try:
+                            await trace.store.event(trace.run_id, "activity.note", {**scope, "text": redact(note[:400], trace.secrets, 400)})
+                        except Exception as exc:  # A progress note must never stop research or metering.
+                            logger.warning(json.dumps({"event": "activity_note_failed", "error": type(exc).__name__}))
                     total = (getattr(message, "usage_metadata", None) or {}).get("total_tokens")
                     if isinstance(total, int) and not isinstance(total, bool) and total >= 0:
                         known_usage = True
@@ -272,8 +310,11 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
         async def on_tool_start(self, serialized, input_str, *, run_id, **kwargs):
             name = (serialized or {}).get("name", "tool")
             await self.begin(run_id, name, "tool", kwargs.get("inputs") or input_str)
-            await trace.store.record_call(trace.run_id, str(run_id), {**scope, "tool_name": name, "started_at": utcnow(), "status": "running", "span_id": str(run_id)})
-            await trace.store.event(trace.run_id, "activity.tool.started", {**scope, "call_id": str(run_id), "tool_name": name})
+            role = roles.get(name)
+            detail = redact(tool_detail(role, kwargs.get("inputs") or input_str), trace.secrets, 2000) if role else {}
+            details = {**scope, "tool_name": name, "role": role, **detail}
+            await trace.store.record_call(trace.run_id, str(run_id), {**details, "started_at": utcnow(), "status": "running", "span_id": str(run_id)})
+            await trace.store.event(trace.run_id, "activity.tool.started", {**details, "call_id": str(run_id)})
             # All tools now use the native call path with their original
             # schemas. Reserve here; there is no separate search wrapper.
             try:
@@ -298,6 +339,7 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
             fetched = fetched_source(redact(getattr(output, "artifact", None), trace.secrets), connector=spec.name, origin=spec.origin) if status == "success" and spec and spec.kind == "native" else None
             if fetched:
                 found = [source for source in found if source["id"] != fetched["id"]] + [fetched]
+            page = {"url": fetched["url"], "title": fetched["title"]} if fetched else {}
             call = await trace.store.record_call(
                 trace.run_id,
                 str(run_id),
@@ -308,6 +350,7 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
                     "status": status,
                     "ended_at": utcnow(),
                     "duration_ms": round((time.monotonic() - entry[0]) * 1000) if entry else None,
+                    **page,
                 },
                 found,
             )

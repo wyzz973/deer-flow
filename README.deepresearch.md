@@ -1,7 +1,13 @@
 # DeepResearch：DeerFlow 原生研究模块
 
 在 DeerFlow 工作区侧栏打开 **DeepResearch**，进入 `/workspace/deepresearch`。
-用原生对话输入框描述研究需求，计划以消息卡片呈现。默认 45 秒后自动启动；点击编辑立即暂停，通过同一输入框修改同一研究的计划。研究由原生子 Agent 执行，最终输出带可追溯引用的报告。
+架构与工作流见 [ARCHITECTURE.md](docs/deepresearch/ARCHITECTURE.md)，当前状态与验收见 [交接文档](docs/deepresearch/HANDOFF.md)。
+交互对标 ChatGPT 深度研究（观察记录见 [对标文档](docs/deepresearch/CHATGPT_BENCHMARK_2026-09-16.md)）：
+
+- 描述需求后，系统把请求改写成完整的研究简报，给出短标题和步骤的计划卡。默认 45 秒后自动开始。
+- 点击“编辑”会暂停倒计时，在同一输入框里说明怎么改；改完的计划直接开始研究。
+- 研究中，计划卡显示实时进展和搜索次数；点“更新”可以追加要求，研究不中断。
+- 研究结束后给出长篇 Markdown 报告：带目录、表格、图示和可验证引用，右侧可以查看来源和研究活动。
 
 ## 设计原则
 
@@ -40,15 +46,27 @@ Researcher 使用原生预算预警提前收尾，为其他单元和综合报告
 
 ## 对话与研究过程
 
-页面复用原生 `ChatSurface`、`MessageList`、`PromptInput` 和 `ChatBox` 面板，不另设研究约束表单或页面内历史列表。约束通过意图理解进入计划；必要澄清也在同一对话中完成。
+页面复用原生 `ChatSurface`、`MessageList`、`PromptInput` 和 `ChatBox` 面板，不另设研究约束表单或页面内历史列表。约束通过意图理解进入计划。只有请求里找不到研究对象时才追问；模糊之处写进研究简报和“前提假设”，由用户在计划卡上决定是否修改。空白页输入框下方提供“推荐”示例和“报告”历史卡片。
+
+流程：
+
+1. 需求被改写成研究简报，内容包括重点方向、时间锚点、来源偏好、证据区分规则和报告结构。计划卡只显示短标题和短步骤。
+2. 默认 45 秒后自动开始。点击“编辑”暂停倒计时，输入框上方出现引用该计划的条；发送修改后，系统先回复一句确认，再给出新版计划并**直接开始**，旧计划卡折叠为“计划已更新”。结构化 `plan/edit` API 仍会重新等待确认。
+3. 研究中，计划卡原位显示步骤状态、实时进展（研究员的进展说明、正在搜索的关键词或正在阅读的网站）、搜索次数和进度条。点“更新”可以追加要求：尚未开始的研究步骤和报告写作会采纳它，已完成的步骤不会重跑。
+4. 研究员先搜索，再用读取工具打开官方文档等一手来源。搜索结果和其中出现的链接只用于发现来源，不能作为引用。长网页分段读取；宿主把超长工具输出转存为文件后，研究员续读该文件的内容仍记为原网页（带 URL、标题和文档哈希）。浏览器取文只有在紧邻的成功导航能确认页面时才算读取原文；未声明的运行时工具（文件读取、命令行、未确认页面的浏览器输出）只是工作材料，不能单独作为引用。研究员的进展说明使用用户的语言。
+5. 单个研究步骤因超时等非致命原因失败时，该步骤标为失败并在报告局限中说明，其他步骤继续；凭据、计费、配置、预算、取消、存储等致命错误，或全部步骤失败时，整个任务才失败。示例配置中研究角色的单步超时为 600 秒。
+6. 补研预算用完后仍有缺口，而且已经取得可引用证据时，默认直接写报告，并在报告里说明局限。完全没有可引用证据时失败为 `NO_EVIDENCE`，不会生成空洞的报告。
+7. 报告分步生成：先写大纲，再并行写各章节，最后写执行摘要。完成后显示“研究完成情况：用时 · 引用 · 搜索”和报告卡。全屏阅读器带悬停目录，右侧分为“来源”“活动 · 用时”两个页签。
 
 倒计时由服务端保存，刷新、多标签页不会生成新的启动期限或重复批准。重启进程时暂停尚未批准的计划，不保存和重用旧请求凭据。点击编辑后，计划停留在修改状态，直到提交修改或放弃修改。
 
 缓存计划重新显示时沿用响应接收时的计时基准；断线重连会刷新服务端状态。网络失败后的消息重试保留幂等键，迟到响应不能覆盖新会话。服务不可用时，按钮和键盘提交都会被拦下。移动端从来源返回引用时自动关闭抽屉，避免正文仍被遮挡。
 
-主对话显示计划/进度卡和报告预览；右侧“来源”“活动”展示引用分组、发现的链接、实际 Agent 与工具调用。发现链接、读取原文和报告引用不是同一事实，也不共用同一个计数。正文引用定位到来源片段，历史报告按自身版本导出。
+报告正文中的 `$` 按原文显示，不当作数学公式渲染；导出同样转义。来源摘录会去掉工具输出的转存说明和抓取头信息。
 
-报告完成后的解释直接使用现有内容；改写不重复搜索；需要新证据的追问生成新一轮计划。是否在研究运行中接受更新仍单独设计，当前执行中输入框不会承诺已经应用新要求。
+右侧“来源”按域名分组列出报告实际引用的页面，另外折叠展示研究中接触过、但未被引用的网页；“活动”是面向用户的研究时间线，完整调试记录仍在 Trace 中。发现链接、读取原文和报告引用不是同一事实，也不共用同一个计数。来源按域名分组并显示网站图标；每条引用显示标题、两行原文摘要和短链接，活动时间线的搜索与阅读记录也带网站图标。图标由 Gateway 代取并缓存（只访问公网地址，只接受 ico/png/gif/jpeg/webp 图片，不返回 SVG），浏览器不会直接访问被引用的网站；没有外网的部署可设置 `favicons: false`，界面显示首字母。鼠标悬停在正文引用编号或右侧来源条目上，会浮出站点、标题和该引用对应的原文片段（抓取页面标为“原文片段”，工具记录标为“引用关联片段”）；点击正文引用可在右侧定位；历史报告按自身版本导出。
+
+报告完成后，解释类追问直接基于现有报告回答；改写只修改现有 Markdown 文档，不重复搜索；需要新证据的追问会生成新一轮计划。
 
 配置检查（不访问模型/MCP）：
 
@@ -62,6 +80,8 @@ PYTHONPATH=backend python -m deepresearch.doctor --config deepresearch.local.yam
 cd backend
 uv run --no-sync python -m deepresearch.live --allow-live --model YOUR_CONFIGURED_MODEL --port 8001 --frontend-port 3100
 ```
+
+事件流返回 `Cache-Control: no-store, no-transform`，避免 Next.js 开发代理等压缩代理把稀疏的进度事件缓冲到流结束。
 
 它使用真实供应商，会产生调用用量；只监听回环地址，使用宿主开发免登录模式，并将数据放在 `.deerflow/deepresearch/live-*`。`--jina-no-key` 仅让验收进程使用 Jina 原生公共模式，不修改 `.env` 中的密钥。该启动器不代表生产登录/企业 SSO 已验收。
 
@@ -140,25 +160,25 @@ validation remains mandatory; this never turns missing evidence into facts.
 
 ### Report quality and source reading
 
-Research plans infer report style and citation scope from natural language;
-there is no additional source-constraint form. Explicit official-domain/original
-reading requirements are applied again before report publication. Native web
-reading supports longer excerpts, section lookup and continuation positions
-instead of silently discarding everything after 4096 characters. Optional native
-page artifacts preserve the actual title, URL and page hash without imposing a
-result shape on MCP tools.
+Plans carry a rewritten research brief, a short title, short step titles and
+explicit assumptions. Sources declare a `role`: `search` results and links seen
+in any tool output are discovery only, `read` tools (for example native
+`web_fetch`) register the opened page, and `data` tools return citable records.
+`cite_search_results: true` restores search-snippet citations for deployments
+whose search tool returns complete documents. Plan-level domain/original-reading
+requirements still apply before publication.
 
-Reports lead with a recommendation, support compact comparison tables, separate
-facts from inferences and retain disclosed limitations. Multiple excerpts of one
-page snapshot share a visible citation number while their individual provenance
-remains available. Reading a tool result and validating an ID still do not prove
-semantic correctness; important conclusions require content review.
-
-Brief reports also use paragraph- and table-cell-level editing bounds rather than
-relying on a whole-report word-count instruction. Historical reports retain their
-original storage/export contract. Conversational edits receive the existing
-report itself, so a targeted change need not regenerate unrelated sections from
-research notes. Provider token settings and cumulative budgets are separate.
+Reports are Markdown documents written in three steps: outline, sections in
+parallel, then the executive summary. Writers cite only with `[[E012]]` markers
+from the evidence they were given; the server validates every marker, repairs a
+section once with precise feedback, and then removes any statement whose
+evidence is unknown or not citable instead of guessing a replacement. Citation
+numbers, the reader outline, Markdown/HTML/Word exports and reference lists are
+generated deterministically. The outline does not repeat the generated executive
+summary, scope/limitations or references, and section headings are unnumbered.
+Length targets guide writing and never fail a run.
+Raw limitations remain in `audit`; the report shows at most five merged caveats
+plus stated assumptions. Historical AST reports remain readable and exportable.
 
 ### Workflow recovery and auditability
 
@@ -179,8 +199,11 @@ third-party MCP behavior, resource limits and load need deployment-specific test
 
 Failed native runs can resume from their checkpoint without rerunning committed
 research units. If bounded supplementary research still leaves evidence gaps,
-the existing plan card offers an explicit **generate report with limitations**
-action when evidence exists. It does not bypass citation validation.
+the report is written with disclosed limitations by default
+(`report.limitations.auto`). Deployments that set `allow_limited_report: false`
+keep the explicit **generate report with limitations** action for failed
+`RESEARCH_GAPS` runs. Neither path bypasses citation validation, and a run
+without citable evidence fails as `NO_EVIDENCE`.
 
 The [2026-09-16 stability audit](docs/deepresearch/STABILITY_AUDIT_2026-09-16.md)
 records the fixes, 361 backend and 18 frontend passing tests, real DeepSeek run

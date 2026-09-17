@@ -15,6 +15,7 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar";
 import { researchApi } from "@/core/deepresearch/api";
+import { firstText } from "@/core/deepresearch/presentation";
 import { terminal } from "@/core/deepresearch/types";
 
 /** Research history occupies the existing sidebar history slot, never a
@@ -50,7 +51,9 @@ export function ResearchHistory() {
                 ) : (
                   <FileText className="size-4" />
                 )}
-                <span className="truncate">{run.query}</span>
+                <span className="truncate">
+                  {firstText(run.plan?.title, run.query)}
+                </span>
               </Link>
             </SidebarMenuButton>
           </SidebarMenuItem>

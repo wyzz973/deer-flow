@@ -5,7 +5,7 @@ import type { ReactNode } from "react";
 
 import { useResearchConversation } from "@/core/deepresearch/hooks";
 
-import { capabilities, makeRun } from "./fixtures";
+import { activity, capabilities, makeRun } from "./fixtures";
 
 const base = "http://127.0.0.1:8022";
 const root = `${base}/api/deepresearch`;
@@ -184,6 +184,7 @@ it("a delayed GET cannot undo a newer command acknowledgement", async () => {
     const url = String(input);
     if (url.endsWith("/capabilities")) return json(capabilities());
     if (url.endsWith("/sources")) return json({ sources: [], calls: [] });
+    if (url.endsWith("/activity")) return json(activity());
     if (init?.method === "POST") return json(fresh);
     return ++gets === 2 ? delayed.promise : json(old);
   };

@@ -180,14 +180,16 @@ async def test_accepted_input_survives_a_crash_before_task_submission(settings, 
     try:
         assert (await restarted.store.get(rid))["status"] == "FAILED"
         await restarted.retry(rid)
-        final = await settle(restarted, rid)
-        assert final["status"] == ("AWAITING_PLAN_CONFIRMATION" if editing else "COMPLETED"), final.get("error")
+        final = await settle(restarted, rid, ("COMPLETED", "FAILED"))
+        # A replayed plan revision is still the owner's approval of that plan.
+        assert final["status"] == "COMPLETED", final.get("error")
         assert not final.get("pending_operation")
         assert len([m for m in final["conversation"] if m["id"] == "durable-message"]) == 1
+        assert final["usage"]["tool_calls"] == 4
         if editing:
             assert final["plan"]["plan_version"] == 2
+            assert len([m for m in final["conversation"] if m["kind"] == "report"]) == 1
         else:
-            assert final["usage"]["tool_calls"] == 4
             assert final["conversation"][-1]["id"] == "answer-durable-message"
     finally:
         await restarted.stop()
