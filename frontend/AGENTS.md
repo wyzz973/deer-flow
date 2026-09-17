@@ -93,6 +93,12 @@ run continues. The research page passes `runDurationEnabled={false}` to
 the stats line and activity tab own elapsed time. Report Markdown uses GFM
 without remark-math (prices contain `$`). Source excerpts go through
 `readableExcerpt`, which drops externalization notices and fetch headers.
+The “指标” tab (`metrics-panel.tsx`) reads `/metrics`, polling every 5 s only while
+the run is active; format numbers with `formatTokens`, `formatCost` and
+`formatPercent`, show “—” for unknown values and never compute prices in the client.
+Unit citation counts show “—” until a report version exists. Runs with
+`metered: false` predate per-call metering: show their unmeasured fields as “—” or
+“未记录”, never as zero.
 Hovering an in-text citation or a cited source opens `CitationPreview`: site,
 title and the excerpt for that evidence (`excerptPreview` strips Markdown syntax),
 labeled as page text only for `fetched_document`. Touch devices keep click-to-locate.

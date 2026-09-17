@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import time
 from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -14,7 +15,7 @@ from . import report as documents
 from .contracts import FollowupResult, ResearchError, ResearchPlan, ResearchResult, ResearchUnit, utcnow
 from .evidence import digest, merge_results
 from .report_policy import eligible_evidence
-from .trace import LocalTrace
+from .trace import LocalTrace, metric_scope
 from .validators import research_gaps, supplemental_units
 
 # Failures that make more research pointless or unsafe fail the run. Anything
@@ -80,10 +81,13 @@ def build_workflow(settings, store, runner, checkpointer):
         version = s.get("plan", {}).get("plan_version", 0) + 1
         key = "plan:" + digest([version, proposed, run.get("conversation", [])])
         cached = await store.cached(run["run_id"], key)
+        if cached:
+            await store.event(run["run_id"], "metrics.cache_hit", {"kind": "plan", "plan_version": version})
         plan = ResearchPlan.model_validate(cached) if cached else await runner.plan(run, proposed)
         plan.plan_version = version
         if not decision.get("revision"):
             plan.acknowledgement = ""
+        settings.fit_origins(plan)
         settings.check_plan(plan, type("Budget", (), run["budget"])(), run["source_names"])
         body = plan.model_dump(mode="json")
         await store.cache(run["run_id"], key, body)
@@ -137,6 +141,7 @@ def build_workflow(settings, store, runner, checkpointer):
             cached = await store.unit(run["run_id"], f"{run.get('cycle', 0)}:{unit.id}", digest(unit.model_dump(mode="json")))
             if cached is not None:
                 results[unit.id] = cached
+                await store.event(run["run_id"], "metrics.cache_hit", {"kind": "unit-result", "unit_id": unit.id})
                 # The result can commit just before a crash in status/event
                 # publication. Reconcile the projection without rerunning tools.
                 state = "FAILED" if unit.id in failed_before else "COMPLETED"
@@ -146,8 +151,10 @@ def build_workflow(settings, store, runner, checkpointer):
         semaphore = asyncio.Semaphore(settings.max_concurrency)
 
         async def execute(unit):
+            queued = time.monotonic()
             async with semaphore:
-                await store.event(run["run_id"], "research.unit.started", {"unit_id": unit.id, "skill_name": unit.skill, "title": unit.title})
+                queued_ms = round((time.monotonic() - queued) * 1000)
+                await store.event(run["run_id"], "research.unit.started", {"unit_id": unit.id, "skill_name": unit.skill, "title": unit.title, "queued_ms": queued_ms})
                 await store.mutate(run["run_id"], lambda r: r["unit_statuses"].update({unit.id: "RESEARCHING"}))
                 try:
                     deps = {uid: results[uid]["findings"] for uid in unit.depends_on}
@@ -273,6 +280,8 @@ def build_workflow(settings, store, runner, checkpointer):
         key = "synthesis:" + digest([current.get("conversation", []), s["plan"], s["findings"], s.get("final_errors", []), s.get("synthesis_repairs", 0), current.get("limitations", []), revise])
         key += f":retry-{current.get('report_retry_generation', 0)}"
         draft = await store.cached(run_id, key)
+        if draft is not None:
+            await store.event(run_id, "metrics.cache_hit", {"kind": "synthesis"})
         if draft is None:
             previous = current.get("report") or {}
             if revise and previous.get("document"):
@@ -387,10 +396,15 @@ def build_workflow(settings, store, runner, checkpointer):
 
             context = get_runtime().context or {}
             trace = LocalTrace(store, state["run"]["run_id"], settings, (context.get("secrets") or {}).values())
-            async with trace.span(name, "node", {k: v for k, v in state.items() if k != "run"}) as output:
-                result = await node(state)
-                output.update(result)
-                return result
+            # Model, tool and agent metrics inherit the phase they ran in.
+            token = metric_scope.set({"phase": name, "cycle": state["run"].get("cycle", 0)})
+            try:
+                async with trace.span(name, "node", {k: v for k, v in state.items() if k != "run"}) as output:
+                    result = await node(state)
+                    output.update(result)
+                    return result
+            finally:
+                metric_scope.reset(token)
 
         return invoke
 

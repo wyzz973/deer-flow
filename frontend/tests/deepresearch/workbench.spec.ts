@@ -102,6 +102,16 @@ for (const entry of ["/deepresearch-demo", "/workspace/deepresearch"]) {
     await expect(
       page.getByRole("heading", { name: "研究活动", exact: true }),
     ).toBeVisible();
+    // Cost and efficiency come from the recorded calls, with a raw export.
+    await page.getByRole("tab", { name: "指标", exact: true }).click();
+    await expect(
+      page.getByText("工具调用", { exact: true }).locator(".."),
+    ).toContainText("4");
+    const metricsDownload = page.waitForEvent("download");
+    await page.getByRole("button", { name: "导出指标", exact: true }).click();
+    expect((await metricsDownload).suggestedFilename()).toBe(
+      `research-${id}-metrics.jsonl`,
+    );
     await page.getByRole("button", { name: "关闭报告", exact: true }).click();
     await page.getByRole("button", { name: "查看 Trace", exact: true }).click();
     await expect(page.locator('[aria-label="Trace 时间轴"]')).toBeVisible();

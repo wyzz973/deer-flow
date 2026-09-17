@@ -62,6 +62,57 @@ export function formatElapsed(seconds: number | null | undefined) {
   return `${Math.floor(value / 3600)}h ${Math.floor((value % 3600) / 60)}m`;
 }
 
+/** Compact token counts: 950, 17.0k, 1.23M. */
+export function formatTokens(value: number | null | undefined) {
+  if (value == null || !Number.isFinite(value)) return "—";
+  if (value < 1000) return String(Math.round(value));
+  if (value < 1_000_000) return `${(value / 1000).toFixed(1)}k`;
+  return `${(value / 1_000_000).toFixed(2)}M`;
+}
+
+const CURRENCY_SYMBOLS: Record<string, string> = {
+  USD: "$",
+  CNY: "¥",
+  RMB: "¥",
+  EUR: "€",
+};
+
+/** Estimated cost; small amounts keep four decimals so they stay visible. */
+export function formatCost(
+  amount: number | null | undefined,
+  currency?: string | null,
+) {
+  if (amount == null || !Number.isFinite(amount)) return "—";
+  const symbol = currency ? (CURRENCY_SYMBOLS[currency] ?? `${currency} `) : "";
+  const digits = amount !== 0 && Math.abs(amount) < 0.01 ? 4 : 2;
+  return `${symbol}${amount.toFixed(digits)}`;
+}
+
+export function formatPercent(ratio: number | null | undefined) {
+  if (ratio == null || !Number.isFinite(ratio)) return "—";
+  return `${Math.round(ratio * 100)}%`;
+}
+
+const PHASE_LABELS: Record<string, string> = {
+  planner: "规划",
+  plan_review: "计划确认",
+  dispatch: "研究",
+  evidence_merge: "合并证据",
+  validator: "缺口检查",
+  supplement: "补研",
+  synthesis: "写报告",
+  citation_binder: "绑定引用",
+  final_validator: "终检",
+  renderer: "发布",
+  follow_up: "追问",
+  rejected: "拒绝",
+  unknown: "其他",
+};
+
+export function phaseLabel(phase: string) {
+  return PHASE_LABELS[phase] ?? phase;
+}
+
 /** Exact duration for the finished timeline, like "7m 55s". */
 export function formatDuration(seconds: number | null | undefined) {
   if (seconds == null || !Number.isFinite(seconds)) return "";

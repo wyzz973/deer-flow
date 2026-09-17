@@ -81,11 +81,13 @@ def build_config(base, fragment, home: Path, model: str, *, max_output_tokens=No
     return value
 
 
-def _write_yaml(path, data, *, reuse=False):
+def _write_yaml(path, data, *, reuse=False, operator_keys=()):
     if reuse:
         # A code-only restart may reuse checkpoints, but a changed execution
         # configuration must not silently acquire the old run's identity.
-        if yaml.safe_load(path.read_text(encoding="utf-8")) != data:
+        # Operator keys (prices) do not change execution and may be added later.
+        stored = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        if {k: v for k, v in stored.items() if k not in operator_keys} != {k: v for k, v in data.items() if k not in operator_keys}:
             raise ValueError(f"Acceptance configuration changed; cannot resume {path.name}")
         return
     # Generated configuration may still contain private non-credential metadata.
@@ -149,7 +151,7 @@ def main():
         if not args.resume_dir:
             target.mkdir(parents=True)
             shutil.copyfile(ROOT / spec["path"], target / "SKILL.md")
-    _write_yaml(home / "research.yaml", research, reuse=bool(args.resume_dir))
+    _write_yaml(home / "research.yaml", research, reuse=bool(args.resume_dir), operator_keys=("pricing",))
 
     os.environ.update(
         DEER_FLOW_CONFIG_PATH=str(home / "host.yaml"),

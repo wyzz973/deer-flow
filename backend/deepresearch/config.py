@@ -64,6 +64,16 @@ class SourceSpec(Contract):
         return self
 
 
+class ModelPricing(Contract):
+    """Operator-entered list prices per million tokens; never fetched or assumed."""
+
+    input_per_million: float = Field(ge=0)
+    output_per_million: float = Field(ge=0)
+    # Prompt-cache hits; omitted means cached input is billed as normal input.
+    cached_input_per_million: float | None = Field(default=None, ge=0)
+    currency: str = Field(default="USD", min_length=3, max_length=8)
+
+
 class Settings(Contract):
     _skill_cache: dict[str, str] = PrivateAttr(default_factory=dict)
     runner: Literal["demo", "deerflow"] = "demo"
@@ -96,6 +106,10 @@ class Settings(Contract):
     # Site icons for cited domains are fetched by the gateway (public hosts only).
     # Disable for deployments without outbound access; the UI shows letter badges.
     favicons: bool = True
+    # Model name -> list prices, used only to estimate research cost in metrics.
+    # Excluded from the configuration fingerprint, so a price update never
+    # blocks resuming earlier runs.
+    pricing: dict[str, ModelPricing] = Field(default_factory=dict)
     require_dual_source: bool = True
     # Automatic LangSmith tracing is disabled; local spans redact captured content.
     budget_ceiling: ResearchBudget = Field(default_factory=ResearchBudget)
@@ -136,6 +150,21 @@ class Settings(Contract):
         if len(text) > 100000:
             raise ValueError(f"Skill too large: {name}")
         return text
+
+    def fit_origins(self, plan):
+        """Drop required origins that no configured source serves.
+
+        Only for deployments that do not require both origins. A planner (weak
+        local models especially) may keep the internal+external default even
+        when only one kind of source exists, which would deny every unit.
+        """
+        available = {source.origin for source in self.sources}
+        if self.require_dual_source or not available:
+            return plan
+        for unit in plan.research_units:
+            strategy = unit.source_strategy
+            strategy.required_origins = [origin for origin in strategy.required_origins if origin in available] or sorted(available)
+        return plan
 
     def check_plan(self, plan, budget, request_sources=()):
         if len(plan.research_units) > budget.max_units:

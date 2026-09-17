@@ -168,6 +168,23 @@ def build_router(service, *, local_demo=False, demo_origins=None):
         calls = await service.store.calls(run["run_id"])
         return build(run, events, calls, tool_roles(service.settings))
 
+    @router.get("/{run_id}/metrics")
+    async def research_metrics(run=Depends(owned)):
+        # Cost and efficiency from recorded measurements; never trace payloads.
+        from .metrics import collect
+
+        return await collect(service.store, run, service.settings.pricing)
+
+    @router.get("/{run_id}/metrics/export")
+    async def export_metrics(run=Depends(owned)):
+        from .metrics import export_records
+
+        async def stream():
+            async for record in export_records(service.store, run, service.settings.pricing):
+                yield json.dumps(record, ensure_ascii=False, default=str) + "\n"
+
+        return StreamingResponse(stream(), media_type="application/x-ndjson", headers={"Content-Disposition": f'attachment; filename="research-{run["run_id"]}-metrics.jsonl"', "Cache-Control": "no-store"})
+
     @router.post("/{run_id}/plan/edit", status_code=202)
     async def edit(body: PlanEdit, request: Request, run=Depends(owned)):
         return await invoke(service.decision(run["run_id"], body.plan_version, "edit", body.plan.model_dump(mode="json"), secrets(request)))

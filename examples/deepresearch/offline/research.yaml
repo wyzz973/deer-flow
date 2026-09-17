@@ -1,0 +1,81 @@
+# 离线部署：DeepResearch 研究配置（完整文件）。
+#
+# 用法：cp examples/deepresearch/offline/research.yaml deepresearch.local.yaml，再按注释修改。
+# 字段说明见 docs/deepresearch/RESEARCH_CONFIGURATION.md。
+# 这里的 model 都是 config.yaml 里 models[].name 的名字，本例假设叫 local-model。
+# 本文件由 tests/deepresearch/test_offline_config.py 校验，改动后请运行该测试。
+
+runner: deerflow                  # deerflow：真实研究；demo：合成数据，不调用模型
+data_dir: .deerflow/deepresearch  # 研究数据库、检查点和日志的位置
+extraction_model: local-model     # 把研究员的回答整理成数据契约用的模型，选最稳的那个
+output_retries: 3                 # 整理失败时的重试次数（0-4），弱模型调高
+native_tools: null                # null：继承宿主工具；需要收紧时写工具名列表
+trace_capture_content: true
+trace_max_chars: 16000
+
+skills:
+  deepresearch:
+    agent: research-planner
+    path: examples/deepresearch/skills/deepresearch/SKILL.md
+    description: 研究问题拆解与计划规范化
+    model: local-model
+    timeout_seconds: 1800
+  industry-trend:
+    agent: industry-researcher
+    path: examples/deepresearch/skills/industry-trend/SKILL.md
+    description: 行业现状、驱动因素与发展趋势
+    model: local-model
+    timeout_seconds: 1800
+  technical-route:
+    agent: technical-researcher
+    path: examples/deepresearch/skills/technical-route/SKILL.md
+    description: 技术路线、工程约束与取舍
+    model: local-model
+    timeout_seconds: 1800
+  report-synthesis:
+    agent: research-synthesizer
+    path: examples/deepresearch/skills/report-synthesis/SKILL.md
+    description: 基于证据池综合结构化报告
+    model: local-model
+    timeout_seconds: 1800
+
+# 离线没有公网搜索，可引用证据来自内网知识库。只有一类来源时必须关掉双来源要求。
+require_dual_source: false
+sources:
+  - name: internal-knowledge
+    kind: native
+    tool: knowledge_search        # config.yaml tools 里的工具名，必须完全一致
+    role: data                    # data：工具返回的记录可以被引用
+    origin: internal
+    level: L1
+    publisher: your-organization
+    priority: 10
+  # 内网 MCP 服务的写法（服务名来自 extensions_config.json）：
+  # - name: internal-mcp-kb
+  #   kind: mcp
+  #   server: company-kb
+  #   tool: company-kb_search     # MCP 工具名 = 服务名_工具原名
+  #   role: data
+  #   origin: internal
+  #   level: L1
+  #   publisher: your-organization
+  #   priority: 20
+source_fallback: [internal-knowledge]
+
+max_concurrency: 2                # 同时研究的单元数；单卡模型服务用 1
+max_active_runs: 2
+plan_countdown_seconds: 120       # 计划卡倒计时，给人留出修改时间
+max_output_tokens: 8192           # 研究角色单次输出上限；实际取它和模型 max_tokens 的较小值
+allow_limited_report: true
+cite_search_results: false
+max_synthesis_repairs: 1
+max_report_sections: 5            # 报告章节越少，模型调用越少
+favicons: false                   # 离线必须关闭，否则网关会尝试访问公网网站
+budget_ceiling:
+  max_iterations: 1               # 补研轮数
+  max_units: 4                    # 每轮最多研究单元数
+  max_tool_calls: 200
+  max_elapsed_seconds: 7200
+  max_model_tokens: 2000000       # 上限就是 2000000
+local_secret_env: {}
+request_secret_headers: {}

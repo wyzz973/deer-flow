@@ -47,6 +47,7 @@ import {
 import type { AgentThreadState } from "@/core/threads";
 import { cn } from "@/lib/utils";
 
+import { ResearchMetricsPanel } from "./metrics-panel";
 import { ResearchPlanCard } from "./plan-card";
 import { ResearchReportReader } from "./report-reader";
 import { ResearchReportActions, ResearchReportCard } from "./report-view";
@@ -54,7 +55,7 @@ import { ResearchGallery } from "./research-gallery";
 import { ResearchActivityPanel, ResearchSourcesPanel } from "./sources-panel";
 import { ResearchTraceInspector } from "./trace-panel";
 
-type Panel = "sources" | "activity" | "trace";
+type Panel = "sources" | "activity" | "metrics" | "trace";
 
 export function ResearchConversation(props: {
   initialRunId?: string;
@@ -281,7 +282,7 @@ function ResearchView({
           </>
         ) : (
           <div role="tablist" aria-label="来源与活动" className="flex gap-1">
-            {(["sources", "activity"] as const).map((tab) => (
+            {(["sources", "activity", "metrics"] as const).map((tab) => (
               <Button
                 key={tab}
                 variant={lastPanel.current === tab ? "secondary" : "ghost"}
@@ -292,9 +293,11 @@ function ResearchView({
               >
                 {tab === "sources"
                   ? "来源"
-                  : activity?.elapsed_seconds != null
-                    ? `活动 · ${formatElapsed(activity.elapsed_seconds)}`
-                    : "活动"}
+                  : tab === "metrics"
+                    ? "指标"
+                    : activity?.elapsed_seconds != null
+                      ? `活动 · ${formatElapsed(activity.elapsed_seconds)}`
+                      : "活动"}
               </Button>
             ))}
           </div>
@@ -344,6 +347,10 @@ function ResearchView({
           />
         ) : lastPanel.current === "activity" ? (
           <ResearchActivityPanel activity={activity} onInspect={inspect} />
+        ) : lastPanel.current === "metrics" ? (
+          runId && (
+            <ResearchMetricsPanel api={api} runId={runId} active={running} />
+          )
         ) : (
           runId && (
             <ResearchTraceInspector

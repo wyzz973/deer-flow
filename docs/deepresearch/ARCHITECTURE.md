@@ -66,11 +66,12 @@ flowchart TB
 | `report.py` | Markdown 报告：标记解析、清理、句级删除、组装、目录、引用绑定、终检、导出（md/html/docx） |
 | `render.py` | 引用元数据分组与历史 AST 报告的 Word 导出 |
 | `activity.py` | 把事件与调用投影为面向用户的活动时间线与计数 |
+| `metrics.py` | 从模型调用、工具调用、子 Agent 记录与 span 汇总成本与效率；也是跨运行对比的命令行工具 |
 | `trace.py` | 本地 span、脱敏、模型/工具回调、用量预留与结算、进展说明事件 |
 | `store.py` | SQLite 存储、事务、事件序号、原子发布、缓存、图标缓存 |
 | `favicons.py` | 网站图标代取：公网地址校验、位图识别、缓存 |
 | `config.py` / `contracts.py` | 配置 schema 与领域契约（计划、单元、结果、证据、大纲、错误、状态） |
-| `live.py` / `demo.py` / `doctor.py` | 隔离真实验收启动器、合成演示应用、配置检查 |
+| `live.py` / `demo.py` / `doctor.py` | 隔离真实验收启动器、合成演示应用、配置检查与模型探测（`--probe-model`） |
 
 ### 3.2 前端 `frontend/src/`
 
@@ -82,6 +83,7 @@ flowchart TB
 | `components/deepresearch/report-view.tsx` / `report-reader.tsx` | 报告卡、正文渲染与引用编号、导出菜单、全屏阅读器与悬停目录 |
 | `components/deepresearch/sources-panel.tsx` | “来源”（按域名分组的引用）与“活动”（研究时间线）页签 |
 | `components/deepresearch/citation-preview.tsx` | 引用悬浮卡（原文片段）与网站图标 `SiteIcon` |
+| `components/deepresearch/metrics-panel.tsx` | “指标”页签：耗时、Token、费用、调用、子 Agent 与效率 |
 | `components/deepresearch/trace-panel.tsx` | 本地 Trace 浏览与导出 |
 | `components/deepresearch/research-history.tsx` / `research-gallery.tsx` | 侧栏研究历史；空白页“推荐/报告” |
 | `components/deepresearch/workbench.tsx` | 兼容旧入口的别名导出 |
@@ -169,7 +171,7 @@ flowchart LR
 
 | 节点 | 状态 | 做什么 | 关键事件 | 持久化与缓存 |
 | --- | --- | --- | --- | --- |
-| `planner` | `PLANNING` | 调用 `deepresearch` 角色生成 `ResearchPlan`：研究简报 `brief`、短标题、3–6 个带短标题的单元、前提假设、报告风格、来源策略；对话修改时写 `acknowledgement` 并设置 `auto_start` | `plan.created` / `plan.updated` | 缓存键 `plan:`；写入 `plan` 与 `units`；追加 `ack-N` 与 `plan-N` 对话消息 |
+| `planner` | `PLANNING` | 调用 `deepresearch` 角色生成 `ResearchPlan`：研究简报 `brief`、短标题、3–6 个带短标题的单元、前提假设、报告风格、来源策略；对话修改时写 `acknowledgement` 并设置 `auto_start`；`require_dual_source: false` 时由 `Settings.fit_origins` 去掉没有来源可用的 `required_origins` | `plan.created` / `plan.updated` | 缓存键 `plan:`；写入 `plan` 与 `units`；追加 `ack-N` 与 `plan-N` 对话消息 |
 | `plan_review` | 等待确认 | `auto_start` 时记录 `plan.auto_started`（`source=revision`）并直接批准；否则 `interrupt` 等待决策 | `plan.waiting_confirmation`（由服务写入）、`plan.auto_started` | 中断前无副作用，恢复时节点重跑 |
 | `dispatch` | `RESEARCHING` | 按依赖分批并行（`max_concurrency`）运行研究单元；已提交结果直接复用；非致命失败降级为占位结果；致命错误或整批失败使运行失败 | `research.unit.started` / `completed` / `failed` | `research_unit` 结果；`unit_statuses`、`unit_failures` |
 | `evidence_merge` | — | `merge_results` 按计划顺序把原始证据合并为稳定的 `E###`，生成 `BoundFinding` 与 lineage | `evidence.pool.updated` | `research_evidence`；`evidence_count` |
@@ -395,6 +397,8 @@ flowchart LR
 | `research_cache` | 计划、原生执行、转换、大纲、章节、摘要、写作、追问等阶段缓存 |
 | `research_source` / `research_tool_call` | 发现的来源与原生工具调用（状态、耗时、角色、查询词或 URL） |
 | `research_favicon` | 网站图标缓存（按域名，与运行无关） |
+| `research_model_call` | 每次模型调用的阶段、用途、角色、单元、Token 明细、耗时、状态与上下文大小 |
+| `research_agent_run` | 每次原生子 Agent 执行的状态、耗时、模型与工具调用计数、Token 汇总 |
 
 LangGraph 检查点在 `checkpoints.sqlite3`。运营日志轮转写入数据目录。进程锁 `worker.lock` 阻止多个 worker 使用同一目录。
 备份与迁移需要同时考虑两个数据库；多 worker 与分布式执行不在当前边界内。
@@ -439,6 +443,43 @@ workflow、节点、原生 Agent、模型调用、工具调用、结构化转换
 `report.section.started/completed`、`report.draft.repair`、`citation.bound`、`report.validation.retry`、`report.completed`、
 `run.failed`、`run.cancelled`、`activity.tool.started/completed`、`activity.note`、`usage.reserved/settled`、`trace.started/ended`。
 
+### 12.4 成本与效率指标（`metrics.py`）
+
+记录在研究执行时同步写入，读取时再汇总；指标写入失败只记日志，绝不改变研究结果。
+
+| 记录 | 来源 | 字段 |
+| --- | --- | --- |
+| 模型调用 `research_model_call` | `trace.model_callbacks` | `cycle`、`phase`（workflow 节点）、`purpose`（`agent` / `conversion`）、`skill`、`agent_name`、`unit_id`（写作为 `report-section-N` 等任务 ID）、`execution_id`、`contract`、`model`、`response_model`、开始/结束时间、`duration_ms`、`status`（ok / error / interrupted）、`error_code`、`input_tokens`、`output_tokens`、`cache_read_tokens`、`reasoning_tokens`、`total_tokens`、`usage_reported`、`estimated_tokens`、`finish_reason`、`prompt_messages`、`prompt_chars`、`output_chars`、`tool_calls` |
+| 工具调用 `research_tool_call` | 同上 | 原有字段加 `cycle`、`phase`、`skill`、`purpose`、`output_chars`（返回给模型的字符数）、`request_key`（脱敏后参数的 SHA-256 前 16 位，不保存参数）、`error_type`（异常类名；工具返回错误结果时由 `returned_error_type` 粗分为 `HTTP nnn`、异常名、`EmptyContent`、`ToolReturnedError`） |
+| 子 Agent `research_agent_run` | `native.execute_role` | 作用域字段、`model`、`thread_id`、开始/结束时间、`duration_ms`、`status`（completed / failed / cancelled）、`error_code`、`stop_reason`、`receipts`、`model_calls`、`model_errors`、`unreported_model_calls`、`tool_calls`、`tool_errors`、各类 Token 合计、`max_input_tokens` |
+| 事件 | workflow / runner | `research.unit.started` 与 `report.section.started` 带 `queued_ms`（等待并发名额）；`metrics.cache_hit`（`plan`、`unit-result`、`native-unit`、`report-outline`、`report-section`、`report-summary`、`synthesis`） |
+
+阶段来自 `trace.metric_scope`：`traced()` 在执行 workflow 节点时写入 `{phase, cycle}`，原生执行与格式转换在构建回调时复制，
+因此在原生子循环中的回调也能归属到正确阶段。Token 用量由 `usage_details` 归一化：优先 LangChain `usage_metadata`，
+其次原始 `token_usage` 中的 OpenAI 兼容字段、DeepSeek `prompt_cache_hit_tokens` 与 Anthropic `cache_read_input_tokens`；
+提供方未上报时字段为空、`usage_reported=false`，只保留预算预留估算，不计入费用。
+
+`summarize` 输出：
+
+- `time`：总时长（创建到发布）、实际计算（workflow span 合计）、等待（两者之差，含计划确认与停机）、模型/工具/排队耗时、按阶段耗时。
+- `tokens` 与 `cost`：输入、输出、缓存命中、推理、合计、未上报调用；按 `pricing` 估算费用（缓存命中按缓存单价，未配置则按普通输入价），
+  列出未定价模型；多币种时只给分币种合计。
+- `model_calls`：次数、错误码、finish reason、延迟 p50/p95、最大上下文。
+- `tools`：次数、错误率与错误类型、延迟、返回字符、搜索次数、读取页面数、按工具明细；重复调用（同一工具同一参数、在一次成功之后，
+  区分同一子 Agent 内与跨 Agent；分页与失败重试不算）；读取失败最多的 10 个站点。
+- `agents`：完成/失败/取消、失败码、最大并行数、按角色汇总、每次执行明细与费用。
+- `units`：按计划顺序列出每个研究单元（含补研）的耗时、模型调用、Token、费用、工具调用、搜索、读取页面、原始证据、
+  被引用页面数（报告引用的 `unit_ids`）与每条引用 Token，用来找出高消耗、低产出的单元。
+- `budget`：Token、工具调用、时长上限与已用比例；上限为空表示不限。时长按已结算用量与运行中 workflow span 取大，
+  因此运行中的任务也能看到时间预算消耗。
+- `metered`：早于逐次调用计量的任务（有预算账本但没有调用记录）为 `false`，未测量的字段一律为 `null`，不以 0 充数。
+- `research`、`report`、`cache`：计划与补研单元、失败单元、原始证据、裁剪与剪除引用、转换重试；报告字符、章节、表格、图、引用、域名、修复与删句；缓存复用。
+- `efficiency`：每条引用 Token/费用/计算时长、读取页面与引用的比例、每个研究单元（含补研）搜索次数、重复工具调用占比、每报告字符 Token、格式转换 Token 占比、失败子 Agent Token 占比、缓存命中率。
+- `breakdown`：按阶段、用途、角色、模型、单元、轮次的调用、Token、耗时与费用。
+
+入口：`GET /{id}/metrics`、`GET /{id}/metrics/export`（JSONL：先汇总，再逐条原始记录），前端“指标”页签，
+以及离线命令 `python -m deepresearch.metrics --data-dir <数据目录>/research [--config research.yaml] [--run ID] --format table|csv|json|jsonl`。
+
 ## 13. HTTP 接口摘要
 
 所有接口位于 `/api/deepresearch`，详细契约见 [API.md](API.md)。
@@ -449,6 +490,7 @@ workflow、节点、原生 Agent、模型调用、工具调用、结构化转换
 | 运行与计划 | `GET /{id}`、`POST /{id}/plan/approve`、`pause`、`resume`、`edit`、`reject` |
 | 对话与控制 | `POST /{id}/messages`、`POST /{id}/cancel`、`POST /{id}/retry` |
 | 过程 | `GET /{id}/events`（SSE）、`GET /{id}/activity`、`GET /{id}/sources`、`GET /{id}/evidences` |
+| 成本与效率 | `GET /{id}/metrics`、`GET /{id}/metrics/export` |
 | 报告与审计 | `GET /{id}/report?format=json\|md\|html\|docx&version=N`、`GET /{id}/trace`、`GET /{id}/trace/export` |
 | 资源 | `GET /favicon?domain=`（网站图标） |
 
@@ -508,6 +550,7 @@ Gateway 依次尝试主机与上级站点的 `/favicon.ico`、首页声明的最
 | `allow_limited_report` / `cite_search_results` | true / false | 带局限写报告；搜索结果是否可引用 |
 | `max_synthesis_repairs` / `max_report_sections` | 1 / 8 | 终检重写次数、章节上限 |
 | `favicons` | true | 网站图标代取 |
+| `pricing` | 空 | 模型名到单价（每百万 Token 的输入、缓存命中、输出价格与币种），只用于估算费用，不参与配置指纹 |
 | `require_dual_source` | true | 是否要求内外部来源并存 |
 | `budget_ceiling` | 有限值 | 部署级预算上限；客户端不能用 `null` 取消有限上限 |
 | `trace_capture_content` / `trace_max_chars` | true / 16000 | Trace 内容采集 |
@@ -515,6 +558,11 @@ Gateway 依次尝试主机与上级站点的 `/favicon.ico`、首页声明的最
 
 示例见仓库根 `deepresearch.example.yaml`、`examples/deepresearch/host-config.fragment.yaml`
 （研究角色超时 600 秒）与 `examples/deepresearch/native-web.sources.yaml`（原生搜索为 `search`、抓取为 `read`）。
+离线模板在 `examples/deepresearch/offline/`（本地模型、内网知识库、`LocalSandboxProvider`），由 `test_offline_config.py` 校验。
+逐字段说明见 [RESEARCH_CONFIGURATION.md](RESEARCH_CONFIGURATION.md)，模型与宿主配置见
+[MODEL_CONFIGURATION.md](MODEL_CONFIGURATION.md)、[DEERFLOW_CONFIGURATION.md](DEERFLOW_CONFIGURATION.md)。
+`python -m deepresearch.doctor --config <研究配置> [--probe-model <模型名>]` 检查配置与研究角色；加 `--probe-model` 时
+对该模型发一次普通请求和一次工具调用，报告工具调用、用量与上下文告警，失败时退出码为 1。
 
 ### 15.2 Skills
 
@@ -588,6 +636,7 @@ python3 ../scripts/pnpm.py check
 | `test_runner.py` / `test_structured_role.py` / `test_dependency_evidence.py` | 研究载荷、证据裁剪、结果错误分类、写作流水线、转换修复 |
 | `test_report_quality.py` / `test_core.py` | 引用资格、页面级编号、清理、导出、大纲规则、外置化页面关联 |
 | `test_activity.py` / `test_favicons.py` / `test_api.py` | 活动投影、图标代取与安全头、接口权限 |
+| `test_metrics.py` | Token 用量归一化、模型/工具/子 Agent 记录、成本与效率汇总、指标接口权限、命令行工具 |
 | `test_native_bridge.py` / `test_native_cleanup.py` / `test_metering.py` / `test_trace_finalization.py` | 原生桥接、取消清理、用量计量、Trace 终态 |
 | 前端 `presentation`、`hooks`、`plan-card`、`activity-panel`、`citation-preview` | 展示计算、SSE 与重连、计划卡、活动跟随、引用悬浮与网站图标 |
 

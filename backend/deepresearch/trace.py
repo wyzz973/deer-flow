@@ -7,6 +7,7 @@ hold no asyncio primitives: native subagents may call them on their own loop.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -20,6 +21,10 @@ from uuid import uuid4
 from .output import visible_text
 
 _parent: ContextVar[str | None] = ContextVar("research_span", default=None)
+# Workflow phase and cycle for metrics. Callbacks copy it when they are built,
+# because native subagents invoke them on another event loop.
+metric_scope: ContextVar[dict | None] = ContextVar("research_metric_scope", default=None)
+METRIC_KEYS = ("cycle", "phase", "purpose", "skill", "agent_name", "unit_id", "execution_id", "contract")
 logger = logging.getLogger("deepresearch.audit")
 _sensitive = re.compile(r"authorization|cookie|csrf|password|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|reasoning|thinking", re.I)
 
@@ -160,6 +165,40 @@ class LocalTrace:
             _parent.reset(token)
 
 
+def _count(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _first(*values):
+    return next((value for value in map(_count, values) if value is not None), None)
+
+
+def usage_details(message, llm_output=None):
+    """Normalize provider token usage across SDK shapes; unknown stays None.
+
+    LangChain ``usage_metadata`` comes first. Raw usage covers OpenAI-compatible
+    fields, DeepSeek prompt-cache hits and Anthropic cache reads.
+    """
+    meta = getattr(message, "usage_metadata", None) or {}
+    response = getattr(message, "response_metadata", None) or {}
+    raw = response.get("token_usage") or response.get("usage") or (llm_output or {}).get("token_usage") or {}
+    raw = raw if isinstance(raw, dict) else {}
+    input_details = meta.get("input_token_details") or {}
+    output_details = meta.get("output_token_details") or {}
+    prompt_details = raw.get("prompt_tokens_details") or {}
+    completion_details = raw.get("completion_tokens_details") or {}
+    usage = {
+        "input_tokens": _first(meta.get("input_tokens"), raw.get("prompt_tokens"), raw.get("input_tokens")),
+        "output_tokens": _first(meta.get("output_tokens"), raw.get("completion_tokens"), raw.get("output_tokens")),
+        "total_tokens": _first(meta.get("total_tokens"), raw.get("total_tokens")),
+        "cache_read_tokens": _first(input_details.get("cache_read"), raw.get("prompt_cache_hit_tokens"), prompt_details.get("cached_tokens"), raw.get("cache_read_input_tokens")),
+        "reasoning_tokens": _first(output_details.get("reasoning"), completion_details.get("reasoning_tokens")),
+    }
+    if usage["total_tokens"] is None and usage["input_tokens"] is not None and usage["output_tokens"] is not None:
+        usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
+    return usage
+
+
 def tool_detail(role, inputs):
     """Show what a search or read step is doing, from the call's own arguments.
 
@@ -187,6 +226,32 @@ def tool_detail(role, inputs):
     return {}
 
 
+HTTP_STATUS = re.compile(r"(?i)\b(?:status(?:\s+code)?|HTTP(?:/[\d.]+)?)\s*:?\s*([1-5]\d\d)\b")
+ERROR_NAME = re.compile(r"\b([A-Z][A-Za-z]*(?:Error|Exception|Timeout))\b")
+EMPTY_RESULT = re.compile(r"(?i)\bno (?:readable|usable|extractable) (?:page )?content\b|\bempty (?:page|content|response|result)\b")
+
+
+def request_key(inputs, secrets=()):
+    """Identity of a tool request, so identical repeats are countable without storing arguments."""
+    if isinstance(inputs, str):
+        try:
+            inputs = json.loads(inputs)
+        except ValueError:
+            pass
+    encoded = json.dumps(redact(inputs, secrets, 256000), ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(encoded.encode()).hexdigest()[:16]
+
+
+def returned_error_type(content):
+    """Coarse label for a tool result that reports an error; only metrics group by it."""
+    text = (content if isinstance(content, str) else json.dumps(content, ensure_ascii=False, default=str))[:2000]
+    if match := HTTP_STATUS.search(text):
+        return f"HTTP {match.group(1)}"
+    if match := ERROR_NAME.search(text):
+        return match.group(1)
+    return "EmptyContent" if EMPTY_RESULT.search(text) else "ToolReturnedError"
+
+
 def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
     """Build lazily so demo/API imports need no model SDK installation."""
     from langchain_core.callbacks import AsyncCallbackHandler
@@ -195,8 +260,19 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
     from .contracts import ResearchError, utcnow
     from .sources import fetched_source, observed_sources
 
-    scope = scope or {}
+    # Keep the caller's dict: execute_role adds execution_id after building us.
+    scope = {} if scope is None else scope
+    for key, value in (metric_scope.get() or {}).items():
+        scope.setdefault(key, value)
     roles = {**NATIVE_ROLES, **{source.tool: source.role for source in trace.settings.sources}}
+    counters = ("model_calls", "model_errors", "unreported_model_calls", "tool_calls", "tool_errors", "input_tokens", "output_tokens", "total_tokens", "cache_read_tokens", "reasoning_tokens", "max_input_tokens")
+
+    async def record_model(key, details):
+        # Metrics describe research; losing one record must never stop it.
+        try:
+            await trace.store.record_model_call(trace.run_id, key, {**{k: scope[k] for k in METRIC_KEYS if scope.get(k) is not None}, **details})
+        except Exception as exc:
+            logger.warning(json.dumps({"event": "model_metrics_failed", "error": type(exc).__name__}))
 
     class LocalCallbacks(AsyncCallbackHandler):
         raise_error = True
@@ -207,6 +283,11 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
             self.parent_id = _parent.get()
             self.budget_error = None
             self.provider_error = None
+            self.totals = dict.fromkeys(counters, 0)
+
+        def elapsed_ms(self, run_id):
+            entry = self.active.get(str(run_id))
+            return round((time.monotonic() - entry[0]) * 1000) if entry else None
 
         async def begin(self, run_id, name, kind, payload):
             key = str(run_id)
@@ -242,13 +323,28 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
                 if kind == "tool":
                     await self.on_tool_error(error, run_id=key)
                 else:
-                    self.reservations.pop(key, None)
+                    reserved = self.reservations.pop(key, None)
+                    if kind == "model":
+                        self.totals["model_errors"] += 1
+                        await record_model(key, {"status": "interrupted", "ended_at": utcnow(), "duration_ms": self.elapsed_ms(key), "error_code": error.code, "estimated_tokens": reserved})
                     await self.finish(key, error=error)
 
         async def on_chat_model_start(self, serialized, messages, *, run_id, **kwargs):
             self.provider_error = None
             body = [[{"role": getattr(m, "type", "unknown"), "content": visible_text(m.content)} for m in batch] for batch in messages]
-            await self.begin(run_id, model_name or (serialized or {}).get("name", "model"), "model", body)
+            name = model_name or (serialized or {}).get("name", "model")
+            await self.begin(run_id, name, "model", body)
+            self.totals["model_calls"] += 1
+            await record_model(
+                str(run_id),
+                {
+                    "model": name,
+                    "status": "running",
+                    "started_at": utcnow(),
+                    "prompt_messages": sum(len(batch) for batch in body),
+                    "prompt_chars": sum(len(message["content"] or "") for batch in body for message in batch),
+                },
+            )
             try:
                 from langchain_core.messages.utils import count_tokens_approximately
 
@@ -262,15 +358,26 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
                 await trace.store.event(trace.run_id, "usage.reserved", {"model_call_id": str(run_id), "estimated_tokens": size})
             except Exception as exc:
                 self.budget_error = exc
+                self.totals["model_errors"] += 1
+                await record_model(str(run_id), {"status": "error", "ended_at": utcnow(), "duration_ms": self.elapsed_ms(run_id), "error_code": getattr(exc, "code", type(exc).__name__)})
                 await self.finish(run_id, error=exc)
                 raise
 
         async def on_llm_end(self, response, *, run_id, **kwargs):
             answers, usage, known_usage = [], 0, False
+            details = dict.fromkeys(("input_tokens", "output_tokens", "total_tokens", "cache_read_tokens", "reasoning_tokens"))
+            finish_reason = response_model = None
             for batch in response.generations:
                 for generation in batch:
                     message = getattr(generation, "message", None)
                     answers.append({"content": visible_text(getattr(message, "content", generation.text)), "tool_calls": getattr(message, "tool_calls", [])})
+                    reported = usage_details(message, response.llm_output)
+                    for field, value in reported.items():
+                        if value is not None:
+                            details[field] = (details[field] or 0) + value
+                    metadata = getattr(message, "response_metadata", None) or {}
+                    finish_reason = metadata.get("finish_reason") or finish_reason
+                    response_model = metadata.get("model_name") or response_model
                     # A researcher's visible sentence beside its tool calls is
                     # the live progress note. Hidden reasoning never qualifies.
                     calls = answers[-1]["tool_calls"] or []
@@ -280,11 +387,26 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
                             await trace.store.event(trace.run_id, "activity.note", {**scope, "text": redact(note[:400], trace.secrets, 400)})
                         except Exception as exc:  # A progress note must never stop research or metering.
                             logger.warning(json.dumps({"event": "activity_note_failed", "error": type(exc).__name__}))
-                    total = (getattr(message, "usage_metadata", None) or {}).get("total_tokens")
-                    if isinstance(total, int) and not isinstance(total, bool) and total >= 0:
+                    if reported["total_tokens"] is not None:
                         known_usage = True
-                        usage += total
+                        usage += reported["total_tokens"]
             reserved = self.reservations.pop(str(run_id), None)
+            for field, value in details.items():
+                self.totals[field] += value or 0
+            self.totals["max_input_tokens"] = max(self.totals["max_input_tokens"], details["input_tokens"] or 0)
+            if not known_usage:
+                self.totals["unreported_model_calls"] += 1
+            model_record = {
+                **details,
+                "ended_at": utcnow(),
+                "duration_ms": self.elapsed_ms(run_id),
+                "usage_reported": known_usage,
+                "estimated_tokens": reserved,
+                "finish_reason": finish_reason,
+                "response_model": response_model,
+                "output_chars": sum(len(answer["content"] or "") for answer in answers),
+                "tool_calls": sum(len(answer["tool_calls"] or []) for answer in answers),
+            }
             if known_usage and reserved is not None:
 
                 def settle(run):
@@ -296,24 +418,32 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
                 ceiling = current["budget"]["max_model_tokens"]
                 if ceiling is not None and current["usage"]["model_tokens"] > ceiling:
                     self.budget_error = ResearchError("BUDGET_EXHAUSTED", "预算已用尽: max_model_tokens", recoverable=False)
+                    await record_model(str(run_id), {**model_record, "status": "error", "error_code": self.budget_error.code})
                     await self.finish(run_id, payload={"answers": answers, "reported_tokens": usage}, error=self.budget_error)
                     raise self.budget_error
             # Missing usage or a failed call keeps the conservative reservation;
             # uncertainty must not become a free retry or negative accounting.
+            await record_model(str(run_id), {**model_record, "status": "ok"})
             await self.finish(run_id, payload={"answers": answers, "reported_tokens": usage})
 
         async def on_llm_error(self, error, *, run_id, **kwargs):
             self.provider_error = provider_failure(error)
-            self.reservations.pop(str(run_id), None)
+            reserved = self.reservations.pop(str(run_id), None)
+            self.totals["model_errors"] += 1
+            code = self.provider_error.code if self.provider_error else type(error).__name__
+            await record_model(str(run_id), {"status": "error", "ended_at": utcnow(), "duration_ms": self.elapsed_ms(run_id), "error_code": code, "estimated_tokens": reserved})
             await self.finish(run_id, error=error)
 
         async def on_tool_start(self, serialized, input_str, *, run_id, **kwargs):
             name = (serialized or {}).get("name", "tool")
-            await self.begin(run_id, name, "tool", kwargs.get("inputs") or input_str)
+            inputs = kwargs.get("inputs") or input_str
+            await self.begin(run_id, name, "tool", inputs)
             role = roles.get(name)
-            detail = redact(tool_detail(role, kwargs.get("inputs") or input_str), trace.secrets, 2000) if role else {}
+            detail = redact(tool_detail(role, inputs), trace.secrets, 2000) if role else {}
             details = {**scope, "tool_name": name, "role": role, **detail}
-            await trace.store.record_call(trace.run_id, str(run_id), {**details, "started_at": utcnow(), "status": "running", "span_id": str(run_id)})
+            request = request_key(inputs, trace.secrets)
+            await trace.store.record_call(trace.run_id, str(run_id), {**details, "started_at": utcnow(), "status": "running", "span_id": str(run_id), "request_key": request})
+            self.totals["tool_calls"] += 1
             await trace.store.event(trace.run_id, "activity.tool.started", {**details, "call_id": str(run_id)})
             # All tools now use the native call path with their original
             # schemas. Reserve here; there is no separate search wrapper.
@@ -332,6 +462,8 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
             spec = next((s for s in trace.settings.sources if s.tool == name), None)
             status = "error" if getattr(output, "status", None) == "error" else "success"
             content = getattr(output, "content", output)
+            if status == "error":
+                self.totals["tool_errors"] += 1
             # Observe only the model-visible body. Do not mine provider headers
             # or mutate the object handed to the native model/tool loop.
             safe_content = redact(content, trace.secrets, 256000)
@@ -350,6 +482,9 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
                     "status": status,
                     "ended_at": utcnow(),
                     "duration_ms": round((time.monotonic() - entry[0]) * 1000) if entry else None,
+                    # Returned size drives the researcher's next prompt; the text is not stored here.
+                    "output_chars": len(content) if isinstance(content, str) else len(json.dumps(content, ensure_ascii=False, default=str)),
+                    **({"error_type": returned_error_type(safe_content)} if status == "error" else {}),
                     **page,
                 },
                 found,
@@ -362,7 +497,12 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
             entry = self.active.get(str(run_id))
             if entry is None:
                 return
-            call = await trace.store.record_call(trace.run_id, str(run_id), {**scope, "status": "error", "ended_at": utcnow(), "tool_name": entry[1] if entry else "tool", "error_type": type(error).__name__})
+            self.totals["tool_errors"] += 1
+            call = await trace.store.record_call(
+                trace.run_id,
+                str(run_id),
+                {**scope, "status": "error", "ended_at": utcnow(), "duration_ms": self.elapsed_ms(run_id), "tool_name": entry[1] if entry else "tool", "error_type": type(error).__name__},
+            )
             await trace.store.event(trace.run_id, "activity.tool.completed", call)
             await self.finish(run_id, error=error)
 

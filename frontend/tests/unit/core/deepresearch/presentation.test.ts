@@ -5,9 +5,13 @@ import {
   countdownSeconds,
   escapeReportText,
   excerptPreview,
+  formatCost,
   formatDuration,
   formatElapsed,
+  formatPercent,
+  formatTokens,
   liveStatus,
+  phaseLabel,
   reportHeadings,
   reportMarkdown,
   readableExcerpt,
@@ -235,5 +239,22 @@ describe("source list summaries", () => {
       "…g unknown words stay intact",
     );
     expect(sourceSummary("字".repeat(200), "", 140)).toHaveLength(141);
+  });
+});
+
+describe("research metrics formatting", () => {
+  it("formats tokens, costs, ratios and phase names", () => {
+    expect(formatTokens(950)).toBe("950");
+    expect(formatTokens(17000)).toBe("17.0k");
+    expect(formatTokens(1234567)).toBe("1.23M");
+    expect(formatTokens(null)).toBe("—");
+    expect(formatCost(0.0088, "USD")).toBe("$0.0088");
+    expect(formatCost(1.2, "CNY")).toBe("¥1.20");
+    expect(formatCost(3, "GBP")).toBe("GBP 3.00");
+    expect(formatCost(null, "USD")).toBe("—");
+    expect(formatPercent(0.552)).toBe("55%");
+    expect(formatPercent(null)).toBe("—");
+    expect(phaseLabel("dispatch")).toBe("研究");
+    expect(phaseLabel("custom-phase")).toBe("custom-phase");
   });
 });

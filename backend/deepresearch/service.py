@@ -55,7 +55,7 @@ class ResearchService(ConversationLifecycle):
             await self.store.start()
             self.log_handler = install_log(self.settings.resolve(self.settings.data_dir))
             bodies = {name: await asyncio.to_thread(self.settings.read_skill, name) for name in self.settings.skills}
-            self.fingerprint = digest([self.settings.model_dump(mode="json"), bodies])
+            self.fingerprint = digest([self.settings.model_dump(mode="json", exclude={"pricing"}), bodies])
             self.settings._skill_cache = bodies
             cp = await self.stack.enter_async_context(AsyncSqliteSaver.from_conn_string(str(self.settings.resolve(self.settings.data_dir) / "checkpoints.sqlite3")))
             await cp.setup()

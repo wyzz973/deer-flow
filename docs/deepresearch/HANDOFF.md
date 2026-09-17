@@ -12,9 +12,10 @@
 | 本机目录 | `/Users/sd3/Desktop/project/deer-flow` |
 | 本地分支 | `feat/deepresearch` |
 | 远端分支 | `origin/feat/deepresearch-v1-fullstack-20260914`（不是同名远端分支） |
-| 已推送提交 | `eb3ce656` 对标 ChatGPT 深度研究的完整改造与本文、[ARCHITECTURE.md](ARCHITECTURE.md)；其后的提交修复浏览器端到端测试与 CI 依赖。以 `git log` 为准 |
+| 已推送提交 | `eb3ce656` 对标 ChatGPT 深度研究的完整改造与本文、[ARCHITECTURE.md](ARCHITECTURE.md)；其后的提交依次修复浏览器端到端测试与 CI 依赖、加入成本与效率观测、加入离线交接文档与配置模板。以 `git log` 为准 |
 | 更早的基线 | `5fa0299c` `feat(deepresearch): unify native research chat and harden workflow recovery` |
-| 功能状态 | 交互、工作流、报告与前端改造完成；三次真实 DeepSeek 研究端到端完成 |
+| 功能状态 | 交互、工作流、报告与前端改造完成；三次真实 DeepSeek 研究端到端完成；成本与效率观测完成并经两次真实研究核对 |
+| 离线开发 | 不联网的本地 Agent 从 [OFFLINE_AGENT_GUIDE.md](OFFLINE_AGENT_GUIDE.md) 开始；配置见 [MODEL_CONFIGURATION.md](MODEL_CONFIGURATION.md)、[DEERFLOW_CONFIGURATION.md](DEERFLOW_CONFIGURATION.md)、[RESEARCH_CONFIGURATION.md](RESEARCH_CONFIGURATION.md)；模板在 `examples/deepresearch/offline/` |
 | 本次回归 | 见第 6 节 |
 | 未验证 | 干净克隆部署、生产构建、公司 MCP 与 SSO、真实手机视口、报告事实逐条核验；远端 CI 以 GitHub Actions 结果为准 |
 
@@ -24,6 +25,7 @@
 
 阅读顺序：仓库根 `AGENTS.md` → `backend/AGENTS.md` → `backend/deepresearch/AGENTS.md` → `frontend/AGENTS.md`
 → [ARCHITECTURE.md](ARCHITECTURE.md) → 本文。不要修改 `CLAUDE.md`，它只是导入 `AGENTS.md` 的薄入口。
+能力较弱、不联网的本地 Agent 先读 [OFFLINE_AGENT_GUIDE.md](OFFLINE_AGENT_GUIDE.md)，它把规则、命令和排错写成了逐步清单。
 
 ## 2. 已确定的产品与架构方向
 
@@ -73,6 +75,28 @@
 - 网站图标由 Gateway 代取（`/api/deepresearch/favicon`，`favicons.py`）：公网地址校验、只接受位图、缓存，失败时显示首字母。
 - SSE 返回 `Cache-Control: no-store, no-transform`，修复 Next 开发代理 gzip 缓冲导致页面停在“执行中”。
 
+**观测：成本与效率（`metrics.py`，细节见 ARCHITECTURE 12.4、API “成本与效率指标”）**
+- 执行时同步写入三类记录：每次模型调用（`research_model_call`：阶段、用途、角色、单元、Token、缓存命中、延迟、
+  finish reason、错误码）、每次子 Agent 执行（`research_agent_run`）、每次工具调用（在原记录上补 `output_chars`、
+  `request_key`、`error_type`）。写入失败只记日志，不影响研究。
+- 读取时汇总：总时长/实际计算/等待、各阶段耗时、并行累计的模型/工具/排队时间；Token 与缓存命中率；按 `pricing` 估算费用；
+  工具失败原因（`HTTP 429`、`ConnectError`、`SSLError`、`EmptyContent` 等）、同参数重复调用、读取失败最多的站点；
+  子 Agent 明细与最大并行；每个研究单元的 Token、搜索、读取、证据与被引用页面数；预算使用；每条引用的 Token/费用/时长等效率比。
+- 入口：侧栏“指标”页签（运行中每 5 秒刷新）、`GET /{id}/metrics`、`/metrics/export`（JSONL 原始记录）、
+  离线命令 `python -m deepresearch.metrics`（多次研究对比，table/csv/json/jsonl）。
+- 早于逐次计量的历史任务 `metered=false`：只有预算账本合计，其余字段为 `null`，界面显示“—”或“未记录”，不以 0 充数。
+- 费用需要在研究配置里填写 `pricing` 单价；当前验收配置没有填写，费用显示“—”。
+
+**离线交接与配置**
+- 新文档：[OFFLINE_AGENT_GUIDE.md](OFFLINE_AGENT_GUIDE.md)（给不联网的本地 Agent：铁律、环境检查、三种运行方式、改动定位、测试、排错、提交）、
+  [MODEL_CONFIGURATION.md](MODEL_CONFIGURATION.md)、[DEERFLOW_CONFIGURATION.md](DEERFLOW_CONFIGURATION.md)、[RESEARCH_CONFIGURATION.md](RESEARCH_CONFIGURATION.md)。
+- 离线模板 `examples/deepresearch/offline/`：`host-config.fragment.yaml`（vLLM 本地模型、RAGFlow 知识库、本机沙箱、四个研究角色、插件）和
+  `research.yaml`（单一内部来源、关闭网站图标、弱模型参数）。`test_offline_config.py` 校验两者合法且互相一致。
+- `python -m deepresearch.doctor --probe-model 模型名`：对模型发一次普通请求和一次工具调用，报告工具调用、用量和上下文告警，失败时退出码为 1。
+  同时修复 doctor 的一个问题：宿主配置尚未加载时，第一个研究角色会被误报为未配置。
+- `Settings.fit_origins`：`require_dual_source: false` 时，规划后去掉没有来源可用的 `required_origins`，避免弱模型的计划让研究单元报 `TOOL_DENIED`。
+- `research.yaml` 里的 `tool_timeout_seconds`、`tool_retries` 已确认不生效，文档标为旧字段，离线模板不再写它们。
+
 **仓库卫生与 CI**
 - `.github/workflows/deepresearch.yml` 的 `setup-uv` 固定为生产使用的 uv `0.11.1`（`test_ci_uv_version_pin.py`）。
 - `backend/deepresearch/AGENTS.md` 登记到 `test_agent_guidance_check.py` 的允许清单。
@@ -107,6 +131,24 @@
 7. 活动进度 `steps_done` 计入补研步骤。改为只统计计划步骤。
 
 注意：第 5 项的“过程说明”清理、第 6 项的页面级编号只有单元测试与对已存报告的离线重算，尚未在新的真实报告中出现。
+
+**观测功能的真实验收**（同一数据目录 `live-m232rndj`，指标由新代码计算）：
+
+| 任务 | 内容 | 指标结果 |
+| --- | --- | --- |
+| `2e5f59eb-438f-490f-b2c7-6ec31c4b9f34` | Redis 与 Valkey 选型；6 个计划单元 + 6 个补研单元 | `COMPLETED`；实际计算 691 秒（研究 596 秒、写报告 67 秒）；模型调用 209 次、Token 4.46M（输入 4.27M、输出 183k、缓存命中 24%）、p95 19.8 秒、最大上下文 44k；工具 382 次（搜索 159、读取页面 103）、失败率 12%（`web_fetch` 30、`web_search` 17 次 `SSLError`）；子 Agent 24 次、最大并行 3、排队累计 12 分 22 秒；71 条引用、每条引用 62.8k Token；单元每条引用 Token 从 14.5k 到 150.7k 不等 |
+| `9718f578-7857-4636-85d4-e246d4c1dbab` | 向量数据库选型（Milvus/Qdrant/Weaviate）；API 创建，预算限 4 个单元、1 轮、400 次工具、2400 秒 | `COMPLETED`；约 5 分钟；模型调用 86 次、Token 1.67M（缓存命中 25%）；工具 140 次（搜索 41、读取页面 58）、失败 18 次：`HTTP 429` 13（无 key 的 Jina 限流）、`ForbiddenError` 4（搜索）、`EmptyContent` 1；同参数重复调用 1 次；预算使用：工具 35%、时长 12%；47 条引用、每条引用 35.5k Token |
+
+核对方式：两次任务的 Token 合计与 `run.usage` 一致，工具次数与 `usage.tool_calls` 一致，搜索次数与读取页面数与活动接口一致，
+引用数与报告一致，子 Agent 的 Token 合计与 `purpose=agent` 的模型调用合计一致；9718f578 的 140 条工具记录全部带 `request_key`，
+18 条失败全部带 `error_type`，按原始记录独立重算的重复次数与汇总一致。浏览器中检查了两次任务与一条历史任务（68ff862b，
+`metered=false`）的“指标”页签。命令行 `python -m deepresearch.metrics --data-dir .deerflow/deepresearch/live-m232rndj/research`
+能列出该目录全部 5 个任务，历史任务的未测量列为空。费用路径用临时配置（测试单价，不是真实价格）验证过：
+`--config` 读取 `pricing` 后 9718f578 的 86 次调用全部计价，总额与按 Token 手算一致，并正确分摊到阶段与单元；临时配置已删除，
+私有验收配置没有写入单价。
+
+指标暴露的优化线索（尚未处理）：读取失败主要来自 Jina 无 key 模式的限流与连接失败，而不是目标网站；研究并发只有 3，
+2e5f59eb 的单元与章节排队累计超过 12 分钟；2e5f59eb 中补研单元的每条引用 Token 普遍低于计划单元（只有这一次任务有补研，样本很少）。
 
 浏览器检查（1568×691 视口）：计划卡、编辑引用条、确认消息、进度卡与“更新”、统计行、报告卡、阅读器悬停目录、
 来源页签（网站图标、摘要）、活动页签（网站标签、跟随）、引用悬浮卡（原文片段）。窄屏只在 Chrome 最小窗口宽度 606 px
@@ -150,11 +192,18 @@ python3 ../scripts/pnpm.py exec next dev --hostname 127.0.0.1 --port 3100
 - 启动器生成隔离的私有配置，不修改根配置；凭据只在进程环境中。`deepseek-v4-flash` 与 `393216` 是本次使用值，切换模型前核实官方上限。
 - `--jina-no-key` 仅让验收进程使用 Jina 公共模式，不修改 `.env`。
 - 重启网关会把活动运行标为 `PROCESS_INTERRUPTED`，需要在页面重试；待确认计划的倒计时会暂停。
-- 最近的研究页面：`http://127.0.0.1:3100/workspace/deepresearch/68ff862b-20dd-45a8-b7e9-90a254e3d889`。
+- 最近的研究页面：`http://127.0.0.1:3100/workspace/deepresearch/9718f578-7857-4636-85d4-e246d4c1dbab`。
+- 前端需要 `DEER_FLOW_AUTH_DISABLED=1`，否则重启后会跳到 `/setup`。
+- 用 API 创建任务时，`budget` 各项不能超过 `/capabilities` 的 `budget_ceiling`，`max_model_tokens` 最大 2,000,000；
+  省略 `budget` 会使用默认的 12 万 Token，而单次调用预留 393,216，会直接 `BUDGET_EXHAUSTED`。不限 Token 时传 `null`。
+- `--resume-dir` 要求生成的研究配置与数据目录中的 `research.yaml` 一致（`pricing` 除外）；给示例配置加字段后，私有配置也要同步加上。
+- 要在验收环境显示费用，把真实单价写进数据目录 `research.yaml` 的 `pricing`（键为模型名），重启网关即可，已有任务不受影响。
 
 ### 5.3 诊断
 
-只读接口：`GET /api/deepresearch/{id}`、`/activity`、`/sources`、`/trace`、`/trace/export`、`/report?format=json|md`。
+只读接口：`GET /api/deepresearch/{id}`、`/activity`、`/sources`、`/trace`、`/trace/export`、`/report?format=json|md`、
+`/metrics`、`/metrics/export`。多次研究对比（从 `backend/`）：
+`uv run --no-sync python -m deepresearch.metrics --data-dir ../.deerflow/deepresearch/live-m232rndj/research --format table`。
 `/events` 是 SSE，诊断时加超时，不要无界等待。`/api/subagents` 是 Agent 配置目录，不是后台执行注册表。
 研究数据库为 `<数据目录>/research/research.sqlite3`，事件在 `research_event.body`（JSON）中；只读打开即可。
 
@@ -196,7 +245,22 @@ DEEPRESEARCH_E2E_FRONTEND_PORT=3200 DEEPRESEARCH_E2E_REUSE_BACKEND=1 DEEPRESEARC
   python3 ../scripts/pnpm.py exec playwright test -c playwright.deepresearch.config.ts
 ```
 
-本次推送前的结果：
+观测与离线交接提交前的结果：
+
+| 检查 | 结果 |
+| --- | --- |
+| `tests/deepresearch` | 153 项通过（含指标 8 项、doctor 3 项、离线模板 3 项、启动器配置 5 项） |
+| DeepResearch 与原生模块集合，加 `tests/test_agent_guidance_check.py` | 420 项通过、1 项失败（`subagents/AGENTS.md` 软上限，宿主已有问题，见下表；该文件与 HEAD 相同） |
+| ruff check / format（DeepResearch） | 通过 |
+| 前端 DeepResearch 单测（`rstest run deepresearch`） | 38 项通过 |
+| `pnpm check`（全前端 ESLint + tsc）与 DeepResearch 文件 Prettier | 通过 |
+| 浏览器端到端 `playwright.deepresearch.config.ts` | 5 项通过；第一项现在还检查“指标”页签的工具调用数与 JSONL 导出 |
+| 离线模板冒烟 | 用离线模板合并出的配置正常启动网关（非验收启动器），`/capabilities` 为 `deerflow`、`ready`；模型地址不可达时 doctor 探测失败、研究在规划阶段报 `NATIVE_AGENT_FAILED`，Trace 中模型节点为 `APIConnectionError` |
+| 模型探测实测 | 对 `deepseek-v4-flash` 运行 `--probe-model`：`ok: true`，普通回复 0.4 秒、工具调用 0.5 秒，返回用量 |
+
+本轮没有重跑后端默认离线全量与前端全量单测；改动只涉及 `backend/deepresearch`、`tests/deepresearch`、前端 DeepResearch 文件与文档。
+
+上次推送前的结果：
 
 | 检查 | 结果 |
 | --- | --- |
@@ -232,6 +296,12 @@ DEEPRESEARCH_E2E_FRONTEND_PORT=3200 DEEPRESEARCH_E2E_REUSE_BACKEND=1 DEEPRESEARC
 - 单 worker SQLite；外部工具至多 at-least-once；两个数据库的备份、保留与日志轮转需要生产方案。
 - 新阅读器、来源与活动面板未在真实手机或 390 px 视口验证；深色主题需要再检查一次。
 - 宿主仓库已有的 AGENTS 指导链超限问题会让 `lint-check` 的指导检查失败，与本功能无关但会出现在 CI 中。
+- 费用只是按 `pricing` 的估算，不是账单；验收配置没有单价，费用未验证过真实金额，只有单元测试覆盖计算。
+- 工具错误类型对“返回错误结果”的情况是按内容粗分（状态码、异常名、空内容），不同工具的错误文本格式不同时可能归入 `ToolReturnedError`。
+- 重复调用只识别参数完全相同的请求；同一页面换 `max_length` 或查询词不算重复，真实的重复浪费可能更高。
+- 提供方不上报用量时，调用只记预留估算且不计入 Token 与费用；DeepSeek 两次验收中未上报调用为 0，其他模型未验证。
+- 离线环境加本地模型、内网知识库的完整研究没有验收过；离线模板只验证了配置合法、网关能启动、模型不可达时的报错。
+  较弱的本地模型在计划、数据整理、引用标记上的失败率未知，调参建议来自代码与联网验收经验，不是离线实测结论。
 
 ## 8. 建议下一步
 
@@ -241,6 +311,10 @@ DEEPRESEARCH_E2E_FRONTEND_PORT=3200 DEEPRESEARCH_E2E_REUSE_BACKEND=1 DEEPRESEARC
 4. 在真实手机与深色主题下复验阅读器、来源抽屉、引用悬浮卡。
 5. 调优耗时：研究并发、补研停止条件、单元数量；考虑发布报告时预热引用域名的网站图标。
 6. 生产运维：多 worker 或外部存储方案、备份与保留策略、故障注入（网络中断、429、5xx、慢工具）。
+7. 按指标调优：给 Jina 配 key 或加退避，降低 `HTTP 429` / `ConnectError`；评估提高研究并发（排队累计过长）；
+   考虑跨 Agent 共享抓取缓存；在研究配置中填写真实模型单价，再用命令行对比多次研究的每条引用成本。
+8. 离线验收：按 [OFFLINE_AGENT_GUIDE.md](OFFLINE_AGENT_GUIDE.md) 接上真实本地模型和内网知识库，完整跑一次研究，
+   记录失败点并据此调整离线模板与模型配置建议。
 
 ## 9. 容易踩坑的地方
 
@@ -259,11 +333,19 @@ DEEPRESEARCH_E2E_FRONTEND_PORT=3200 DEEPRESEARCH_E2E_REUSE_BACKEND=1 DEEPRESEARC
 - 演示后端在 CI 中只安装 `backend/deepresearch/requirements.txt`；报告或演示路径新增第三方依赖时同步更新该清单，本地 uv 环境不会暴露缺失。
 - `/deepresearch-demo` 这类不经过工作区布局的页面必须提供限高父容器，否则研究页面的可调整面板会塌缩。
 - 公司已有 DeerFlow 时，适配原生宿主接口与完整 feature 差异，不要覆盖公司的业务代码、配置、Skills 或认证体系。
+- 指标中的 `null` 表示没有测量，不要当成 0 汇总；新增指标时，历史数据缺字段也要返回 `null`。
+- `request_key`、`error_type` 只用于统计分组，不要据此改变研究流程；`request_key` 是脱敏后参数的哈希，不要改成保存参数原文。
+- 指标写入必须吞掉自身异常，只记日志；不要让观测代码的故障让研究失败。
+- 不要把真实单价写进 `deepresearch.example.yaml`（那里只保留注释示例）；单价属于部署方私有配置。验收启动器恢复时只忽略 `pricing` 的差异，
+  其余字段不一致仍会拒绝恢复。
 
 ## 10. 文档索引
 
 | 文档 | 状态与用途 |
 | --- | --- |
+| [OFFLINE_AGENT_GUIDE.md](OFFLINE_AGENT_GUIDE.md) | 不联网的本地 Agent 开发入口（规则、命令、排错） |
+| [MODEL_CONFIGURATION.md](MODEL_CONFIGURATION.md) / [DEERFLOW_CONFIGURATION.md](DEERFLOW_CONFIGURATION.md) / [RESEARCH_CONFIGURATION.md](RESEARCH_CONFIGURATION.md) | 模型、宿主、研究配置说明 |
+| [LOCAL_AGENT_HANDOFF.md](LOCAL_AGENT_HANDOFF.md) | 本地 / 公司 Agent 的入口页，指向上面的文档 |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | 当前架构与工作流（权威） |
 | [HANDOFF.md](HANDOFF.md) | 当前交接状态（本文） |
 | [API.md](API.md) / [openapi.json](openapi.json) | 当前接口契约 |
@@ -272,4 +354,4 @@ DEEPRESEARCH_E2E_FRONTEND_PORT=3200 DEEPRESEARCH_E2E_REUSE_BACKEND=1 DEEPRESEARC
 | [NATIVE_RUNTIME.md](NATIVE_RUNTIME.md) / [REUSE_AUDIT.md](REUSE_AUDIT.md) | 原生复用专题，仍然有效 |
 | [EXTENDING.md](EXTENDING.md) | 新增研究角度与来源 |
 | [STABILITY_AUDIT_2026-09-16.md](STABILITY_AUDIT_2026-09-16.md) | 2026-09-16 稳定性修复与恢复验收 |
-| [DESIGN_BASELINE.md](DESIGN_BASELINE.md) / [RUNTIME.md](RUNTIME.md) / [VERIFICATION.md](VERIFICATION.md) / [COMPUTER_USE_2026-09-15.md](COMPUTER_USE_2026-09-15.md) / [COMPUTER_USE_2026-09-16.md](COMPUTER_USE_2026-09-16.md) / [LOCAL_AGENT_HANDOFF.md](LOCAL_AGENT_HANDOFF.md) | 历史记录；早期设计与“未完成”结论不能覆盖后来的实现与验收 |
+| [DESIGN_BASELINE.md](DESIGN_BASELINE.md) / [RUNTIME.md](RUNTIME.md) / [VERIFICATION.md](VERIFICATION.md) / [COMPUTER_USE_2026-09-15.md](COMPUTER_USE_2026-09-15.md) / [COMPUTER_USE_2026-09-16.md](COMPUTER_USE_2026-09-16.md) | 历史记录；早期设计与“未完成”结论不能覆盖后来的实现与验收 |

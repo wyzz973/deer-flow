@@ -7,12 +7,15 @@ compaction, loop guards, extension lifecycle and cancellation.
 
 import asyncio
 import json
+import logging
+import time
 from dataclasses import replace
+from uuid import uuid4
 
-from .contracts import ResearchError
+from .contracts import ResearchError, utcnow
 from .evidence import digest
 from .observations import NativeExecution
-from .trace import LocalTrace, model_callbacks, redact
+from .trace import METRIC_KEYS, LocalTrace, metric_scope, model_callbacks, redact
 
 
 def native_thread_id(run, skill_name, unit_id):
@@ -96,13 +99,6 @@ def output_instruction(skill_name, payload):
 
 async def execute_role(settings, store, run, skill_name, payload, tools, agent, context, *, task_id=None):
     from deerflow.config import get_app_config
-    from deerflow.subagents.executor import (
-        SubagentExecutor,
-        SubagentStatus,
-        cleanup_background_task,
-        get_background_task_result,
-        request_cancel_background_task,
-    )
     from deerflow.tools import get_available_tools
 
     spec = settings.skills[skill_name]
@@ -151,9 +147,55 @@ async def execute_role(settings, store, run, skill_name, payload, tools, agent, 
     unit_id = task_id or payload.get("unit", {}).get("id", skill_name)
     child_thread = native_thread_id(run, skill_name, unit_id)
     trace = LocalTrace(store, run["run_id"], settings, (context.get("secrets") or {}).values())
+    scope = {"cycle": run.get("cycle", 0), **(metric_scope.get() or {}), "unit_id": unit_id, "agent_name": role.name, "skill": skill_name, "purpose": "agent"}
+    metrics = {"started_at": utcnow(), "started": time.monotonic(), "status": "failed"}
+    try:
+        return await _execute(settings, store, run, role, payload, candidates, context, trace, scope, metrics, model_name, child_thread, app_config)
+    except asyncio.CancelledError:
+        metrics["status"] = "cancelled"
+        raise
+    except BaseException as exc:
+        metrics.update(status="failed", error_code=getattr(exc, "code", type(exc).__name__))
+        raise
+    finally:
+        await _record_agent_run(store, run, scope, metrics, model_name, child_thread)
+
+
+async def _record_agent_run(store, run, scope, metrics, model_name, thread_id):
+    """One subagent execution: duration, outcome, model and tool usage."""
+    try:
+        totals = getattr(metrics.get("callbacks"), "totals", None) or {}
+        body = {
+            **{key: scope[key] for key in METRIC_KEYS if scope.get(key) is not None},
+            "model": model_name,
+            "thread_id": thread_id,
+            "started_at": metrics["started_at"],
+            "ended_at": utcnow(),
+            "duration_ms": round((time.monotonic() - metrics["started"]) * 1000),
+            "status": metrics["status"],
+            "error_code": metrics.get("error_code"),
+            "stop_reason": metrics.get("stop_reason"),
+            "receipts": metrics.get("receipts", 0),
+            **totals,
+        }
+        await store.record_agent_run(run["run_id"], scope.get("execution_id") or "unsubmitted-" + uuid4().hex, body)
+    except Exception as exc:  # Metrics never change the research outcome.
+        logging.getLogger("deepresearch.audit").warning(json.dumps({"event": "agent_metrics_failed", "error": type(exc).__name__}))
+
+
+async def _execute(settings, store, run, role, payload, candidates, context, trace, scope, metrics, model_name, child_thread, app_config):
+    from deerflow.subagents.executor import (
+        SubagentExecutor,
+        SubagentStatus,
+        cleanup_background_task,
+        get_background_task_result,
+        request_cancel_background_task,
+    )
+
+    unit_id = scope["unit_id"]
     async with trace.span(role.name, "agent", {"unit_id": unit_id, "thread_id": child_thread, "task": payload, "tools": list(candidates)}) as output:
-        scope = {"unit_id": unit_id, "agent_name": role.name}
         callbacks = model_callbacks(trace, metered_tools=list(candidates.values()), model_name=model_name, scope=scope)
+        metrics["callbacks"] = callbacks
         executor = SubagentExecutor(
             config=role,
             tools=list(candidates.values()),
@@ -193,6 +235,7 @@ async def execute_role(settings, store, run, skill_name, payload, tools, agent, 
                     raise ResearchError("NATIVE_AGENT_TIMEOUT", "原生 Agent 执行超时，可从检查点重试")
                 raise ResearchError("NATIVE_AGENT_FAILED", "Native agent failed; inspect the local trace")
             output.update(execution_id=execution_id, result=result.result, stop_reason=result.stop_reason, tool_receipts=result.snapshot_tool_receipts())
+            metrics.update(status="completed", stop_reason=result.stop_reason, receipts=len(result.snapshot_tool_receipts() or []))
             # Capture host envelopes only after the native model/tool loop has
             # finished. Redaction/bounding affects archival copies, never the
             # ToolMessage delivered to the researcher.

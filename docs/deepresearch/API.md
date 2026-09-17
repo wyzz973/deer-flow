@@ -22,6 +22,8 @@ Base: `/api/deepresearch`，由 DeerFlow Gateway 扩展路由提供。生产请�
 | GET | `/{id}/evidences` | 证据目录与 lineage |
 | GET | `/{id}/sources` | 已发现来源与实际调用，分别返回 sources/calls |
 | GET | `/{id}/activity` | 面向用户的研究时间线、实时状态、搜索/阅读计数和用时 |
+| GET | `/{id}/metrics` | 成本与效率汇总：耗时、Token、预估费用、模型/工具调用、子 Agent、效率与分组 |
+| GET | `/{id}/metrics/export` | JSONL：首行汇总，其后逐条模型调用、工具调用、子 Agent 与 span 记录 |
 | GET | `/favicon?domain=example.com` | 网站图标：需登录；200 返回图片，404 表示没有图标（缓存 1 天）或仍在获取（`no-store`），422 表示域名无效 |
 | GET | `/{id}/report?format=json\|md\|html\|docx&version=1` | 指定版本报告/下载；省略 version 为当前完成态报告 |
 | GET | `/{id}/trace?after=0&limit=100` | 本地 trace 分页；limit 1–200 |
@@ -85,6 +87,34 @@ trace 分页返回 `{"trace_id":"...","items":[...],"next_cursor":123}`。导出
 ## 证据语义
 
 `E001` 是报告内部 ID，不是外部文档 ID。`provenance=tool_output` 表示真实原生工具调用，`source_uri=mcp-result://...`；原生文件/沙箱等调用为 `origin=runtime`、`tool-result://...`。raw_content_ref 关联 execution/call。receipt/调用证明来源发生过，不自动证明文档日期、独立性或结论正确。前端和导出必须保留该限定。
+
+## 成本与效率指标
+
+`GET /{id}/metrics` 与导出接口受 owner/ACL 保护，不包含 Trace 载荷或提示词正文。主要字段：
+
+| 字段 | 内容 |
+| --- | --- |
+| `time` | `wall_seconds`、`active_seconds`、`waiting_seconds`、`model_seconds`、`tool_seconds`、`queue_seconds`、`in_progress`、`phases[]` |
+| `tokens` | `input`、`output`、`cache_read`、`reasoning`、`total`、`unreported_calls`、`estimated_unreported`、`cache_read_ratio` |
+| `cost` | `currency`、`total`、`by_currency`、`priced_calls`、`unpriced_models`；未配置 `pricing` 时为空 |
+| `model_calls` | 次数、进行中、错误与错误码、finish reason、延迟 p50/p95、最大上下文 |
+| `tools` | 次数、错误率、`error_types`、延迟、返回字符、搜索与读取、`repeat_calls` / `repeat_calls_same_agent`、`failing_domains`（读取失败最多的 10 个站点及其错误类型）、按工具明细 |
+| `agents` | 子 Agent 执行明细、按角色汇总、失败码、最大并行数 |
+| `units` | 每个研究单元（含补研）的耗时、模型调用、Token、费用、工具调用、搜索、读取页面、原始证据、被引用页面数、每条引用 Token |
+| `budget` | Token、工具调用、时长的上限与已用比例；上限为空表示不限 |
+| `research` / `report` / `cache` | 单元与补研、证据裁剪、转换重试、报告规模与修复、缓存复用 |
+| `efficiency` | 每条引用 Token/费用/计算时长、读取页面与引用比例、每个研究单元搜索次数、重复工具调用占比、转换与失败子 Agent 的 Token 占比 |
+| `breakdown` | `by_phase`、`by_purpose`、`by_skill`、`by_model`、`by_unit`、`by_cycle` |
+
+提供方未上报用量的调用只计次数与预留估算，不计入 Token 合计与费用。费用只是按配置单价的估算，不是账单。
+
+工具错误类型：抛出异常时为异常类名（如 `SSLError`）；工具返回错误结果时按内容粗分为 `HTTP nnn`、异常名（如 `ConnectError`）、
+`EmptyContent` 或 `ToolReturnedError`，只用于统计分组。重复调用指同一工具以完全相同的参数，在一次成功调用之后再次调用；
+参数只以脱敏后的哈希 `request_key` 记录。分页、换查询词、失败后的重试都不算重复。`repeat_calls_same_agent` 是同一次子 Agent
+执行内的重复（结果通常仍在上下文中），其余为跨 Agent 重复（共享缓存可以避免）。
+
+`metered=false` 表示任务早于逐次调用计量：Token 只有预算账本合计（`tokens.total`），输入/输出/缓存、模型调用次数、
+子 Agent、模型与排队累计时间、单元 Token 均为 `null`；早于请求键记录的任务 `repeat_calls` 为 `null`。`null` 表示未测量，不是 0。
 
 ## 网站图标
 

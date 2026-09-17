@@ -5,6 +5,7 @@ import type {
   Capabilities,
   ResearchActivity,
   ResearchEvent,
+  ResearchMetrics,
   ResearchSources,
   Run,
 } from "./types";
@@ -100,6 +101,17 @@ export function researchApi(base = "") {
       const a = document.createElement("a");
       a.href = url;
       a.download = `research-${id}-trace.jsonl`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    },
+    metrics: (id: string) =>
+      json<ResearchMetrics>(`/${encodeURIComponent(id)}/metrics`),
+    async downloadMetrics(id: string) {
+      const res = await response(`/${encodeURIComponent(id)}/metrics/export`);
+      const url = URL.createObjectURL(await res.blob());
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `research-${id}-metrics.jsonl`;
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     },

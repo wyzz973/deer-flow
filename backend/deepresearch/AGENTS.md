@@ -49,6 +49,24 @@ at the repository root; update it with any change to nodes, events, contracts or
   time, identifies raster images by signature (never SVG/HTML) and caches hits
   and misses in `research_favicon`. A slow site returns a `no-store` pending 404
   and finishes in the background. `favicons: false` disables all fetching.
+- Metrics (`research_model_call`, `research_agent_run`, tool `output_chars`, `queued_ms`,
+  `metrics.cache_hit`) are recorded beside execution and summarized by `metrics.py`.
+  A metrics write must never raise into research. Keep phase attribution via
+  `trace.metric_scope` (set in `traced()`), normalize usage with `usage_details`,
+  leave unknown usage empty with `usage_reported=false`, and never invent prices:
+  `pricing` is operator configuration excluded from the fingerprint and from the
+  acceptance launcher's resume comparison. Tool records
+  add `request_key` (a hash of redacted arguments, never the arguments) and
+  `error_type` (exception class, or the coarse `returned_error_type` label for an
+  error result). These labels only group metrics; never branch research on them.
+- `doctor.py` checks configuration without calling models; only `--probe-model NAME`
+  sends two short requests (a plain reply and a tool call) through the host model
+  factory with thinking disabled. Pass the loaded `AppConfig` to registry lookups:
+  the global subagent config stays empty until something loads it.
+- Offline templates in `examples/deepresearch/offline/` are validated by
+  `tests/deepresearch/test_offline_config.py`; keep them consistent with each other.
+  With `require_dual_source: false`, `Settings.fit_origins` drops planned origins no
+  configured source serves, because weak planners keep the internal+external default.
 - Report messages retain immutable versions. A historical card must request its
   own `version` when exporting, not silently download the latest report.
 - `SourceSpec.kind` selects either the existing MCP cache or native host tools.

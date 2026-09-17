@@ -484,6 +484,86 @@
         }
       }
     },
+    "/api/deepresearch/{run_id}/metrics": {
+      "get": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Research Metrics",
+        "operationId": "research_metrics_api_deepresearch__run_id__metrics_get",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/deepresearch/{run_id}/metrics/export": {
+      "get": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Export Metrics",
+        "operationId": "export_metrics_api_deepresearch__run_id__metrics_export_get",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/deepresearch/{run_id}/plan/edit": {
       "post": {
         "tags": [

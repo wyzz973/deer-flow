@@ -60,8 +60,18 @@ async def test_roles_use_native_executor_with_scoped_tools_and_credentials(setti
     await store.start()
     run = {"run_id": "r", "thread_id": "dr-r", "owner": "alice"}
     await store.create(run, "k", "h")
-    reply = await execute_role(settings, store, run, "technical-route", {"unit": {"id": "R1"}}, [], Agent(), {"secrets": {"research_cookie": "private-value"}, "user_role": "member"})
+    from deepresearch.trace import metric_scope
+
+    token = metric_scope.set({"phase": "dispatch", "cycle": 0})
+    try:
+        reply = await execute_role(settings, store, run, "technical-route", {"unit": {"id": "R1"}}, [], Agent(), {"secrets": {"research_cookie": "private-value"}, "user_role": "member"})
+    finally:
+        metric_scope.reset(token)
     assert reply.answer == "ordinary prose"
+    # Each native execution leaves one metrics record, even with stub callbacks.
+    (agent_run,) = await store.agent_runs("r")
+    assert agent_run == {**agent_run, "id": "native-execution", "phase": "dispatch", "skill": "technical-route", "unit_id": "R1", "purpose": "agent", "status": "completed", "agent_name": "technical-researcher"}
+    assert agent_run["duration_ms"] >= 0 and agent_run["model"] == "local-chat"
     assert reply.execution_id == "native-execution"
     assert captured["thread_id"] == native_thread_id(run, "technical-route", "R1")
     assert captured["user_id"] == "alice"

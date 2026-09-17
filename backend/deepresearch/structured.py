@@ -69,7 +69,9 @@ async def convert_answer(runner, run, skill_name, payload, schema, answer, conte
         {"role": "user", "content": json.dumps({"answer": answer, "task": payload}, ensure_ascii=False)},
     ]
     async with trace.span("contract:" + schema.__name__, "conversion") as output:
-        callbacks = model_callbacks(trace, model_name=model_name)
+        unit = payload.get("unit") if isinstance(payload.get("unit"), dict) else {}
+        scope = {"purpose": "conversion", "skill": skill_name, "contract": schema.__name__, **({"unit_id": unit["id"]} if unit.get("id") else {})}
+        callbacks = model_callbacks(trace, model_name=model_name, scope=scope)
         for attempt in range(settings.output_retries + 1):
             try:
                 response = await asyncio.wait_for(model.ainvoke(messages, config={"callbacks": [callbacks]}), timeout=spec.timeout_seconds)

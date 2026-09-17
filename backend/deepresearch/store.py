@@ -91,6 +91,12 @@ class Store:
               body TEXT NOT NULL, PRIMARY KEY(run_id,id));
             CREATE TABLE IF NOT EXISTS research_favicon (
               domain TEXT PRIMARY KEY, content_type TEXT, body BLOB, fetched_at REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS research_model_call (
+              run_id TEXT NOT NULL REFERENCES research_run(id), id TEXT NOT NULL,
+              body TEXT NOT NULL, PRIMARY KEY(run_id,id));
+            CREATE TABLE IF NOT EXISTS research_agent_run (
+              run_id TEXT NOT NULL REFERENCES research_run(id), id TEXT NOT NULL,
+              body TEXT NOT NULL, PRIMARY KEY(run_id,id));
             PRAGMA user_version=1;
             """)
 
@@ -234,6 +240,55 @@ class Store:
                     merged.update(title=source["title"], title_observed=True)
                 db.execute("INSERT INTO research_source VALUES (?,?,?) ON CONFLICT(run_id,id) DO UPDATE SET body=excluded.body", (run_id, source["id"], dumps(merged)))
             return call
+
+        return await self.call(op)
+
+    async def _merge_record(self, table, run_id, record_id, details):
+        def op(db):
+            old = db.execute(f"SELECT body FROM {table} WHERE run_id=? AND id=?", (run_id, record_id)).fetchone()
+            record = {**(json.loads(old[0]) if old else {}), "id": record_id, **details}
+            db.execute(f"INSERT INTO {table} VALUES (?,?,?) ON CONFLICT(run_id,id) DO UPDATE SET body=excluded.body", (run_id, record_id, dumps(record)))
+            return record
+
+        return await self.call(op)
+
+    async def _records(self, table, run_id):
+        return await self.call(lambda db: [json.loads(row[0]) for row in db.execute(f"SELECT body FROM {table} WHERE run_id=? ORDER BY rowid", (run_id,))])
+
+    async def record_model_call(self, run_id, call_id, details):
+        """Metrics for one model request, merged across its start and end."""
+        return await self._merge_record("research_model_call", run_id, call_id, details)
+
+    async def model_calls(self, run_id):
+        return await self._records("research_model_call", run_id)
+
+    async def record_agent_run(self, run_id, execution_id, details):
+        """Metrics for one native subagent execution."""
+        return await self._merge_record("research_agent_run", run_id, execution_id, details)
+
+    async def agent_runs(self, run_id):
+        return await self._records("research_agent_run", run_id)
+
+    async def unit_results(self, run_id):
+        return await self.call(lambda db: [{"id": row[0], "result": json.loads(row[1])} for row in db.execute("SELECT id, result FROM research_unit WHERE run_id=? ORDER BY rowid", (run_id,))])
+
+    async def span_timings(self, run_id, kinds=("workflow", "node")):
+        """Span timings of the given kinds without payloads; open spans have no duration."""
+        marks = ",".join("?" for _ in kinds)
+
+        def op(db):
+            rows = db.execute(
+                "SELECT json_extract(body, '$.type'), json_extract(body, '$.at'), json_extract(body, '$.data.span_id'), json_extract(body, '$.data.kind'), "
+                "json_extract(body, '$.data.name'), json_extract(body, '$.data.status'), json_extract(body, '$.data.duration_ms') "
+                f"FROM research_event WHERE run_id=? AND json_extract(body, '$.type') IN ('trace.started', 'trace.ended') AND json_extract(body, '$.data.kind') IN ({marks}) ORDER BY seq",
+                (run_id, *kinds),
+            )
+            spans = {}
+            for kind, at, span_id, span_kind, name, status, duration in rows:
+                entry = spans.setdefault(span_id, {"kind": span_kind, "name": name, "status": "running", "duration_ms": None, "at": at})
+                if kind == "trace.ended":
+                    entry.update(status=status, duration_ms=duration, at=at)
+            return list(spans.values())
 
         return await self.call(op)
 

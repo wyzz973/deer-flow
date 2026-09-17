@@ -304,3 +304,222 @@ export function mergeEvents(
   if (old.some((e) => e.seq === incoming.seq)) return old;
   return [...old, incoming].sort((a, b) => a.seq - b.seq).slice(-100);
 }
+
+export type LatencySummary = {
+  count: number;
+  avg: number | null;
+  p50: number | null;
+  p95: number | null;
+  max: number | null;
+};
+/** Token, time, call and cost totals for one breakdown key (phase, model, unit…). */
+export type MetricGroup = {
+  key: string;
+  model_calls: number;
+  model_errors: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  reasoning_tokens: number;
+  total_tokens: number;
+  model_ms: number;
+  cost: number | null;
+  priced_calls: number;
+  tool_calls: number;
+  tool_errors: number;
+  tool_ms: number;
+};
+export type AgentRunMetric = {
+  id: string;
+  skill: string | null;
+  agent_name: string | null;
+  unit_id: string | null;
+  phase: string | null;
+  cycle: number | null;
+  status: string;
+  error_code: string | null;
+  stop_reason: string | null;
+  model_calls: number | null;
+  tool_calls: number | null;
+  tool_errors: number | null;
+  max_input_tokens: number | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  cache_read_tokens: number | null;
+  reasoning_tokens: number | null;
+  total_tokens: number | null;
+  seconds: number | null;
+  cost: number | null;
+};
+/** What one research unit cost and contributed to the report. */
+export type UnitOutcomeMetric = {
+  unit_id: string;
+  title: string | null;
+  skill: string | null;
+  supplement: boolean;
+  failed: boolean;
+  seconds: number | null;
+  /** Null for runs from before per-call metering. */
+  model_calls: number | null;
+  total_tokens: number | null;
+  cost: number | null;
+  tool_calls: number;
+  searches: number;
+  pages_read: number;
+  evidence: number;
+  citations: number;
+  tokens_per_citation: number | null;
+};
+/** Cost and efficiency of one research run (GET /metrics). */
+export type ResearchMetrics = {
+  run_id: string;
+  status: string;
+  generated_at: string;
+  /** False for runs from before per-call metering: only ledger totals exist. */
+  metered: boolean;
+  time: {
+    wall_seconds: number | null;
+    active_seconds: number | null;
+    waiting_seconds: number | null;
+    model_seconds: number | null;
+    tool_seconds: number | null;
+    queue_seconds: number | null;
+    in_progress: boolean;
+    phases: { phase: string; seconds: number; runs: number; errors: number }[];
+  };
+  tokens: {
+    input: number | null;
+    output: number | null;
+    cache_read: number | null;
+    reasoning: number | null;
+    total: number;
+    unreported_calls: number | null;
+    estimated_unreported: number | null;
+    cache_read_ratio: number | null;
+  };
+  cost: {
+    currency: string | null;
+    total: number | null;
+    by_currency: Record<string, number>;
+    priced_calls: number;
+    unpriced_models: string[];
+  };
+  model_calls: {
+    count: number | null;
+    running: number | null;
+    errors: number | null;
+    error_codes: Record<string, number>;
+    finish_reasons: Record<string, number>;
+    latency_ms: LatencySummary;
+    max_input_tokens: number | null;
+  };
+  tools: {
+    count: number;
+    errors: number;
+    error_rate: number | null;
+    /** Exception class, `HTTP nnn`, `EmptyContent` or `ToolReturnedError`. */
+    error_types: Record<string, number>;
+    latency_ms: LatencySummary;
+    output_chars: number;
+    searches: number;
+    reads: number;
+    read_errors: number;
+    pages_read: number;
+    /** Identical requests (same tool and arguments) after one succeeded. */
+    /** Null for runs recorded before request keys existed. */
+    repeat_calls: number | null;
+    repeat_calls_same_agent: number | null;
+    failing_domains: {
+      domain: string;
+      reads: number;
+      errors: number;
+      error_types: Record<string, number>;
+    }[];
+    by_tool: {
+      tool: string;
+      role: string | null;
+      count: number;
+      errors: number;
+      error_types: Record<string, number>;
+      repeats: number | null;
+      latency_ms: LatencySummary;
+      output_chars: number;
+    }[];
+  };
+  agents: {
+    count: number | null;
+    completed: number | null;
+    failed: number | null;
+    cancelled: number | null;
+    failure_codes: Record<string, number>;
+    max_parallel: number | null;
+    by_skill: {
+      skill: string;
+      count: number;
+      failed: number;
+      seconds: number | null;
+      avg_seconds: number | null;
+      model_calls: number;
+      tool_calls: number;
+      total_tokens: number;
+      cost: number | null;
+    }[];
+    runs: AgentRunMetric[];
+  };
+  research: {
+    planned_units: number;
+    supplement_units: number;
+    iterations: number;
+    failed_units: number;
+    raw_evidence: number;
+    evidence_pool: number | null;
+    trimmed_evidence: number;
+    pruned_references: number;
+    conversion_retries: number;
+    deferred_supplements: number;
+  };
+  units: UnitOutcomeMetric[];
+  /** Share of each run limit consumed; a null maximum is unlimited. */
+  budget: {
+    max_model_tokens: number | null;
+    model_tokens_used: number | null;
+    max_tool_calls: number | null;
+    tool_calls_used: number | null;
+    max_elapsed_seconds: number | null;
+    elapsed_used: number | null;
+  };
+  report: {
+    versions: number;
+    characters: number;
+    sections: number;
+    tables: number;
+    diagrams: number;
+    citations: number;
+    cited_domains: number;
+    draft_repairs: number;
+    dropped_statements: number;
+    validation_retries: number;
+  };
+  cache: { hits: number; by_kind: Record<string, number> };
+  efficiency: {
+    tokens_per_citation: number | null;
+    cost_per_citation: number | null;
+    active_seconds_per_citation: number | null;
+    pages_read_per_citation: number | null;
+    citations_per_page_read: number | null;
+    searches_per_unit: number | null;
+    repeat_tool_call_ratio: number | null;
+    tokens_per_report_char: number | null;
+    conversion_token_share: number | null;
+    failed_agent_token_share: number | null;
+    cache_read_ratio: number | null;
+  };
+  breakdown: {
+    by_phase: MetricGroup[];
+    by_purpose: MetricGroup[];
+    by_skill: MetricGroup[];
+    by_model: MetricGroup[];
+    by_unit: MetricGroup[];
+    by_cycle: MetricGroup[];
+  };
+};

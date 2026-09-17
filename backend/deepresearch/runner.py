@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Protocol
@@ -428,6 +429,7 @@ class DeerFlowRunner:
         key = "native-unit:" + digest([run.get("cycle", 0), unit.model_dump(mode="json"), dependencies])
         cached = await self.store.cached(run["run_id"], key)
         if cached is not None:
+            await self.store.event(run["run_id"], "metrics.cache_hit", {"kind": "native-unit", "unit_id": unit.id})
             execution = NativeExecution(**cached)
         else:
             async with self._source_tools(run, sources) as tool_map:
@@ -611,6 +613,7 @@ class DeerFlowRunner:
         outline_key = "report-outline:" + digest([run.get("cycle", 0), generation, outline_payload])
         cached = await self.store.cached(run["run_id"], outline_key)
         if cached is not None:
+            await self.store.event(run["run_id"], "metrics.cache_hit", {"kind": "report-outline"})
             outline = ReportOutline.model_validate(cached)
         else:
             outline = await self._json(run, "report-synthesis", outline_payload, ReportOutline, validator=coverage, repair=tidy, task_id="report-outline")
@@ -639,11 +642,14 @@ class DeerFlowRunner:
                 "instructions": SECTION_INSTRUCTIONS,
             }
             key = "report-section:" + digest([outline_key, index, payload])
+            queued = time.monotonic()
             async with semaphore:
                 cached = await self.store.cached(run["run_id"], key)
                 if cached is not None:
+                    await self.store.event(run["run_id"], "metrics.cache_hit", {"kind": "report-section", "index": index})
                     return cached
-                await self.store.event(run["run_id"], "report.section.started", {"index": index, "heading": section.heading})
+                queued_ms = round((time.monotonic() - queued) * 1000)
+                await self.store.event(run["run_id"], "report.section.started", {"index": index, "heading": section.heading, "queued_ms": queued_ms})
                 body, audit = await self._markdown(run, payload, set(ids), task_id=f"report-section-{index}", heading=section.heading)
                 value = {"heading": section.heading, "body": body, "audit": audit}
                 await self.store.cache(run["run_id"], key, value)
@@ -669,6 +675,8 @@ class DeerFlowRunner:
         }
         summary_key = "report-summary:" + digest([outline_key, summary_payload])
         summary = await self.store.cached(run["run_id"], summary_key)
+        if summary is not None:
+            await self.store.event(run["run_id"], "metrics.cache_hit", {"kind": "report-summary"})
         if summary is None:
             body, audit = await self._markdown(run, summary_payload, set(cited), task_id="report-summary")
             summary = {"body": body, "audit": audit}

@@ -61,6 +61,15 @@ max_report_sections: 8
 # raster images only, cached) so browsers never contact cited sites. Set false
 # without outbound access; the UI then shows letter badges.
 favicons: true
+# Estimated research cost (metrics tab, /metrics API and `python -m deepresearch.metrics`).
+# Enter official list prices per million tokens for each model name the research
+# roles use; nothing is assumed and prices are excluded from the config fingerprint.
+# pricing:
+#   your-model-name:
+#     input_per_million: 0.0
+#     cached_input_per_million: 0.0   # optional prompt-cache hit price
+#     output_per_million: 0.0
+#     currency: USD
 budget_ceiling:
   max_iterations: 2
   max_units: 12

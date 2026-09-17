@@ -65,3 +65,16 @@ def test_code_only_resume_preserves_config_and_rejects_config_drift(tmp_path):
     with pytest.raises(ValueError, match="configuration changed"):
         _write_yaml(path, {"model": "different"}, reuse=True)
     assert path.read_bytes() == original
+
+
+def test_resume_accepts_prices_added_to_the_private_config(tmp_path):
+    import pytest
+    import yaml
+
+    path = tmp_path / "research.yaml"
+    _write_yaml(path, {"model": "configured"})
+    path.write_text(path.read_text(encoding="utf-8") + "pricing:\n  flash:\n    input_per_million: 1.0\n    output_per_million: 2.0\n", encoding="utf-8")
+    _write_yaml(path, {"model": "configured"}, reuse=True, operator_keys=("pricing",))
+    assert yaml.safe_load(path.read_text(encoding="utf-8"))["pricing"]["flash"]["output_per_million"] == 2.0
+    with pytest.raises(ValueError, match="configuration changed"):
+        _write_yaml(path, {"model": "different"}, reuse=True, operator_keys=("pricing",))

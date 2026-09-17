@@ -20,6 +20,9 @@
 
 详细说明：[设计与原生能力复用](docs/deepresearch/NATIVE_RUNTIME.md) · [逐步评审记录](docs/deepresearch/REUSE_AUDIT.md) · [API](docs/deepresearch/API.md) · [公司 Agent 交接](docs/deepresearch/HANDOFF.md)
 
+配置说明：[模型配置](docs/deepresearch/MODEL_CONFIGURATION.md) · [DeerFlow 宿主配置](docs/deepresearch/DEERFLOW_CONFIGURATION.md) · [研究配置](docs/deepresearch/RESEARCH_CONFIGURATION.md)。
+不联网的环境（本地模型、内网知识库）从 [离线开发交接](docs/deepresearch/OFFLINE_AGENT_GUIDE.md) 开始，模板在 `examples/deepresearch/offline/`。
+
 ## 接入已有 DeerFlow
 
 1. 合并 `examples/deepresearch/host-config.fragment.yaml` 到本地 `config.yaml`，保留原模型、其他 Agent 与插件配置。
@@ -74,6 +77,8 @@ Researcher 使用原生预算预警提前收尾，为其他单元和综合报告
 PYTHONPATH=backend python -m deepresearch.doctor --config deepresearch.local.yaml
 ```
 
+加 `--probe-model 模型名` 时，会对该模型发一次普通请求和一次工具调用，报告是否支持工具调用、是否返回用量、上下文是否过小；失败时退出码为 1。
+
 已配置模型的开发机可用隔离的原生 Gateway 验收启动器，不覆盖现有配置或数据库：
 
 ```sh
@@ -109,6 +114,34 @@ request_secret_headers:
 - `research.log`：不含原始 prompt/header 的运行元数据，5 MiB 轮转、3 个备份。
 
 `trace_capture_content: false` 可关闭明细采集；`trace_max_chars` 限制单条载荷长度。已知凭据与敏感字段被脱敏，不采集隐藏推理块。数据仍可能包含业务内容，必须按私有应用数据保护；当前 Trace 无自动 TTL。
+
+## 成本与效率
+
+研究侧栏的“指标”页签显示一次研究的实际计算与总时长、各阶段耗时与并行累计的模型/工具/排队时间、Token（输入、输出、缓存命中）、
+预估费用与预算使用、模型与工具调用（次数、失败原因、延迟、重复调用）、读取失败最多的站点、每个研究单元的消耗与被引用页面数、
+子 Agent（完成、失败、并行度、每次执行的耗时与 Token）以及效率指标（每条引用的 Token、费用和计算时长，读取页面到引用的转化，
+格式转换与失败执行的 Token 占比，缓存复用）。
+“导出指标”下载 JSONL，包含汇总与每条原始记录。
+
+在研究配置中填写模型单价后才显示费用（单价不影响已有任务的恢复；真实验收时写在数据目录的 `research.yaml`，重启网关生效）：
+
+```yaml
+pricing:
+  your-model-name:
+    input_per_million: 0.0
+    cached_input_per_million: 0.0
+    output_per_million: 0.0
+    currency: USD
+```
+
+离线对比多次研究：
+
+```sh
+cd backend
+uv run --no-sync python -m deepresearch.metrics --data-dir ../.deerflow/deepresearch/research --format table
+uv run --no-sync python -m deepresearch.metrics --data-dir ../.deerflow/deepresearch/research --config ../deepresearch.local.yaml --format csv > research-metrics.csv
+uv run --no-sync python -m deepresearch.metrics --data-dir ../.deerflow/deepresearch/research --run RUN_ID --format jsonl
+```
 
 ## 演示与验收
 
