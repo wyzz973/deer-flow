@@ -46,6 +46,7 @@ export function SiteIcon({
   if (HOSTNAME.test(host) && (phase === "first" || phase === "retry")) {
     return (
       <span
+        aria-hidden
         className={cn(
           "flex size-5 shrink-0 items-center justify-center overflow-hidden rounded-full bg-white ring-1 ring-black/10 dark:ring-white/15",
           className,
@@ -70,6 +71,7 @@ export function SiteIcon({
   }
   return (
     <span
+      aria-hidden
       className={cn(
         "bg-muted text-muted-foreground flex size-5 shrink-0 items-center justify-center rounded-full text-[10px] font-medium uppercase",
         className,

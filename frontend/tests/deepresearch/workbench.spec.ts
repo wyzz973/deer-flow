@@ -16,7 +16,7 @@ async function submitQuestion(
   return url.searchParams.get("run") ?? url.pathname.split("/").at(-1)!;
 }
 
-async function finishResearch(page: Page) {
+async function startResearch(page: Page) {
   await page.getByRole("button", { name: /^开始研究/ }).click();
   await expect(page.locator('[aria-label="研究报告预览"]')).toBeVisible();
 }
@@ -30,32 +30,48 @@ for (const entry of ["/deepresearch-demo", "/workspace/deepresearch"]) {
     await expect(
       page.getByRole("textbox", { name: "研究问题", exact: true }),
     ).toHaveCount(0);
+
+    // Editing pauses the server-owned countdown and survives a reload.
     await page.getByRole("button", { name: "编辑", exact: true }).click();
     await expect(
-      page.getByRole("button", { name: "修改中", exact: true }),
-    ).toBeDisabled();
+      page.getByRole("button", { name: "编辑", exact: true }),
+    ).toHaveAttribute("aria-pressed", "true");
     await page.reload();
     await expect(
-      page.getByRole("button", { name: "修改中", exact: true }),
-    ).toBeDisabled();
+      page.getByRole("button", { name: "编辑", exact: true }),
+    ).toHaveAttribute("aria-pressed", "true");
+
+    // A conversational revision is acknowledged and starts research at once.
     await page
       .getByRole("textbox", { name: "研究消息", exact: true })
       .fill("只关注并发与运维，优先官方资料");
     await page.getByRole("button", { name: "发送消息", exact: true }).click();
     await expect(
-      page.locator("summary").filter({ hasText: "计划已更新" }),
+      page.getByText(
+        "演示：已按你的要求调整计划——只关注并发与运维，优先官方资料",
+      ),
     ).toBeVisible();
     await expect(
-      page.getByRole("button", { name: "编辑", exact: true }),
+      page.locator("summary").filter({ hasText: "计划已更新" }),
     ).toBeVisible();
+    await expect(page.locator('[aria-label="研究报告预览"]')).toBeVisible();
     expect(page.url()).toContain(id);
-    await finishResearch(page);
-    await page.getByRole("button", { name: "展开报告", exact: true }).click();
+
+    await page
+      .getByRole("button", { name: "全屏阅读报告", exact: true })
+      .click();
     const reader = page.locator("[data-research-report-reader]");
     const citation = reader
       .getByRole("button", { name: "查看引用 1", exact: true })
       .first();
     const evidenceId = await citation.getAttribute("data-evidence-id");
+    // Hovering a citation floats the excerpt it was cited for.
+    await citation.hover();
+    await expect(
+      page
+        .locator("[data-slot=hover-card-content]")
+        .filter({ hasText: "合成测试证据" }),
+    ).toBeVisible();
     await citation.click();
     await expect(
       page.getByRole("tab", { name: "来源", exact: true }),
@@ -82,17 +98,11 @@ for (const entry of ["/deepresearch-demo", "/workspace/deepresearch"]) {
       `research-${id}.md`,
     );
 
-    await page.getByRole("button", { name: "来源与活动", exact: true }).click();
-    await page.getByRole("button", { name: "来源与活动", exact: true }).click();
+    await page.getByRole("tab", { name: /^活动/ }).click();
     await expect(
-      page.getByRole("heading", {
-        name: "研究活动 · 4 次工具调用",
-        exact: true,
-      }),
+      page.getByRole("heading", { name: "研究活动", exact: true }),
     ).toBeVisible();
-    await expect(
-      page.getByText("example.invalid", { exact: false }).first(),
-    ).toBeVisible();
+    await page.getByRole("button", { name: "关闭报告", exact: true }).click();
     await page.getByRole("button", { name: "查看 Trace", exact: true }).click();
     await expect(page.locator('[aria-label="Trace 时间轴"]')).toBeVisible();
     await page
@@ -161,15 +171,12 @@ test("native workspace history and research details work on mobile", async ({
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/workspace/deepresearch");
   const id = await submitQuestion(page, "移动端研究验收");
-  await finishResearch(page);
+  await startResearch(page);
   await page.getByRole("button", { name: "来源与活动", exact: true }).click();
   const details = page.getByRole("dialog", { name: "研究详情", exact: true });
   await expect(details).toBeVisible();
   await expect(
-    details.getByRole("heading", {
-      name: "研究活动 · 4 次工具调用",
-      exact: true,
-    }),
+    details.getByRole("heading", { name: "研究活动", exact: true }),
   ).toBeVisible();
   await expect
     .poll(() =>
@@ -184,18 +191,20 @@ test("native workspace history and research details work on mobile", async ({
   await details
     .getByRole("button", { name: "关闭研究详情", exact: true })
     .click();
-  await page.getByRole("button", { name: "展开报告", exact: true }).click();
+  await page.getByRole("button", { name: "全屏阅读报告", exact: true }).click();
   const reference = page
     .locator("[data-research-report-reader]")
     .getByRole("button", { name: "查看引用 1", exact: true })
     .first();
   await reference.click();
+  // Leave the chip so its hover card cannot cover the drawer.
+  await page.mouse.move(0, 0);
   await details
     .getByRole("button", { name: "回到正文引用 1", exact: true })
     .click();
   await expect(details).toBeHidden();
   await expect(reference).toBeInViewport();
-  await page.getByRole("button", { name: "返回研究对话", exact: true }).click();
+  await page.getByRole("button", { name: "关闭报告", exact: true }).click();
   await page
     .getByRole("button", { name: "Toggle Sidebar", exact: true })
     .click();

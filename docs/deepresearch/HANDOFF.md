@@ -12,11 +12,11 @@
 | 本机目录 | `/Users/sd3/Desktop/project/deer-flow` |
 | 本地分支 | `feat/deepresearch` |
 | 远端分支 | `origin/feat/deepresearch-v1-fullstack-20260914`（不是同名远端分支） |
-| 上一次推送 | `5fa0299c` `feat(deepresearch): unify native research chat and harden workflow recovery` |
-| 本次提交 | 对标 ChatGPT 深度研究的完整改造，与本文、[ARCHITECTURE.md](ARCHITECTURE.md) 一起推送到上面的远端分支；哈希以 `git log` 为准 |
+| 已推送提交 | `eb3ce656` 对标 ChatGPT 深度研究的完整改造与本文、[ARCHITECTURE.md](ARCHITECTURE.md)；其后的提交修复浏览器端到端测试与 CI 依赖。以 `git log` 为准 |
+| 更早的基线 | `5fa0299c` `feat(deepresearch): unify native research chat and harden workflow recovery` |
 | 功能状态 | 交互、工作流、报告与前端改造完成；三次真实 DeepSeek 研究端到端完成 |
 | 本次回归 | 见第 6 节 |
-| 未验证 | 远端 CI、干净克隆部署、生产构建、公司 MCP 与 SSO、真实手机视口、报告事实逐条核验 |
+| 未验证 | 干净克隆部署、生产构建、公司 MCP 与 SSO、真实手机视口、报告事实逐条核验；远端 CI 以 GitHub Actions 结果为准 |
 
 **务必保留用户原有的本地修改：**
 `backend/packages/harness/deerflow/community/aio_sandbox/local_backend.py`。
@@ -73,9 +73,15 @@
 - 网站图标由 Gateway 代取（`/api/deepresearch/favicon`，`favicons.py`）：公网地址校验、只接受位图、缓存，失败时显示首字母。
 - SSE 返回 `Cache-Control: no-store, no-transform`，修复 Next 开发代理 gzip 缓冲导致页面停在“执行中”。
 
-**仓库卫生**
+**仓库卫生与 CI**
 - `.github/workflows/deepresearch.yml` 的 `setup-uv` 固定为生产使用的 uv `0.11.1`（`test_ci_uv_version_pin.py`）。
 - `backend/deepresearch/AGENTS.md` 登记到 `test_agent_guidance_check.py` 的允许清单。
+- 浏览器端到端测试（`frontend/tests/deepresearch/workbench.spec.ts`）按新交互改写：编辑状态、对话修改直接开始、
+  全屏阅读、引用悬浮原文片段、来源与活动页签、Trace、移动端抽屉与侧栏历史。
+- `/deepresearch-demo` 页面补上与工作区相同的限高框架（`SidebarProvider h-screen` + `SidebarInset`）。此前面板组只有约 104 px 高，
+  输入框在视口外，这是 09-16 起 CI 端到端测试失败的原因。
+- `backend/deepresearch/requirements.txt` 补充 `markdown-it-py`。CI 的演示后端只安装该清单，缺少它时报告渲染失败（已在同等环境复现）。
+- 网站图标的首字母徽标与图片标为装饰性（`aria-hidden`），不改变域名标题的可读名称。
 
 ## 4. 真实验收
 
@@ -174,6 +180,22 @@ python3 ../scripts/pnpm.py test
 python3 ../scripts/pnpm.py check
 ```
 
+浏览器端到端（配置默认前端端口 3000；本机 3000 被占用时改用其他端口，并先自行启动演示后端与前端）：
+
+```bash
+# 仓库根：演示后端（合成数据，端口必须是 8022）
+cd backend && DEEPRESEARCH_DEMO_DATA_DIR=.deerflow/deepresearch/e2e DEEPRESEARCH_DEMO_FRONTEND_PORT=3200 \
+  DEEPRESEARCH_DEMO_PLAN_COUNTDOWN=5 DEEPRESEARCH_DEMO_STEP_DELAY=0.2 \
+  uv run --no-sync python -m uvicorn deepresearch.demo:app --host 127.0.0.1 --port 8022
+# frontend/：测试用前端（同一目录不能同时运行两个 next dev）
+SKIP_ENV_VALIDATION=1 DEER_FLOW_AUTH_DISABLED=1 DEER_FLOW_ENV=development \
+  NEXT_PUBLIC_BACKEND_BASE_URL=http://127.0.0.1:8022 \
+  python3 ../scripts/pnpm.py exec next dev --hostname 127.0.0.1 --port 3200
+# frontend/：运行测试
+DEEPRESEARCH_E2E_FRONTEND_PORT=3200 DEEPRESEARCH_E2E_REUSE_BACKEND=1 DEEPRESEARCH_E2E_REUSE_FRONTEND=1 \
+  python3 ../scripts/pnpm.py exec playwright test -c playwright.deepresearch.config.ts
+```
+
 本次推送前的结果：
 
 | 检查 | 结果 |
@@ -184,6 +206,7 @@ python3 ../scripts/pnpm.py check
 | 前端 DeepResearch 相关单测 | 39 项通过 |
 | 前端全量单测 `pnpm test` | 1325 项通过 |
 | `pnpm check`（全前端 ESLint + tsc） | 通过 |
+| 浏览器端到端 `playwright.deepresearch.config.ts` | 5 项通过；重复两轮 10 项通过；另用只安装 `requirements.txt` 的干净环境启动演示后端再次 5 项通过 |
 
 后端全量的 7 项失败：
 
@@ -195,7 +218,7 @@ python3 ../scripts/pnpm.py check
 | `test_aio_sandbox_local_backend.py::test_start_container_hardens_docker_run_by_default` | `cap_add` 多出重复的 `FOWNER`，来自用户未提交的 `local_backend.py` 修改 | 未修改，也不提交该文件 |
 | `test_sandbox_orphan_reconciliation_e2e.py` 三项 | 全量运行时与验收网关的 AIO 容器同时存在，Docker 端到端测试受干扰 | 单独重跑全部通过 |
 
-未运行：`make test-blocking-io`、`make test-live`、前端生产构建、远端 CI。单元测试使用伪造提供方，只证明适配与生命周期行为，
+未运行：`make test-blocking-io`、`make test-live`、前端生产构建。远端 CI 结果见 GitHub Actions 的 “DeepResearch full-stack checks”。单元测试使用伪造提供方，只证明适配与生命周期行为，
 不能代替真实研究与浏览器验收。
 
 ## 7. 残余风险与未验证项
@@ -233,6 +256,8 @@ python3 ../scripts/pnpm.py check
 - SSE 响应头必须保留 `no-transform`，否则压缩代理会缓冲进度事件。
 - 新增会让研究“直接开始”的路径时，确认运行快照（`units`、状态）在不经过中断处理时也被写入。
 - 全量后端测试时如果验收网关与 AIO 容器仍在运行，Docker 端到端测试可能被干扰；判断失败前单独重跑。
+- 演示后端在 CI 中只安装 `backend/deepresearch/requirements.txt`；报告或演示路径新增第三方依赖时同步更新该清单，本地 uv 环境不会暴露缺失。
+- `/deepresearch-demo` 这类不经过工作区布局的页面必须提供限高父容器，否则研究页面的可调整面板会塌缩。
 - 公司已有 DeerFlow 时，适配原生宿主接口与完整 feature 差异，不要覆盖公司的业务代码、配置、Skills 或认证体系。
 
 ## 10. 文档索引
