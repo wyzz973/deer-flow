@@ -3,11 +3,21 @@ import { getBackendBaseURL } from "@/core/config";
 
 import type {
   Capabilities,
+  EditableSettings,
+  LlmCallDetail,
+  LlmCallSummary,
+  McpServerSpec,
+  ModelProbe,
+  ModelSpec,
+  ProviderHealth,
+  ProviderProbe,
   ResearchActivity,
   ResearchEvent,
   ResearchMetrics,
   ResearchSources,
   Run,
+  SettingsView,
+  SourceSpec,
 } from "./types";
 
 /** Site icon for a cited domain. The gateway fetches and caches it, so the
@@ -53,9 +63,12 @@ export function researchApi(base = "") {
           : detail && typeof detail === "object" && "message" in detail
             ? String(detail.message)
             : `请求失败 (${res.status})`;
-      throw new Error(
+      const failure = new Error(
         res.status === 401 ? "请先登录 DeerFlow，再打开研究工作台。" : message,
-      );
+      ) as Error & { status?: number; detail?: unknown };
+      failure.status = res.status;
+      failure.detail = detail;
+      throw failure;
     }
     return res;
   }
@@ -106,6 +119,68 @@ export function researchApi(base = "") {
     },
     metrics: (id: string) =>
       json<ResearchMetrics>(`/${encodeURIComponent(id)}/metrics`),
+    llmCalls: (id: string) =>
+      json<{ items: LlmCallSummary[] }>(`/${encodeURIComponent(id)}/llm-calls`),
+    llmCall: (id: string, callId: string) =>
+      json<LlmCallDetail>(
+        `/${encodeURIComponent(id)}/llm-calls/${encodeURIComponent(callId)}`,
+      ),
+    async downloadLlmCalls(id: string) {
+      const res = await response(`/${encodeURIComponent(id)}/llm-calls/export`);
+      const url = URL.createObjectURL(await res.blob());
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `research-${id}-llm-calls.jsonl`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    },
+    settings: () => json<SettingsView>("/settings"),
+    saveSettings: (version: number, settings: EditableSettings) =>
+      json<SettingsView>("/settings", { version, settings }),
+    resetSettings: (version: number, fields?: string[]) =>
+      json<SettingsView>("/settings/reset", { version, fields }),
+    restoreSettings: (version: number, targetVersion: number) =>
+      json<SettingsView>("/settings/restore", {
+        version,
+        target_version: targetVersion,
+      }),
+    settingsHistory: () =>
+      json<{
+        items: {
+          version: number;
+          updated_at: string;
+          updated_by: string | null;
+          fields: string[];
+        }[];
+      }>("/settings/history"),
+    saveSecret: (name: string, value: string | null) =>
+      json<SettingsView>("/settings/secrets", { name, value }),
+    testModel: (model: ModelSpec) =>
+      json<ModelProbe>("/settings/test-model", { model }),
+    testProvider: (
+      source: SourceSpec,
+      providerId: string,
+      probe: { query?: string; url?: string },
+      mcpServers?: Record<string, McpServerSpec>,
+    ) =>
+      json<ProviderProbe>("/settings/test-provider", {
+        source,
+        provider_id: providerId,
+        ...probe,
+        mcp_servers: mcpServers,
+      }),
+    mcpTools: (name: string, server: McpServerSpec) =>
+      json<{
+        ok: boolean;
+        error?: string;
+        tools: {
+          name: string;
+          description: string;
+          arguments: Record<string, unknown>;
+        }[];
+      }>("/settings/mcp-tools", { name, server }),
+    providerHealth: () =>
+      json<{ providers: ProviderHealth[] }>("/settings/health"),
     async downloadMetrics(id: string) {
       const res = await response(`/${encodeURIComponent(id)}/metrics/export`);
       const url = URL.createObjectURL(await res.blob());

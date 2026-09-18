@@ -128,3 +128,74 @@ async def test_final_conversion_attempt_prunes_unverifiable_references_without_i
     result = await convert_answer(runner, {"run_id": "r"}, "technical-route", {}, Answer, "notes", {}, validator=validate, repair=prune)
     assert result.evidence_ids == ["known"]
     assert len(calls) == settings.output_retries + 1
+
+
+@pytest.mark.asyncio
+async def test_streaming_only_providers_still_produce_a_contract(settings, tmp_path, monkeypatch):
+    """Many local servers answer only in streaming mode.
+
+    A non-streaming request there returns an empty message, which used to look
+    like a model that refused the contract. Direct research calls must consume
+    the stream the way the agent loop already does.
+    """
+    from langchain_core.messages import AIMessageChunk
+
+    class Answer(BaseModel):
+        value: int
+
+    store = Store(tmp_path / "streaming.sqlite")
+    await store.start()
+    await store.create({"run_id": "r", "owner": "u"}, "key", "hash")
+    calls = []
+
+    class StreamingOnlyModel:
+        async def ainvoke(self, messages, **kwargs):
+            calls.append("ainvoke")
+            return AIMessageChunk(content="")  # what a streaming-only server returns
+
+        async def astream(self, messages, **kwargs):
+            calls.append("astream")
+            for piece in ('{"value"', ": 11", "}"):
+                yield AIMessageChunk(content=piece)
+
+    async def agent_config(name):
+        return settings.skills[name], SimpleNamespace(model="local")
+
+    monkeypatch.setattr("deerflow.models.create_chat_model", lambda **kwargs: StreamingOnlyModel())
+    runner = SimpleNamespace(settings=settings, store=store, _agent_config=agent_config)
+    result = await convert_answer(runner, {"run_id": "r"}, "technical-route", {}, Answer, "ordinary notes", {})
+    assert result.value == 11
+    assert calls == ["astream"]
+
+
+@pytest.mark.asyncio
+async def test_a_provider_that_refuses_streaming_still_answers(settings, tmp_path, monkeypatch):
+    """The opposite deployment: a gateway that rejects stream=true."""
+    from types import SimpleNamespace as Namespace
+
+    class Answer(BaseModel):
+        value: int
+
+    store = Store(tmp_path / "no-stream.sqlite")
+    await store.start()
+    await store.create({"run_id": "r", "owner": "u"}, "key", "hash")
+    calls = []
+
+    class NoStreamingModel:
+        async def ainvoke(self, messages, **kwargs):
+            calls.append("ainvoke")
+            return Namespace(content='{"value": 3}')
+
+        async def astream(self, messages, **kwargs):
+            calls.append("astream")
+            raise RuntimeError("streaming is not supported by this deployment")
+            yield  # pragma: no cover - generator marker
+
+    async def agent_config(name):
+        return settings.skills[name], Namespace(model="local")
+
+    monkeypatch.setattr("deerflow.models.create_chat_model", lambda **kwargs: NoStreamingModel())
+    runner = SimpleNamespace(settings=settings, store=store, _agent_config=agent_config)
+    result = await convert_answer(runner, {"run_id": "r"}, "technical-route", {}, Answer, "notes", {})
+    assert result.value == 3
+    assert calls == ["astream", "ainvoke"]

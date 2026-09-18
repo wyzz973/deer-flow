@@ -281,6 +281,69 @@ def test_dynamic_context_reminder_is_preserved_across_summarization() -> None:
         assert DynamicContextMiddleware().before_agent(followup_state, _runtime()) is None
 
 
+def test_subagent_system_prompt_survives_compaction_and_its_turns_are_summarized() -> None:
+    """A subagent keeps its system prompt in state (executor ``_build_initial_state``).
+
+    Compaction must retain that prompt verbatim instead of summarizing it away, and
+    the summary must be built from the tool turns being removed. Previously the
+    human-anchored trimmer reduced a window of [system, AI, Tool, ...] to the system
+    prompt alone, so the research turns vanished without being summarized.
+    """
+    captured: list[SummarizationEvent] = []
+    middleware = _middleware(before_summarization=[captured.append], trigger=("messages", 8), keep=("messages", 2))
+    system = SystemMessage(content="You are the pricing researcher. Cite only pages you opened.", id="system-1")
+    task = HumanMessage(content="Compare database hosting prices", id="task-1")
+
+    def turn(index: int, url: str, text: str) -> list:
+        call_id = f"call-{index}"
+        return [
+            AIMessage(content="", id=f"ai-{index}", tool_calls=[{"id": call_id, "name": "web_fetch", "args": {"url": url}}]),
+            ToolMessage(content=f"Source: {url}\n{text}", tool_call_id=call_id, id=f"tool-{index}"),
+        ]
+
+    messages = [
+        system,
+        task,
+        *turn(1, "https://example.com/pricing", "Plan A costs $5 per month"),
+        *turn(2, "https://example.com/limits", "Free tier includes 100 databases"),
+        *turn(3, "https://example.com/regions", "Available in 12 regions"),
+    ]
+
+    result = middleware.before_model({"messages": messages}, _runtime())
+
+    assert result is not None
+    emitted = result["messages"][1:]
+    assert emitted[0] is system and emitted[1] is task
+    assert system not in captured[0].messages_to_summarize
+    prompt = middleware.model.invoke.call_args.args[0]
+    assert "Plan A costs $5 per month" in prompt and "https://example.com/limits" in prompt
+    assert "You are the pricing researcher" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_streaming_only_provider_still_produces_a_summary() -> None:
+    """Local OpenAI-compatible servers often answer only in streaming mode.
+
+    A plain request there returns an empty message, which looked like a failed
+    summary and left compaction permanently unavailable for that deployment.
+    """
+    from langchain_core.messages import AIMessageChunk
+
+    async def stream(prompt, **kwargs):
+        for piece in ("compressed ", "summary"):
+            yield AIMessageChunk(content=piece)
+
+    model = MagicMock()
+    model.with_config.return_value = model
+    model.ainvoke = AsyncMock(return_value=SimpleNamespace(text=""))
+    model.astream = stream
+    middleware = DeerFlowSummarizationMiddleware(model=model, trigger=("messages", 4), keep=("messages", 2), token_counter=len)
+
+    result = await middleware.abefore_model({"messages": _messages()}, _runtime())
+
+    assert result["summary_text"] == "compressed summary"
+
+
 def test_before_summarization_hook_not_called_when_threshold_not_met() -> None:
     captured: list[SummarizationEvent] = []
     middleware = _middleware(before_summarization=[captured.append], trigger=("messages", 10))

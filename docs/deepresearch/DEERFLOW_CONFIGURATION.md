@@ -4,6 +4,11 @@
 模型字段见 [MODEL_CONFIGURATION.md](MODEL_CONFIGURATION.md)，研究配置字段见 [RESEARCH_CONFIGURATION.md](RESEARCH_CONFIGURATION.md)。
 DeerFlow 全部配置项的权威说明在 `config.example.yaml` 的注释和 `backend/docs/CONFIGURATION.md`。
 
+**先明确分工**：研究用什么模型、什么数据源、什么 MCP 服务、什么角色和提示词，全部写在研究配置
+（`deepresearch.local.yaml`）或设置页里，**不写在 `config.yaml`**。宿主配置只需要提供执行环境
+（沙箱、子 Agent 运行时、数据库）和一行 `plugins` 注册。宿主的 `models`、`tools`、
+`subagents.custom_agents`、`extensions_config.json` 都不会影响研究。
+
 ## 1. 配置文件一览
 
 以下文件都在仓库根目录，都**不提交**到 git（已在 `.gitignore` 里）：
@@ -13,8 +18,10 @@ DeerFlow 全部配置项的权威说明在 `config.example.yaml` 的注释和 `b
 | `config.yaml` | 主配置：模型、工具、沙箱、Agent、插件等 | 复制 `config.example.yaml`，再合并离线片段 |
 | `.env` | 密钥，以及 `config.yaml` 里 `$变量` 的值 | 手写 |
 | `extensions_config.json` | MCP 服务和 Skill 开关（可选，没有这个文件也能启动） | 手写，见第 4 节 |
-| `deepresearch.local.yaml` | 研究配置 | 复制 `examples/deepresearch/offline/research.yaml` |
-| `skills/custom/` | 研究方法论（Skill） | 复制 `examples/deepresearch/skills/` 下的目录 |
+| `deepresearch.local.yaml` | 研究配置：研究模型、数据源、MCP、角色、提示词 | 复制 `examples/deepresearch/offline/research.yaml` |
+| `skills/custom/` | 研究方法论（Skill），也可以直接写在研究配置的 `methodology` 里 | 复制 `examples/deepresearch/skills/` 下的目录 |
+
+`extensions_config.json` 与研究无关：研究自己的 MCP 服务写在研究配置的 `mcp_servers` 里。
 
 改变文件位置的环境变量：
 
@@ -113,65 +120,61 @@ curl http://127.0.0.1:8001/api/deepresearch/capabilities
 
 ## 3. `config.yaml` 里和研究有关的段
 
+研究不从宿主继承模型和工具，所以这里只剩执行环境：
+
 | 段 | 离线怎么配 | 说明 |
 | --- | --- | --- |
-| `models` | 本地模型 | 见 MODEL_CONFIGURATION.md |
-| `tools` | 只保留内网知识库和沙箱文件工具 | 不要配置 `web_search`、`web_fetch`、`image_search` 这类依赖公网的工具。`read_file` 不能删：规划和写作角色靠它读取 Skill 文件 |
-| `tool_groups` | 保持示例 | 每个工具的 `group` 必须在这里声明过；示例里已有 `knowledge`、`file:read`、`file:write` |
+| `plugins` | 加载 `deepresearch.extension:install` | `config_path` 相对仓库根目录；没有这一段，研究接口就不存在。这是研究唯一必须的宿主配置 |
 | `sandbox` | `deerflow.sandbox.local:LocalSandboxProvider` | 不需要 Docker。要用容器沙箱（`AioSandboxProvider`）的话，必须在联网时先拉好镜像 |
-| `skills` | 保持示例 | `path` 不写时使用仓库根目录的 `skills/`；`container_path` 保持 `/mnt/skills` |
-| `subagents.custom_agents` | 四个研究角色 | 名字必须和研究配置 `skills.*.agent` 一致，见下表 |
-| `subagents.timeout_seconds` | 1800 | 只对内置子 Agent 生效；研究角色用它们各自的 `timeout_seconds` |
 | `subagent_runtime.max_running` | 不小于研究配置的 `max_concurrency` | 子 Agent 同时运行的上限，超出的会排队 |
-| `summarization` | `trigger` 约为模型 `context_window` 的 40% | 上下文快满时自动压缩历史 |
-| `title.model_name` | `null` | 不为标题额外调用模型 |
-| `suggestions.enabled` | `false` | 少一次模型调用 |
-| `memory.enabled` | `false` | 记忆会额外调用模型 |
-| `token_budget` | 保持示例（`enabled: false`） | 这是主对话 Agent 的预算，不是研究预算。研究预算在研究配置的 `budget_ceiling` |
 | `database` | 保持示例（sqlite） | DeerFlow 自己的数据库，和研究数据库不是同一个 |
-| `plugins` | 加载 `deepresearch.extension:install` | `config_path` 相对仓库根目录；没有这一段，研究接口就不存在 |
+| `skills` | 保持示例 | `container_path` 保持 `/mnt/skills`；只影响宿主自己的 Skill 索引 |
+| `models` | 至少留一个能构造的模型 | 宿主聊天用；研究用研究配置里的 `models`。两边可以完全不同 |
+| `title.model_name` / `suggestions.enabled` / `memory.enabled` | `null` / `false` / `false` | 少几次与研究无关的模型调用 |
+| `token_budget` | 保持示例（`enabled: false`） | 主对话 Agent 的预算，不是研究预算（研究预算在研究配置的 `budget_ceiling`） |
+| `summarization` | 保持示例 | 主对话的上下文压缩。**研究不使用这里的阈值**：研究角色的压缩由研究配置的 `compaction` 决定 |
 
-研究角色（`subagents.custom_agents` 下）的字段：
+不再需要为研究配置的段（旧版本要求过，现在保留只是为了兼容旧文件）：
 
-| 字段 | 说明 |
-| --- | --- |
-| `description` | 角色说明 |
-| `system_prompt` | 角色的系统提示词。研究任务自己的指令会追加在后面 |
-| `skills` | 这个角色可以激活的 Skill，例如 `[deepresearch]` |
-| `tools` | 工具白名单。`null` 表示继承全部宿主工具；规划和写作角色只给 `[read_file]` |
-| `model` | 模型名，或 `inherit`（使用默认模型） |
-| `max_turns` | 图递归步数上限（包含中间件节点，不等于模型对话轮数） |
-| `timeout_seconds` | 这个角色单次执行的超时时间；实际生效的是它和研究配置 `skills.*.timeout_seconds` 中较小的值 |
+- `subagents.custom_agents` 里的研究角色：角色现在完全由研究配置的 `skills` 定义。
+- `tools` 里的 `web_search`、`web_fetch`、`knowledge_search`：研究的数据源由研究配置的 `sources`
+  与其供应商提供；研究员还能使用的引擎工具由研究配置的 `engine_tools` 决定（默认只有 `read_file`）。
+- `extensions_config.json` 里的 MCP 服务：研究自己的 MCP 服务写在研究配置的 `mcp_servers`。
 
-研究员角色的 `tools` 必须覆盖研究配置里 `sources[].tool` 用到的工具，否则研究单元报 `TOOL_DENIED`。
+## 4. 研究自己的 MCP 服务（内网知识库）
 
-## 4. `extensions_config.json`（内网 MCP 服务）
+写在研究配置里，不需要 `extensions_config.json`：
 
-只有使用 MCP 服务作为研究来源时才需要。最小内容：
+```yaml
+mcp_servers:
+  company-kb:
+    transport: http
+    url: http://10.0.0.8:9000/mcp
+    headers:
+      Authorization: secret:company-kb-token   # 或 $COMPANY_KB_TOKEN
+    timeout_seconds: 60
 
-```json
-{
-  "mcpServers": {
-    "company-kb": {
-      "enabled": true,
-      "type": "http",
-      "url": "http://10.0.0.8:9000/mcp",
-      "headers": {"Authorization": "Bearer $COMPANY_KB_TOKEN"},
-      "description": "内网知识库检索"
-    }
-  },
-  "skills": {}
-}
+sources:
+  - name: internal-knowledge
+    tool: knowledge_search      # 模型看到的名字，自己取
+    role: data
+    origin: internal
+    level: L1
+    providers:
+      - id: kb
+        type: mcp
+        server: company-kb
+        tool: search            # MCP 工具原名
 ```
 
 规则：
 
-- MCP 工具在宿主里的名字是 `服务名_工具原名`。例如服务 `company-kb` 的工具 `search`，名字就是 `company-kb_search`。
-- 研究配置里写成 `kind: mcp`、`server: company-kb`、`tool: company-kb_search`。
-- `$变量` 同样从 `.env` 读取。
-- 改完要重启网关。
-- 不要直接复制 `extensions_config.example.json`：其中的 `mcpInterceptors` 指向示例模块，本地并不存在。
-- 需要按请求传递凭据时，参考 `README.deepresearch.md` 的“凭据”一节（`headers_from_context`）。
+- 工具名由研究配置决定，不再是 `服务名_工具原名`。
+- 返回格式不固定也没关系：系统会从 JSON、Markdown 链接、`Title/URL` 文本块或 HTML 中识别标题、链接与正文。
+- 也可以用 `kind: mcp` 的数据源把某个 MCP 工具连同它自己的参数 schema 原样暴露给研究员。
+- `$变量` 从 `.env` 读取；`secret:名字` 在设置页“密钥与历史”里保存（只写不读）。
+- 需要按请求传递凭据时，见 `README.deepresearch.md` 的“凭据”一节。
+- 设置页“MCP 服务”可以直接“连接并列出工具”，确认工具名与参数。
 
 ## 5. `.env`
 

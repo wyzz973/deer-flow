@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import sqlite3
 import time
 from typing import TypedDict
@@ -12,9 +13,11 @@ from langgraph.types import interrupt
 
 from . import activity
 from . import report as documents
-from .contracts import FollowupResult, ResearchError, ResearchPlan, ResearchResult, ResearchUnit, utcnow
+from .config import active_settings
+from .contracts import FollowupResult, ResearchError, ResearchPlan, ResearchRequest, ResearchResult, ResearchUnit, utcnow
 from .evidence import digest, merge_results
 from .report_policy import eligible_evidence
+from .secrets import trace_secrets
 from .trace import LocalTrace, metric_scope
 from .validators import research_gaps, supplemental_units
 
@@ -46,6 +49,8 @@ class ResearchState(TypedDict, total=False):
     followup_action: str
     plan: dict
     decision: dict
+    # The conversation rewritten into one complete research request.
+    request: dict
     auto_start: bool
     units: list[dict]
     results: list[dict]
@@ -65,28 +70,91 @@ class ResearchState(TypedDict, total=False):
     status: str
 
 
+def accepts(function, name):
+    """Custom runners (``runner_factory``) may implement the earlier protocol."""
+    try:
+        parameters = inspect.signature(function).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(item.name == name or item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters)
+
+
 def build_workflow(settings, store, runner, checkpointer):
+    def run_settings():
+        # The executing run's configuration snapshot, bound by the service.
+        return active_settings(settings)
+
     async def stage(s, status, event=None, data=None):
         await store.patch(s["run"]["run_id"], status=status)
         if event:
             await store.event(s["run"]["run_id"], event, data)
 
-    async def planner(s):
+    async def rewrite(s):
+        """Rewrite the conversation into one complete research request.
+
+        ChatGPT's conversation model does this before a research session and
+        again, merging the change into the previous request, whenever the user
+        revises the plan. A structured plan edit keeps the current request.
+        """
         run = await store.get(s["run"]["run_id"])
         await stage(s, "PLANNING")
         decision = s.get("decision", {})
+        previous = (s.get("request") or {}).get("user_query") or (s.get("plan") or {}).get("brief") or None
+        if (decision.get("plan") is not None and not decision.get("revision") and s.get("request")) or not hasattr(runner, "rewrite"):
+            return {"request": s.get("request") or {}}
+        users = [m for m in run.get("conversation", []) if m["role"] == "user"]
+        message = decision.get("revision") or (users[-1]["text"] if users else run["query"])
+        fresh = previous is None or (not decision.get("revision") and len(users) <= 1)
+        version = s.get("plan", {}).get("plan_version", 0) + 1
+        key = "rewrite:" + digest([run.get("cycle", 0), version, message, None if fresh else previous, run.get("conversation", [])])
+        cached = await store.cached(run["run_id"], key)
+        if cached:
+            await store.event(run["run_id"], "metrics.cache_hit", {"kind": "rewrite", "plan_version": version})
+        request = ResearchRequest.model_validate(cached) if cached else await runner.rewrite(run, message, None if fresh else previous)
+        body = request.model_dump(mode="json")
+        await store.cache(run["run_id"], key, body)
+        await store.patch(run["run_id"], request=body)
+        await store.append_message(
+            run["run_id"],
+            {
+                "id": f"request-{version}",
+                "role": "assistant",
+                "kind": "rewrite",
+                "text": body["user_query"],
+                "rewrite": {"user_query": body["user_query"], "revision": not fresh, "clarification_questions": body["clarification_questions"]},
+                "cycle": run.get("cycle", 0),
+                "at": utcnow(),
+            },
+        )
+        await store.event(run["run_id"], "research.request.rewritten", {"plan_version": version, "revision": not fresh, "characters": len(body["user_query"])}, key=f"rewrite-{run.get('cycle', 0)}-{version}")
+        return {"request": body}
+
+    async def planner(s):
+        run = await store.get(s["run"]["run_id"])
+        await stage(s, "PLANNING")
+        settings = run_settings()
+        decision = s.get("decision", {})
+        request = s.get("request") or {}
         proposed = decision.get("plan")
         if decision.get("revision"):
             proposed = {"plan": proposed, "revision": decision["revision"]}
         version = s.get("plan", {}).get("plan_version", 0) + 1
-        key = "plan:" + digest([version, proposed, run.get("conversation", [])])
+        key = "plan:" + digest([version, proposed, run.get("conversation", []), request])
         cached = await store.cached(run["run_id"], key)
         if cached:
             await store.event(run["run_id"], "metrics.cache_hit", {"kind": "plan", "plan_version": version})
-        plan = ResearchPlan.model_validate(cached) if cached else await runner.plan(run, proposed)
+        if cached:
+            plan = ResearchPlan.model_validate(cached)
+        else:
+            plan = await (runner.plan(run, proposed, request=request) if accepts(runner.plan, "request") else runner.plan(run, proposed))
         plan.plan_version = version
-        if not decision.get("revision"):
-            plan.acknowledgement = ""
+        # The rewritten request is the shared research brief; the conversation
+        # model, not the planner, confirms a revision.
+        if request.get("user_query"):
+            plan.brief = request["user_query"]
+        plan.acknowledgement = (request.get("acknowledgement") or plan.acknowledgement) if decision.get("revision") else ""
+        if request.get("clarification_questions") and not plan.clarification_questions:
+            plan.clarification_questions = request["clarification_questions"][:3]
         settings.fit_origins(plan)
         settings.check_plan(plan, type("Budget", (), run["budget"])(), run["source_names"])
         body = plan.model_dump(mode="json")
@@ -148,7 +216,7 @@ def build_workflow(settings, store, runner, checkpointer):
                 await store.mutate(run["run_id"], lambda r, uid=unit.id, value=state: r["unit_statuses"].update({uid: value}))
                 if state == "COMPLETED":
                     await store.event(run["run_id"], "research.unit.completed", completion(run, unit, cached), key=f"unit-done-{run.get('cycle', 0)}-{unit.id}")
-        semaphore = asyncio.Semaphore(settings.max_concurrency)
+        semaphore = asyncio.Semaphore(run_settings().max_concurrency)
 
         async def execute(unit):
             queued = time.monotonic()
@@ -229,6 +297,7 @@ def build_workflow(settings, store, runner, checkpointer):
         await stage(s, "VALIDATING")
         plan = ResearchPlan.model_validate(s["plan"])
         pool = s["evidence_pool"]
+        settings = run_settings()
         eligible = eligible_evidence(pool, plan.source_policy, settings)
         gaps = research_gaps(plan, s["units"], s["findings"], pool, s["results"], eligible)
         run_id = s["run"]["run_id"]
@@ -305,6 +374,7 @@ def build_workflow(settings, store, runner, checkpointer):
     async def final_validate(s):
         await stage(s, "FINAL_VALIDATING")
         plan = ResearchPlan.model_validate(s["plan"])
+        settings = run_settings()
         eligible = eligible_evidence(s["evidence_pool"], plan.source_policy, settings)
         errors = documents.validate(s["report_draft"]["document"], s["evidence_pool"], eligible)
         repairs = s.get("synthesis_repairs", 0)
@@ -318,6 +388,7 @@ def build_workflow(settings, store, runner, checkpointer):
         draft, pool, mapping = s["report_draft"], s["evidence_pool"], s["citation_map"]
         current = await store.get(run_id)
         lang = documents.language(current.get("query", ""))
+        settings = run_settings()
         demo = settings.runner == "demo"
         document = draft["document"]
         citations = documents.citations(mapping, pool)
@@ -395,7 +466,7 @@ def build_workflow(settings, store, runner, checkpointer):
             from langgraph.runtime import get_runtime
 
             context = get_runtime().context or {}
-            trace = LocalTrace(store, state["run"]["run_id"], settings, (context.get("secrets") or {}).values())
+            trace = LocalTrace(store, state["run"]["run_id"], run_settings(), trace_secrets(run_settings(), context))
             # Model, tool and agent metrics inherit the phase they ran in.
             token = metric_scope.set({"phase": name, "cycle": state["run"].get("cycle", 0)})
             try:
@@ -410,6 +481,7 @@ def build_workflow(settings, store, runner, checkpointer):
 
     graph = StateGraph(ResearchState, context_schema=dict)
     for name, node in [
+        ("rewrite", rewrite),
         ("planner", planner),
         ("follow_up", follow_up),
         ("plan_review", review),
@@ -424,10 +496,11 @@ def build_workflow(settings, store, runner, checkpointer):
         ("renderer", render),
     ]:
         graph.add_node(name, traced(name, node))
-    graph.add_conditional_edges(START, lambda state: "follow_up" if state.get("input_mode") == "follow_up" else "planner")
-    graph.add_conditional_edges("follow_up", lambda state: state["followup_action"], {"answer": END, "revise": "synthesis", "research": "planner"})
+    graph.add_conditional_edges(START, lambda state: "follow_up" if state.get("input_mode") == "follow_up" else "rewrite")
+    graph.add_conditional_edges("follow_up", lambda state: state["followup_action"], {"answer": END, "revise": "synthesis", "research": "rewrite"})
+    graph.add_edge("rewrite", "planner")
     graph.add_edge("planner", "plan_review")
-    graph.add_conditional_edges("plan_review", lambda s: s["decision"]["action"], {"edit": "planner", "approve": "dispatch", "reject": "rejected"})
+    graph.add_conditional_edges("plan_review", lambda s: s["decision"]["action"], {"edit": "rewrite", "approve": "dispatch", "reject": "rejected"})
     graph.add_edge("rejected", END)
     graph.add_edge("dispatch", "evidence_merge")
     graph.add_edge("evidence_merge", "validator")

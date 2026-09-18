@@ -28,6 +28,19 @@ Base: `/api/deepresearch`，由 DeerFlow Gateway 扩展路由提供。生产请�
 | GET | `/{id}/report?format=json\|md\|html\|docx&version=1` | 指定版本报告/下载；省略 version 为当前完成态报告 |
 | GET | `/{id}/trace?after=0&limit=100` | 本地 trace 分页；limit 1–200 |
 | GET | `/{id}/trace/export` | owner/ACL 保护的 JSONL 导出 |
+| GET | `/{id}/llm-calls` | 本次研究的全部模型调用（含指标；`audited: false` 表示早于审计或关闭了内容记录） |
+| GET | `/{id}/llm-calls/{call_id}` | 一次调用的完整消息、工具定义、参数、返回、与上一次调用的差异、可重建的 OpenAI 请求 |
+| GET | `/{id}/llm-calls/export` | JSONL：逐条调用的完整请求与返回 |
+| GET | `/settings` | 研究设置：当前值、配置文件默认值、已覆盖字段、运维上限、目录、凭据状态、供应商健康度 |
+| POST | `/settings` | 管理员保存设置；`version` 不匹配返回 409 `PROFILE_VERSION`，校验失败返回 422 及字段路径 |
+| POST | `/settings/reset` | 管理员把指定字段（或全部）恢复为配置文件 |
+| POST | `/settings/restore` | 管理员回滚到某个历史版本 |
+| GET | `/settings/history` | 设置修改历史：版本、时间、修改人、改动字段 |
+| POST | `/settings/secrets` | 管理员保存或删除只写密钥（`secret:名字` 引用它；接口不返回值） |
+| POST | `/settings/test-model` | 管理员用提交的模型配置真实发一次普通请求和一次工具调用 |
+| POST | `/settings/test-provider` | 管理员真实调用某个数据源供应商，返回耗时、条数与样例 |
+| POST | `/settings/mcp-tools` | 管理员连接一个 MCP 服务并列出它的工具与参数 |
+| GET | `/settings/health` | 供应商健康度快照：成功/失败次数、冷却剩余、最近错误类别 |
 
 ## 创建
 
@@ -129,6 +142,9 @@ trace 分页返回 `{"trace_id":"...","items":[...],"next_cursor":123}`。导出
 401 未登录；403 ACL 撤销/演示 Origin 拒绝；404 不存在或不属于当前用户；409 计划版本、配置指纹、幂等或状态冲突；422 契约/配置无效；429 容量已满。
 
 后台错误写入 run.error `{code,message,recoverable}` 并发出 run.failed。不可恢复预算/配置/最终校验错误应新建或修正配置后新建任务；不能无限点击 retry。
+
+设置接口的读取对所有登录用户开放（只读视图），修改只对管理员开放；接口从不返回已保存密钥的值。
+每个研究任务在创建时保存一份配置快照并全程使用它，所以保存设置只影响之后新建的研究。
 
 精确请求 schema 见同目录 `openapi.json`（从实际 FastAPI router 生成）。内部 MCP URL、凭据和 Python 插件配置不接受客户端通过研究 API 注册。
 

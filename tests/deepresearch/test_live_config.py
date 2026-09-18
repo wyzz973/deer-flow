@@ -1,6 +1,6 @@
 """Live acceptance setup must not mutate operator data or persist API keys."""
 
-from deepresearch.live import _write_yaml, build_config, private_config
+from deepresearch.live import _write_yaml, build_config, private_config, research_model, web_sources
 
 
 def test_inline_credentials_are_kept_only_in_the_child_environment():
@@ -13,15 +13,14 @@ def test_inline_credentials_are_kept_only_in_the_child_environment():
     assert original["models"][0]["api_key"] == "private-value"
 
 
-def test_live_copy_preserves_host_models_and_isolates_storage(tmp_path):
+def test_live_engine_copy_isolates_storage_and_adds_no_research_agents(tmp_path):
     base = {
         "models": [{"name": "configured", "api_key": "$KEY"}],
         "tools": [{"name": "web_search", "use": "original:tool"}],
         "database": {"backend": "postgres", "postgres_url": "$DATABASE"},
         "subagents": {"custom_agents": {"untouched": {"model": "configured"}}},
     }
-    fragment = {"subagents": {"custom_agents": {"technical-researcher": {"tools": ["placeholder"], "model": "inherit"}}}}
-    value = build_config(base, fragment, tmp_path, "configured")
+    value = build_config(base, tmp_path)
     assert value["models"] == base["models"] and value["tools"] == base["tools"]
     assert base["database"]["backend"] == "postgres"
     assert value["database"]["sqlite_dir"] == str(tmp_path / "database")
@@ -32,26 +31,51 @@ def test_live_copy_preserves_host_models_and_isolates_storage(tmp_path):
 
     # Validate against the host contract, not just this launcher's dictionary.
     TypeAdapter(AppConfig.model_fields["database"].annotation).validate_python(value["database"])
-    assert "untouched" in value["subagents"]["custom_agents"]
-    assert value["subagents"]["custom_agents"]["acceptance-technical-researcher"]["tools"] is None
+    # Research roles are defined in the research configuration, not as host agents.
+    assert value["subagents"]["custom_agents"] == {"untouched": {"model": "configured"}}
+    assert value["plugins"][0]["config"]["config_path"] == str(tmp_path / "research.yaml")
 
 
-def test_explicit_live_limits_reach_the_native_model_and_subagent_policy(tmp_path):
+def test_live_research_config_owns_its_model_and_failover_sources(tmp_path):
+    from deepresearch.config import Settings, load_settings
     from deerflow.config.subagents_config import SubagentsAppConfig
 
-    base = {
-        "models": [{"name": "configured", "max_tokens": 8192, "when_thinking_disabled": {"max_tokens": 4096}}],
-        "subagents": {"agents": {"untouched": {"token_budget": {"enabled": True, "max_tokens": 20000}}}},
+    host_model = {
+        "name": "deepseek-v4-flash",
+        "display_name": "DeepSeek V4 Flash",
+        "use": "deerflow.models.patched_deepseek:PatchedChatDeepSeek",
+        "model": "deepseek-v4-flash",
+        "api_key": "$DEEPSEEK_API_KEY",
+        "timeout": 600.0,
+        "max_retries": 2,
+        "max_tokens": 8192,
+        "context_window": 128000,
+        "supports_thinking": True,
+        "when_thinking_enabled": {"extra_body": {"thinking": {"type": "enabled"}}},
     }
-    fragment = {"subagents": {"custom_agents": {"technical-researcher": {"description": "research", "system_prompt": "research"}}}}
-    value = build_config(base, fragment, tmp_path, "configured", max_output_tokens=393216, unlimited_budget=True)
-    assert value["models"][0]["max_tokens"] == 393216
-    assert value["models"][0]["when_thinking_disabled"]["max_tokens"] == 393216
-    policies = SubagentsAppConfig.model_validate(value["subagents"])
-    assert not policies.get_token_budget_for("acceptance-technical-researcher", summarization_enabled=True).enabled
+    model = research_model(host_model, max_output_tokens=393216)
+    assert model == {
+        "name": "deepseek-v4-flash",
+        "display_name": "DeepSeek V4 Flash",
+        "provider": "deepseek",
+        "model": "deepseek-v4-flash",
+        "api_key": "$DEEPSEEK_API_KEY",
+        "max_tokens": 393216,
+        "context_window": 128000,
+        "supports_thinking": True,
+        "max_retries": 2,
+        "timeout_seconds": 600.0,
+    }
+    sources = web_sources({"SERPER_API_KEY": "x", "JINA_API_KEY": "y"}, jina_key=False)
+    assert [provider["id"] for provider in sources[0]["providers"]] == ["serper", "duckduckgo"]
+    assert sources[1]["providers"] == [{"id": "jina", "type": "jina_reader"}, {"id": "direct", "type": "direct"}]
+    base = load_settings().model_dump(mode="json")
+    research = Settings.model_validate({**base, "runner": "deerflow", "models": [model], "default_model": model["name"], "extraction_model": model["name"], "sources": sources, "source_fallback": [], "require_dual_source": False})
+    assert research.sources[0].kind == "channel" and research.models[0].provider == "deepseek"
+    engine = build_config({"subagents": {"agents": {"untouched": {"token_budget": {"enabled": True, "max_tokens": 20000}}}}}, tmp_path, research.skills, unlimited_budget=True)
+    policies = SubagentsAppConfig.model_validate(engine["subagents"])
+    assert not policies.get_token_budget_for("deepresearch-technical-route", summarization_enabled=True).enabled
     assert policies.get_token_budget_for("untouched").enabled
-    assert base["models"][0]["max_tokens"] == 8192
-    assert "acceptance-technical-researcher" not in base["subagents"]["agents"]
 
 
 def test_code_only_resume_preserves_config_and_rejects_config_drift(tmp_path):

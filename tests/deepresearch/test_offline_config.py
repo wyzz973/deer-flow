@@ -1,4 +1,4 @@
-"""Offline deployment templates stay valid and consistent with each other."""
+"""Offline deployment templates stay valid, self-contained and consistent."""
 
 from pathlib import Path
 
@@ -9,35 +9,38 @@ from deepresearch.contracts import ResearchPlan, ResearchUnit
 
 ROOT = Path(__file__).resolve().parents[2]
 OFFLINE = ROOT / "examples/deepresearch/offline"
+PUBLIC_PROVIDERS = {"tavily", "serper", "brave", "exa", "bocha", "jina_search", "duckduckgo", "jina_reader", "tavily_extract", "firecrawl", "direct"}
 
 
-def test_offline_research_config_is_valid_and_offline_safe():
+def test_offline_research_config_is_self_contained_and_offline_safe():
     settings = load_settings(OFFLINE / "research.yaml")
     for name in settings.skills:
         assert settings.read_skill(name)
     assert settings.runner == "deerflow" and not settings.require_dual_source and not settings.favicons
     assert {source.origin for source in settings.sources} == {"internal"} and settings.source_fallback == ["internal-knowledge"]
+    # Every model reference resolves inside the research configuration itself.
+    models = {model.name for model in settings.models}
+    references = {settings.default_model, settings.extraction_model} | {spec.model for spec in settings.skills.values() if spec.model}
+    assert references <= models and all(spec.agent is None for spec in settings.skills.values())
+    providers = [provider.type for source in settings.sources for provider in source.providers]
+    assert providers and not set(providers) & PUBLIC_PROVIDERS
+    assert all(model.api_key is None or model.api_key.startswith("$") for model in settings.models)
 
 
-def test_offline_host_fragment_validates_and_matches_the_research_config():
+def test_offline_engine_fragment_only_tunes_the_engine_and_registers_the_extension():
     from deerflow.config.app_config import AppConfig
 
     base = yaml.safe_load((ROOT / "config.example.yaml").read_text(encoding="utf-8"))
     fragment = yaml.safe_load((OFFLINE / "host-config.fragment.yaml").read_text(encoding="utf-8"))
-    config = AppConfig.model_validate({**base, **fragment})
+    # Research needs nothing from the host's models, tools or subagents.
+    assert not {"models", "tools", "subagents"} & set(fragment)
+    config = AppConfig.model_validate({**base, **fragment, "models": []})
     settings = load_settings(OFFLINE / "research.yaml")
-
-    models = {model.name for model in config.models}
-    assert {spec.model for spec in settings.skills.values()} | {settings.extraction_model} <= models
-    agents = config.subagents.custom_agents
-    assert {spec.agent for spec in settings.skills.values()} <= set(agents)
-    assert all(agents[spec.agent].model in models and agents[spec.agent].timeout_seconds >= spec.timeout_seconds for spec in settings.skills.values())
-    tools = {tool.name for tool in config.tools}
-    assert {source.tool for source in settings.sources} <= tools and "read_file" in tools
-    assert not tools & {"web_search", "web_fetch", "image_search"}
     assert config.subagent_runtime.max_running >= settings.max_concurrency
     (plugin,) = config.plugins
     assert (plugin.use, plugin.config["config_path"]) == ("deepresearch.extension:install", "deepresearch.local.yaml")
+    online = yaml.safe_load((ROOT / "examples/deepresearch/host-config.fragment.yaml").read_text(encoding="utf-8"))
+    assert set(online) == {"plugins"}
 
 
 def test_single_origin_deployments_drop_origins_no_source_serves(settings):

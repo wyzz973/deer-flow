@@ -133,6 +133,27 @@ run ID so responses from a previous selection cannot populate another run's trac
 Keep export requests on the authenticated research API; do not put trace payloads
 in localStorage or send them to a telemetry service.
 
+The inspector has two tabs: “LLM 调用” (`llm-calls-panel.tsx` + `llm-call-dialog.tsx`)
+and “Trace 时间线”. Audit calls group by execution (`groupCalls` in
+`core/deepresearch/llm-calls.ts`): a call carrying a `node` label is that node's own
+work (context compaction, a graph node) and never counts as an agent turn. The
+dialog's “只看本轮新增” filter uses the server's `new_message_indexes`; never
+recompute a diff in the client. A run created before auditing shows
+`audited: false` — say so instead of rendering an empty prompt. The rewritten
+request renders through `request-card.tsx` (message kind `rewrite`), collapsed by
+default, with copy and inspect actions.
+
+`research-settings.tsx` and `components/deepresearch/settings/` own the research
+settings page (`/workspace/deepresearch/settings`). It edits a draft copy
+(`edit()` clones), pins the server version on the first edit so a save can only
+succeed against the version the draft was based on (409 shows “载入最新版本”), and
+surfaces `draftProblems` before the request. Secrets are write-only: send a value,
+never read one back, and show reference status from the server. Field components
+in `settings/fields.tsx` keep local text while it still describes the draft value
+(numbers typed as text, JSON, one-per-line lists) so typing is never reformatted
+mid-keystroke. Settings apply to research created afterwards; say that in the UI
+rather than implying a running study changes.
+
 - **Imports**: Enforced ordering (builtin → external → internal → parent → sibling), alphabetized, newlines between groups. Use inline type imports: `import { type Foo }`.
 - **Unused variables**: Prefix with `_`.
 - **Class names**: Use `cn()` from `@/lib/utils` for conditional Tailwind classes.

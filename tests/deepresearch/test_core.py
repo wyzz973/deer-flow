@@ -50,6 +50,29 @@ def test_merge_replay_lineage_and_distinct_origins(result):
     assert all(e["unit_ids"] == ["R1", "R2"] for e in merged.values())
 
 
+def test_display_metadata_from_the_web_is_bounded_not_rejected(result):
+    """A page without a title is labeled by its URL, and URLs can be enormous.
+
+    Truncating display text keeps one monster link from failing a whole research
+    run in evidence_merge; identity fields stay strict.
+    """
+    from deepresearch.contracts import RawEvidence
+
+    url = "https://example.com/image.png?jwt=" + "e" * 1600
+    evidence = RawEvidence(raw_id="raw-long", title=url, url=url, origin="external", source_name="external-web", publisher="p" * 400, snippet="正文")
+    assert len(evidence.title) == 1000 and evidence.title.endswith("…") and evidence.title.startswith("https://example.com/image.png")
+    assert len(evidence.publisher) == 200
+    assert evidence.url == url  # the locator itself is never silently altered
+    # A result carrying such evidence still merges.
+    body = result.model_dump(mode="json")
+    body["raw_evidences"].append({**evidence.model_dump(mode="json"), "raw_id": "raw-long"})
+    from deepresearch.contracts import ResearchResult
+
+    revalidated = ResearchResult.model_validate(body)
+    pool, _findings, _lineage = merge_results([revalidated], {})
+    assert any(str(item["title"]).startswith("https://example.com/image.png") for item in pool.values())
+
+
 def test_source_priority_injected_file_fallback(settings, plan, tmp_path):
     priority = tmp_path / "priority.yaml"
     priority.write_text("- external-web\n", encoding="utf-8")

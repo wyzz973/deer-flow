@@ -1,11 +1,12 @@
-"""Configuration doctor: an explicit probe tells whether a host model can research."""
+"""Configuration doctor: offline checks and an explicit research model probe."""
 
 import json
+from pathlib import Path
 
 import pytest
 from langchain_core.messages import AIMessage
 
-from deerflow.config.model_config import ModelConfig
+ROOT = Path(__file__).resolve().parents[2]
 
 
 class FakeModel:
@@ -27,9 +28,11 @@ class FakeModel:
         return AIMessage(content="", tool_calls=calls, usage_metadata=usage)
 
 
-def install(monkeypatch, model, **profile):
-    config = type("Config", (), {"get_model_config": lambda self, name: ModelConfig(name=name, use="langchain_openai:ChatOpenAI", model="qwen", **profile) if name == "local" else None})()
-    monkeypatch.setattr("deerflow.config.get_app_config", lambda: config)
+def install(monkeypatch, model):
+    from deerflow.config.app_config import AppConfig
+
+    host = AppConfig.model_validate({"sandbox": {"use": "deerflow.sandbox.local:LocalSandboxProvider"}, "models": []})
+    monkeypatch.setattr("deerflow.config.get_app_config", lambda: host)
     created = []
 
     def create_chat_model(**kwargs):
@@ -40,50 +43,63 @@ def install(monkeypatch, model, **profile):
     return created
 
 
-def test_doctor_finds_every_custom_agent_of_a_real_research_config(monkeypatch, capsys):
-    from pathlib import Path
+def offline_settings(monkeypatch, context_window=65536):
+    from deepresearch.config import load_settings
 
-    import yaml
+    monkeypatch.setenv("LOCAL_MODEL_API_KEY", "local-not-checked")
+    settings = load_settings(ROOT / "examples/deepresearch/offline/research.yaml")
+    settings.models[0].context_window = context_window
+    return settings
 
+
+def test_status_needs_no_host_agents_and_reports_missing_credentials(monkeypatch, capsys, tmp_path):
     from deepresearch.doctor import main
-    from deerflow.config.app_config import AppConfig
 
-    root = Path(__file__).resolve().parents[2]
-    base = yaml.safe_load((root / "config.example.yaml").read_text(encoding="utf-8"))
-    fragment = yaml.safe_load((root / "examples/deepresearch/offline/host-config.fragment.yaml").read_text(encoding="utf-8"))
-    config = AppConfig.model_validate({**base, **fragment})
-    monkeypatch.setattr("deerflow.config.get_app_config", lambda: config)
-    main(["--config", str(root / "examples/deepresearch/offline/research.yaml")])
+    monkeypatch.setenv("LOCAL_MODEL_API_KEY", "local-not-checked")
+    monkeypatch.delenv("RAGFLOW_API_KEY", raising=False)
+    config = tmp_path / "research.yaml"
+    config.write_text((ROOT / "examples/deepresearch/offline/research.yaml").read_text(encoding="utf-8").replace(".deerflow/deepresearch", str(tmp_path / "data")), encoding="utf-8")
+
+    def no_host(*args, **kwargs):
+        raise AssertionError("Self-contained roles never look up host subagents")
+
+    monkeypatch.setattr("deerflow.subagents.registry.get_subagent_config", no_host)
+    with pytest.raises(SystemExit, match="RAGFLOW_API_KEY|internal-knowledge/ragflow"):
+        main(["--config", str(config)])
     status = json.loads(capsys.readouterr().out)
-    assert status["mode"] == "deerflow" and all(status["agents"].values()) and len(status["agents"]) == 4
+    assert status["mode"] == "deerflow" and "legacy_agents" not in status
+    assert status["models"] == [{"name": "local-model", "provider": "vllm", "model": "Qwen/Qwen3-32B", "api_key": "set"}]
+    assert status["problems"] == ["provider internal-knowledge/ragflow has no API key value"]
+    monkeypatch.setenv("RAGFLOW_API_KEY", "ragflow-test")
+    main(["--config", str(config)])
+    assert json.loads(capsys.readouterr().out)["problems"] == []
 
 
 @pytest.mark.asyncio
-async def test_probe_reports_tool_calling_usage_and_a_small_context(monkeypatch):
+async def test_probe_uses_the_research_model_and_reports_a_small_context(monkeypatch):
     from deepresearch.doctor import probe_model
 
-    created = install(monkeypatch, FakeModel(), max_tokens=8192, context_window=16000)
-    report = await probe_model("local")
-    assert created == [{"name": "local", "thinking_enabled": False, "attach_tracing": False}]
+    created = install(monkeypatch, FakeModel())
+    report = await probe_model("local-model", settings=offline_settings(monkeypatch, context_window=16000))
+    assert [(item["name"], item["thinking_enabled"], item["attach_tracing"]) for item in created] == [("local-model", False, False)]
+    assert created[0]["app_config"].get_model_config("local-model").model == "Qwen/Qwen3-32B"
     assert report["ok"] and report["tool_call"]["tools"] == ["lookup"] and report["plain_reply"]["text"] == "ready"
     assert (report["max_tokens"], report["context_window"], report["usage"]["total_tokens"]) == (8192, 16000, 46)
     assert any("below 32768" in warning for warning in report["warnings"])
 
 
-def test_probe_failures_exit_nonzero_with_a_readable_reason(monkeypatch, capsys):
-    from deepresearch.doctor import main
+@pytest.mark.asyncio
+async def test_probe_failures_are_readable_and_never_echo_credentials(monkeypatch):
+    from deepresearch.doctor import probe_model
 
-    install(monkeypatch, FakeModel(tool_calls=False), context_window=65536)
-    with pytest.raises(SystemExit, match="tool calling"):
-        main(["--probe-model", "local"])
-    probe = json.loads(capsys.readouterr().out)["model_probe"]
+    install(monkeypatch, FakeModel(tool_calls=False))
+    probe = await probe_model("local-model", settings=offline_settings(monkeypatch))
     assert probe["ok"] is False and probe["warnings"][0].startswith("No tool call")
 
-    install(monkeypatch, FakeModel(error=ConnectionError("connect to http://127.0.0.1:8000/v1 refused; Bearer sk-secret")))
-    with pytest.raises(SystemExit):
-        main(["--probe-model", "local"])
-    probe = json.loads(capsys.readouterr().out)["model_probe"]
-    assert probe["ok"] is False and probe["error"].startswith("ConnectionError") and "sk-secret" not in probe["error"]
+    install(monkeypatch, FakeModel(error=ConnectionError("connect to http://127.0.0.1:8000/v1 refused; Bearer sk-secret; key local-not-checked")))
+    probe = await probe_model("local-model", settings=offline_settings(monkeypatch))
+    assert probe["ok"] is False and probe["error"].startswith("ConnectionError")
+    assert "sk-secret" not in probe["error"] and "local-not-checked" not in probe["error"]
 
-    with pytest.raises(SystemExit, match="not in the models list"):
-        main(["--probe-model", "missing"])
+    missing = await probe_model("missing", settings=offline_settings(monkeypatch))
+    assert missing["ok"] is False and "not configured" in missing["error"]

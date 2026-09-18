@@ -4,19 +4,23 @@
 架构与工作流见 [ARCHITECTURE.md](docs/deepresearch/ARCHITECTURE.md)，当前状态与验收见 [交接文档](docs/deepresearch/HANDOFF.md)。
 交互对标 ChatGPT 深度研究（观察记录见 [对标文档](docs/deepresearch/CHATGPT_BENCHMARK_2026-09-16.md)）：
 
-- 描述需求后，系统把请求改写成完整的研究简报，给出短标题和步骤的计划卡。默认 45 秒后自动开始。
+- 描述需求后，系统先把整段对话改写成一条完整的研究请求（和 ChatGPT 调 Deep Research App 时的 `user_query` 一样），
+  再给出短标题和步骤的计划卡。默认 45 秒后自动开始。
 - 点击“编辑”会暂停倒计时，在同一输入框里说明怎么改；改完的计划直接开始研究。
 - 研究中，计划卡显示实时进展和搜索次数；点“更新”可以追加要求，研究不中断。
 - 研究结束后给出长篇 Markdown 报告：带目录、表格、图示和可验证引用，右侧可以查看来源和研究活动。
 
 ## 设计原则
 
-- LangGraph 管计划审批、状态、依赖调度与补研。
-- DeerFlow `SubagentExecutor` 管 Agent、工具授权、Skill 激活、沙箱、上下文压缩、运行保护和取消。
-- MCP 的参数和结果由原生工具链处理，**不要求任何统一搜索返回格式**。模型直接阅读原始 ToolMessage。
+- LangGraph 管请求改写、计划审批、状态、依赖调度与补研。
+- DeerFlow `SubagentExecutor` 管 Agent 循环、工具授权、Skill 激活、沙箱、运行保护和取消。
+- **配置独立于 DeerFlow**：研究模型、数据源与供应商、MCP 服务、角色、提示词、引擎工具、上下文压缩策略
+  都是研究自己的配置（文件或设置页），宿主 `config.yaml` 只需要一行 `plugins` 注册。
+- 一个数据源对模型只暴露一套固定参数，背后可以挂多个供应商按顺序故障切换（限流/额度/鉴权失败自动换下一家）；
+  MCP 工具也可以原样暴露，**不要求任何统一返回格式**。
 - 研究完成后，从原生 ToolMessage 和 receipts 建立报告引用；调用记录不等于语义支持证明。
 - 普通 Chat Completions 回复通过独立、有限重试的输出整理进入研究契约，不要求 JSON mode。
-- 本地 Trace 与轮转日志支持调查，不依赖 LangSmith 或其他遥测服务。
+- 本地 Trace、完整的模型调用审计与轮转日志支持调查，不依赖 LangSmith 或其他遥测服务。
 
 详细说明：[设计与原生能力复用](docs/deepresearch/NATIVE_RUNTIME.md) · [逐步评审记录](docs/deepresearch/REUSE_AUDIT.md) · [API](docs/deepresearch/API.md) · [公司 Agent 交接](docs/deepresearch/HANDOFF.md)
 
@@ -25,13 +29,19 @@
 
 ## 接入已有 DeerFlow
 
-1. 合并 `examples/deepresearch/host-config.fragment.yaml` 到本地 `config.yaml`，保留原模型、其他 Agent 与插件配置。
+1. 把 `examples/deepresearch/host-config.fragment.yaml` 的 `plugins` 段合并到本地 `config.yaml`，其余配置不动。
 2. 复制 `deepresearch.example.yaml` 为 `deepresearch.local.yaml`，设置 `runner: deerflow`。
-3. 将 Skill registry 的 `agent` 对应到现有 Custom Agent，`path` 指向实际方法论文件。
-4. 在 `sources` 选择已配置的原生工具或 MCP 工具。默认 `kind: mcp` 需要服务名与**精确工具名**；`kind: native` 只填宿主精确工具名，不填 `server`。两者都不配置返回字段映射。
-5. MCP 连接、stdio/HTTP/SSE、认证及凭据策略沿用宿主；研究模块不建立另一套客户端或推断工具名前缀。
-6. 执行 `uv sync` 安装宿主依赖（本分支已声明 DOCX 依赖）。检查后重启 Gateway。
-7. 打开工作区侧栏 DeepResearch，新建研究。旧运行配置指纹不兼容时应新建任务。
+3. 在研究配置里写自己的 `models`（凭据只写 `$环境变量` 或 `secret:名字`）与 `default_model`。
+4. 在 `sources` 配置数据源：搜索、阅读、知识库各一个；每个数据源按顺序列出供应商
+   （例如 `tavily` → `serper` → `duckduckgo`，`jina_reader` → `direct`）。内网知识库用 `mcp_servers` 加
+   `type: mcp` 的供应商，或 `kind: mcp` 的数据源。
+5. 角色写在 `skills` 里：`deepresearch`（规划）、`report-synthesis`（写作）加至少一个研究员，方法论用
+   `path` 指向 SKILL.md 或直接写 `methodology`。
+6. 执行 `uv sync` 安装宿主依赖（本分支已声明 DOCX 依赖）。用
+   `python -m deepresearch.doctor --config ../deepresearch.local.yaml --probe-model <模型名> --probe-sources`
+   检查后重启 Gateway。
+7. 打开工作区侧栏 DeepResearch，新建研究。之后的模型、提示词、数据源调整都可以在页面右上角的
+   **研究设置**（`/workspace/deepresearch/settings`，管理员）里改，保存后对新建的研究立刻生效。
 
 原生 Agent 和激活 Skill 的工具白名单仍生效。`native_tools: null` 表示使用宿主候选工具；可以额外配置列表收紧权限。研究模块不会绕过原生授权，也不会自动开放嵌套 Agent 或非交互任务中的澄清工具。
 
@@ -45,7 +55,8 @@ Researcher 使用原生预算预警提前收尾，为其他单元和综合报告
 
 默认要求 internal/external 两类来源；可以设置 `require_dual_source: false` 并在计划中选择实际来源类别。模型负责调用顺序和并行机会，没有强制的“两次预搜索”。
 
-已有 `web_search` / `web_fetch` 的部署可参考 `examples/deepresearch/native-web.sources.yaml`，不必为了研究而另建搜索 MCP。该片段不会自动启用服务、配置凭据或扩大 Custom Agent 的工具权限。
+研究不继承宿主的工具列表。研究员除数据源外只能使用研究配置 `engine_tools` 里声明的引擎工具（默认只有 `read_file`）。
+旧配置里把角色绑定到 Custom Agent、把数据源绑定到宿主工具或宿主 MCP 服务的写法仍然可读，但新部署不要再用。
 
 ## 对话与研究过程
 
@@ -103,9 +114,29 @@ request_secret_headers:
 
 这里存的是环境变量名/映射，不是真实凭据。凭据只进入原生 executor 的 runtime context；不要把宿主登录 Cookie 自动转发到另一个业务系统。
 
+## 研究设置（管理员）
+
+研究页面右上角的齿轮进入 `/workspace/deepresearch/settings`：
+
+- **模型**：增删研究模型、选默认/改写/整理模型、填单价；“测试连接”用表单里当前的配置真实发一次普通请求和一次工具调用。
+- **研究角色**：增删研究员，改角色说明、模型、系统提示词、方法论正文、可用工具白名单、步数与超时。
+- **提示词**：研究流程发给模型的每一条指令都能改，按阶段分组、可搜索、可逐条恢复默认。
+- **数据源与搜索**：数据源及其供应商链（顺序、启用、密钥、参数），每个供应商可单独测试并显示健康状态与冷却。
+- **MCP 服务**：研究自己的 MCP 服务，可“连接并列出工具”。
+- **运行参数**：并发、倒计时、输出上限、章节数、审计开关、上下文压缩策略、默认引擎工具；部署上限只读展示。
+- **密钥与历史**：保存只写密钥（用 `secret:名字` 引用）、查看凭据解析状态、查看与回滚历史版本。
+
+保存会生成新版本，之后**新建**的研究使用；每个研究任务保存创建时的完整配置快照，进行中的研究不受影响。
+
 ## 本地 Trace 与日志
 
-从“活动”进入 Trace，查看时间轴、可搜索的分组记录以及 workflow/node/agent/model/tool/conversion 的父子关联、输入输出、耗时与错误。详细载荷按需读取，普通进度 SSE 不传输完整 trace 内容；支持分页及完整 JSONL 导出。
+研究页面顶部的“LLM 调用审计与 Trace”提供两个页签：
+
+- **LLM 调用**：本次研究的每一次模型调用，按阶段（改写、规划、研究、整理、写作、压缩）和执行分组。
+  逐次查看完整提示词（可只看本轮新增的消息）、模型返回与推理、工具调用与结果、工具定义、请求参数、
+  可重建的 OpenAI 请求 JSON，并支持 JSONL 导出。`llm_audit: false` 可关闭记录。
+- **Trace 时间线**：workflow/node/agent/model/tool/conversion 的父子关联、输入输出、耗时与错误。
+  详细载荷按需读取，普通进度 SSE 不传输完整 trace 内容；支持分页及完整 JSONL 导出。
 
 研究数据目录默认 `.deerflow/deepresearch`：
 

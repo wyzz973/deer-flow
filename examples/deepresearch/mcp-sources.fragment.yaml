@@ -1,0 +1,49 @@
+# Merge into deepresearch.local.yaml; this fragment is not a complete config.
+# DeepResearch talks to its own MCP servers (not extensions_config.json). A server
+# can back a provider inside a failover chain, or be exposed as a source of its own
+# with the tool's native schema. Credentials are references; per-request credentials
+# come from request_secret_headers below.
+mcp_servers:
+  your-internal-mcp:
+    transport: http                 # http | streamable_http | sse | stdio
+    url: https://YOUR-INTERNAL-MCP/mcp
+    headers:
+      Cookie: secret:research_cookie
+      X-Csrf-Token: secret:research_csrf
+    timeout_seconds: 60
+    description: Internal knowledge base
+
+sources:
+  # 1) An MCP tool inside a provider chain: one stable schema for the model.
+  - name: internal-knowledge
+    tool: knowledge_search
+    role: data                      # returned records are citable
+    origin: internal
+    level: L1
+    publisher: your-organization
+    priority: 10
+    providers:
+      - id: kb
+        type: mcp
+        server: your-internal-mcp
+        tool: search                # the MCP tool's own name
+        # arguments: {query: "{query}", top_k: "{max_results}"}  # inferred when omitted
+
+  # 2) The MCP tool exposed as-is, keeping its own arguments.
+  - name: internal-tickets
+    kind: mcp
+    tool: ticket_search             # the name the model sees
+    server: your-internal-mcp
+    mcp_tool: tickets.search        # omit when it equals `tool`
+    role: data
+    origin: internal
+    level: L2
+
+# Per-request credentials. The Gateway reads these request headers into named
+# credentials; a request's value overrides the saved `secret:` of the same name for
+# that request only (MCP connection headers/env and custom HTTP provider headers).
+# Values never reach the model, the store or the trace, and two users never share a
+# discovered-tool cache entry.
+request_secret_headers:
+  X-Research-Cookie: research_cookie
+  X-Research-Csrf: research_csrf

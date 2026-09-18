@@ -1,0 +1,39 @@
+# Merge into deepresearch.local.yaml; this fragment is not a complete config.
+# Public web research through DeepResearch's own provider chains: no host tool,
+# no host MCP server and no host credentials are involved. Providers are tried in
+# order, and one that is rate limited, out of quota or unauthorized is cooled down
+# so the next one takes over. Keys are references ($ENV or secret:NAME) — the
+# settings page stores saved secrets write-only.
+require_dual_source: false
+sources:
+  - name: public-web-search
+    tool: web_search
+    # Search results are discovery only; they are never cited.
+    role: search
+    origin: external
+    level: L4
+    publisher: web-search-unclassified
+    providers:
+      - id: tavily
+        type: tavily
+        api_key: $TAVILY_API_KEY
+        options: {search_depth: basic}
+      - id: serper
+        type: serper
+        api_key: $SERPER_API_KEY
+      - id: duckduckgo          # no key; last resort
+        type: duckduckgo
+  - name: public-web-read
+    tool: web_fetch
+    # Opened pages are the citable originals.
+    role: read
+    origin: external
+    level: L4
+    publisher: web-content-unclassified
+    providers:
+      - id: jina
+        type: jina_reader
+        api_key: $JINA_API_KEY   # optional; without it the public rate limit applies
+      - id: direct               # gateway fetch with readability extraction and PDF support
+        type: direct
+source_fallback: [public-web-search, public-web-read]

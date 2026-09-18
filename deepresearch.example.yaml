@@ -1,55 +1,124 @@
-# Explicit synthetic demo. Never silently used when the real adapter fails.
+# DeepResearch configuration. It is independent of DeerFlow's config.yaml:
+# DeerFlow only registers the extension there (see examples/deepresearch/host-config.fragment.yaml)
+# and provides the execution engine. Models, sources, MCP servers, roles, prompts and
+# limits are configured here and can be edited later on the research settings page.
+#
+# Copy to deepresearch.local.yaml, set runner: deerflow and fill in credentials.
+# Credentials are references: $ENV_NAME (Gateway environment / .env) or secret:NAME
+# (saved on the settings page). Field reference: docs/deepresearch/RESEARCH_CONFIGURATION.md
+
+# demo: synthetic data without model calls. deerflow: real research.
 runner: demo
-# Real execution uses DeerFlow's native SubagentExecutor (runner: deerflow).
-output_retries: 2
-extraction_model: null
-native_tools: null  # Inherit host candidates; Agent/Skill authorization still applies.
-trace_capture_content: true
-trace_max_chars: 16000
 data_dir: .deerflow/deepresearch
+
+# Research models. Roles, request rewriting and output extraction refer to these names.
+models:
+  - name: deepseek-flash
+    display_name: DeepSeek V4 Flash
+    provider: deepseek            # openai | deepseek | vllm | anthropic | custom (with use: class path)
+    model: deepseek-v4-flash
+    api_key: $DEEPSEEK_API_KEY
+    max_tokens: 8192
+    context_window: 128000
+    supports_thinking: true       # research runs with thinking off; the provider switch is sent
+default_model: deepseek-flash     # used by every role without its own model
+rewrite_model: null               # request rewriting; null uses default_model
+extraction_model: null            # notes -> structured findings; null uses the role's model
+
+# Research roles. deepresearch (planner) and report-synthesis (writer) are fixed;
+# every other entry is a researcher the planner can assign. Methodology comes from
+# path (a Skill file) or methodology (inline text, e.g. edited on the settings page).
 skills:
   deepresearch:
-    agent: research-planner
+    name: 规划
     path: examples/deepresearch/skills/deepresearch/SKILL.md
     description: 研究问题拆解与计划规范化
   industry-trend:
-    agent: industry-researcher
+    name: 行业研究员
     path: examples/deepresearch/skills/industry-trend/SKILL.md
     description: 行业现状、驱动因素与发展趋势
   technical-route:
-    agent: technical-researcher
+    name: 技术研究员
     path: examples/deepresearch/skills/technical-route/SKILL.md
     description: 技术路线、工程约束与取舍
   report-synthesis:
-    agent: research-synthesizer
+    name: 报告撰写
     path: examples/deepresearch/skills/report-synthesis/SKILL.md
     description: 基于证据池综合结构化报告
+
+# Sources. Each source is one tool for researchers; its providers are tried in order and a
+# rate-limited, out-of-quota or failing provider cools down while the next one answers.
+#   search: tavily serper brave exa bocha searxng jina_search duckduckgo http mcp
+#   read:   jina_reader tavily_extract firecrawl direct http mcp
+#   data:   ragflow lightrag http mcp
 sources:
   - name: internal-kb
+    tool: knowledge_search
+    role: data                    # records returned by a data source can be cited
     origin: internal
-    server: your-internal-mcp
-    tool: your-internal-mcp_search
-    # data: the tool returns citable records. Use search for discovery-only tools
-    # and read for tools that open a document.
-    role: data
     level: L1
     publisher: your-organization
     priority: 10
+    providers:
+      - id: ragflow
+        type: ragflow
+        base_url: http://127.0.0.1:9380
+        api_key: $RAGFLOW_API_KEY
+        options: {dataset_ids: []} # empty: every dataset the key can access
   - name: external-web
+    tool: web_search
+    role: search                  # results are for discovery; pages must be opened to be cited
     origin: external
-    server: your-external-mcp
-    tool: your-external-mcp_search
-    role: data
     level: L4
-    publisher: external-search-unclassified
+    publisher: web-search-unclassified
     priority: 20
-source_fallback: [internal-kb, external-web]
+    providers:
+      - {id: tavily, type: tavily, api_key: $TAVILY_API_KEY}
+      - {id: serper, type: serper, api_key: $SERPER_API_KEY}
+      - {id: duckduckgo, type: duckduckgo}
+  - name: external-read
+    tool: web_fetch
+    role: read                    # opened pages are the citable originals
+    origin: external
+    level: L4
+    publisher: web-content-unclassified
+    priority: 30
+    providers:
+      - {id: jina, type: jina_reader}  # add api_key: $JINA_API_KEY for a higher rate limit
+      - {id: direct, type: direct}
+source_fallback: [internal-kb, external-web, external-read]
+require_dual_source: true         # false when only internal or only external sources exist
+
+# MCP servers used only by DeepResearch sources (type: mcp providers or kind: mcp sources).
+mcp_servers: {}
+#   company-kb:
+#     transport: http              # http | sse | stdio
+#     url: http://10.0.0.8:9000/mcp
+#     headers: {Authorization: secret:company-kb-token}
+
+# Engine tools roles may use besides sources. read_file continues long results the engine
+# moved to a file.
+engine_tools: [read_file]
+
+# Context compaction for long role executions. The engine rewrites older messages
+# into notes (prompts.compaction) once the context passes the trigger, and keeps the
+# most recent content verbatim. A role's system prompt and its task always survive.
+compaction:
+  enabled: true
+  trigger_fraction: 0.6           # of the role model's declared context_window
+  fallback_trigger_tokens: 48000  # used when the model declares no context window
+  keep_fraction: 0.4              # share of the trigger kept verbatim, in tokens
+  max_summary_input_tokens: 24000
+  model: null                     # null: summarize with the role's own model
+
 max_concurrency: 3
 max_active_runs: 8
-tool_timeout_seconds: 45
-tool_retries: 1
+plan_countdown_seconds: 45
 max_output_tokens: 4096
-require_dual_source: true
+output_retries: 2
+trace_capture_content: true
+trace_max_chars: 16000
+llm_audit: true                   # keep the complete prompt and answer of every model call
 # Write a report with explicit caveats when bounded supplementation cannot close
 # every gap. Evidence-free runs still fail. Set false to require owner consent.
 allow_limited_report: true
@@ -58,18 +127,15 @@ cite_search_results: false
 max_synthesis_repairs: 1
 max_report_sections: 8
 # Site icons for cited domains are fetched by the Gateway (public hosts only,
-# raster images only, cached) so browsers never contact cited sites. Set false
-# without outbound access; the UI then shows letter badges.
+# raster images only, cached). Set false without outbound access.
 favicons: true
-# Estimated research cost (metrics tab, /metrics API and `python -m deepresearch.metrics`).
-# Enter official list prices per million tokens for each model name the research
-# roles use; nothing is assumed and prices are excluded from the config fingerprint.
+# Estimated research cost per model name (metrics only; never fetched or assumed).
 # pricing:
-#   your-model-name:
+#   deepseek-flash:
 #     input_per_million: 0.0
-#     cached_input_per_million: 0.0   # optional prompt-cache hit price
+#     cached_input_per_million: 0.0
 #     output_per_million: 0.0
-#     currency: USD
+#     currency: CNY
 budget_ceiling:
   max_iterations: 2
   max_units: 12

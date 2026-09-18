@@ -74,11 +74,11 @@ async def test_native_tools_unchanged_and_execution_cached(settings, plan, tmp_p
     monkeypatch.setattr("deepresearch.native.execute_role", native)
     monkeypatch.setattr("deepresearch.structured.convert_answer", convert)
     result = await runner.research(run, plan.research_units[0], {})
-    assert len(invoked) == 2
+    assert len(invoked) == len(settings.sources)
     assert {e.origin for e in result.raw_evidences} == {"internal", "external"}
     assert all(e.provenance == "tool_output" for e in result.raw_evidences)
     await runner.research(run, plan.research_units[0], {})
-    assert len(invoked) == 2  # conversion retry reuses the whole completed execution
+    assert len(invoked) == len(settings.sources)  # conversion retry reuses the whole completed execution
 
     async def fabricated(*args, **kwargs):
         return ResearchAnalysis(findings=[Finding(claim="claim", raw_evidence_refs=["fabricated"], confidence=0.8)], confidence=0.8)
@@ -249,15 +249,20 @@ def test_opaque_calls_do_not_require_external_date_schema(settings, plan):
 async def test_source_selection_reuses_host_cache_and_checks_server(settings, tmp_path, monkeypatch):
     import sys
 
-    tool = types.SimpleNamespace(name=settings.sources[0].tool)
+    from deepresearch.config import SourceSpec
+
+    # An older file binding a host MCP server (not one of DeepResearch's own servers).
+    legacy = SourceSpec(name="internal-kb", server="your-internal-mcp", tool="your-internal-mcp_search", origin="internal")
+    assert legacy.kind == "mcp"
+    tool = types.SimpleNamespace(name=legacy.tool)
     monkeypatch.setitem(sys.modules, "deerflow.mcp.cache", types.SimpleNamespace(get_cached_mcp_tools=lambda: [tool]))
-    monkeypatch.setitem(sys.modules, "deerflow.tools.mcp_metadata", types.SimpleNamespace(get_mcp_source=lambda value: {"server_name": settings.sources[0].server}))
+    monkeypatch.setitem(sys.modules, "deerflow.tools.mcp_metadata", types.SimpleNamespace(get_mcp_source=lambda value: {"server_name": legacy.server}))
     runner = DeerFlowRunner(settings, Store(tmp_path / "unused.sqlite"))
-    async with runner._source_tools({}, [settings.sources[0]]) as selected:
-        assert selected[settings.sources[0].name] is tool
-    wrong = settings.sources[0].model_copy(update={"server": "another-server"})
+    async with runner._source_tools({"run_id": "r"}, [legacy]) as selected:
+        assert selected[legacy.name] is tool
+    wrong = legacy.model_copy(update={"server": "another-server"})
     with pytest.raises(ResearchError, match="unavailable"):
-        async with runner._source_tools({}, [wrong]):
+        async with runner._source_tools({"run_id": "r"}, [wrong]):
             pytest.fail("A tool from another server must never be selected")
 
 

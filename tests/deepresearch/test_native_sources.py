@@ -14,8 +14,11 @@ def test_native_bindings_are_explicit_and_do_not_need_an_mcp_server(settings):
     source = SourceSpec(name="web", kind="native", tool="web_search", origin="external")
     configured = Settings.model_validate({**settings.model_dump(), "runner": "deerflow", "sources": [source], "require_dual_source": False, "source_fallback": []})
     assert configured.sources[0].server is None
-    with pytest.raises(ValidationError, match="server name"):
+    # Without a host binding a source is DeepResearch-owned and needs providers.
+    with pytest.raises(ValidationError, match="at least one provider"):
         SourceSpec(name="web", tool="search", origin="external")
+    with pytest.raises(ValidationError, match="server name"):
+        SourceSpec(name="web", kind="mcp", tool="search", origin="external")
     with pytest.raises(ValidationError, match="do not select"):
         SourceSpec(name="web", kind="native", server="unknown", tool="web_search", origin="external")
 

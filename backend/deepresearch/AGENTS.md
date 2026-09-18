@@ -6,21 +6,61 @@ runtime. Read `../AGENTS.md` and the harness subagents guide for native executio
 The current architecture and workflow are described in `docs/deepresearch/ARCHITECTURE.md`
 at the repository root; update it with any change to nodes, events, contracts or storage.
 
+## Configuration independence
+
+DeerFlow is the engine; what research runs is DeepResearch configuration.
+Models, sources and their provider chains, MCP servers, roles, methodologies,
+prompts, engine tools, compaction and budgets all live in the research profile
+(`config.py`), never in the host `config.yaml` models/tools/subagents or in
+`extensions_config.json`. The only host-side entry is the `plugins:` registration.
+
+- `models.py` turns `ModelSpec`s into engine `ModelConfig`s inside a **private**
+  AppConfig copy (`private_config` rebuilds the name indexes; `model_copy` alone
+  leaves stale lookups and silently drops the output cap). Research models are
+  placed ahead of same-named host models; the operator's object is never mutated.
+- Credentials are references only (`$ENV`, `secret:NAME`). `secrets.py` resolves
+  them at use time, keeps saved secrets write-only, and feeds `trace_secrets` so
+  the values are scrubbed from traces and the LLM audit.
+- Legacy bindings (a role bound to a host subagent, a source bound to a host
+  tool or host MCP server) stay readable for older files. Do not add new
+  behavior that depends on them.
+- `catalog.py` publishes only research-owned choices (model providers, source
+  provider presets, engine tools, fixed roles, prompt defaults) for the settings
+  page. It must not expose a host catalog.
+- `profile.py` layers settings-page overrides over the operator file: `EDITABLE`
+  fields only, snapshots inline each role's methodology (front matter stripped by
+  `Settings.methodology`), and every run stores the snapshot it executes with.
+  Editing settings never changes a run that already exists. `LATER_FIELDS` keeps
+  old fingerprints stable when new fields are added.
+
 - `native.py` submits each role to `SubagentExecutor.execute_async`, polls the
   server-generated execution ID, and cancels/drains before registry cleanup.
   Do not replace it with a bare `create_agent` or copy the middleware chain.
-- Candidate host tools are explicit and intersected with the Custom Agent
-  allow/deny policy and native authorization. Unrelated MCP discovery, nested
-  delegation and implicit source fallback are not enabled by this module.
+- Candidate tools are research-owned: the source tools built from `channels.py`,
+  DeepResearch MCP tools from `mcp.py`, and the engine tools named in
+  `engine_tools` (read_file/ls/glob/grep). The host tool list is not inherited;
+  a role's `tools` allowlist can only narrow that set. Unrelated MCP discovery,
+  nested delegation and implicit source fallback stay disabled.
 - The native executor accepts narrow request-secret and execution-callback
   parameters. Never pass secrets through messages/configurable/checkpoints or
   merge arbitrary caller context into native authorization/sandbox ownership.
 - `structured.py` isolates output conversion. Use ordinary chat messages and
   bounded retries; no provider JSON-mode requirement. Invalid evidence IDs
   remain failures; parsing must never manufacture references or research facts.
+- Every direct model call (contract conversion, request rewriting, the doctor
+  probe) goes through `models.complete`, which consumes the stream like the
+  agent loop and falls back to a plain request only when streaming is refused or
+  returns nothing. Many local OpenAI-compatible servers answer *only* in
+  streaming mode and return an empty message for a plain request; treating that
+  as a refused contract made research unusable on them. A reply whose only
+  content is a tool call counts as an answer.
 - `observations.py` projects native ToolMessage/receipt envelopes after execution.
-  Never inspect MCP business payload fields or replace the tool's input schema.
-  The original host tool object must reach the native model/tool loop unchanged.
+  For MCP-bound and host-bound sources it must not inspect business payload
+  fields or replace the tool's input schema: the original tool object reaches the
+  native loop unchanged. Provider-backed sources are different by construction —
+  `channels.py` owns the model-facing schema, so `extract.py` reads provider
+  payloads deliberately and format-agnostically (JSON walk, Markdown links,
+  Title/URL blocks, HTML title) and emits the same artifacts a native tool would.
   Native completed executions are cached; individual tool calls are not replayed.
 - `trace.py` records bounded, redacted payloads and paired spans in the local
   event store. It has no telemetry-service dependency. Callbacks must remain
@@ -69,9 +109,17 @@ at the repository root; update it with any change to nodes, events, contracts or
   configured source serves, because weak planners keep the internal+external default.
 - Report messages retain immutable versions. A historical card must request its
   own `version` when exporting, not silently download the latest report.
-- `SourceSpec.kind` selects either the existing MCP cache or native host tools.
-  Native-only selection does not discover MCP servers and must respect the
-  `native_tools` ceiling as well as the executor's Agent/Skill authorization.
+- `SourceSpec.kind` selects a provider chain (`channel`), a DeepResearch MCP tool
+  (`mcp`), or a legacy host tool (`native`, which respects the `native_tools`
+  ceiling and the executor's Agent/Skill authorization and discovers nothing).
+- `channels.py` gives every provider-backed source one stable model-facing schema
+  per role and tries providers in order. Provider-level failures (rate_limit,
+  quota, auth, timeout, network, server, config) cool that provider down for the
+  process; request-level failures (invalid, not_found, blocked, empty,
+  unsupported) only advance to the next provider. A site's 403 or timeout is
+  request-level — never cool a working reader because one page refused. Health is
+  process-wide, the page cache is run-scoped, and every attempt is recorded for
+  `tools.by_provider` metrics and the settings page's provider test.
 - `sources.py` observes links beside execution without parsing provider-specific
   business fields. Keep discovered URLs, calls and cited references distinct;
   an observed URL is not evidence that its original page was read or verified.
@@ -101,11 +149,39 @@ at the repository root; update it with any change to nodes, events, contracts or
   unit `title`s and explicit `assumptions`. Clarification is reserved for requests
   without an identifiable subject; do not add units that only synthesize others.
 
+- Request credentials (`request_secret_headers`) reach research-owned MCP servers and
+  custom HTTP providers through `SECRETS.resolve(ref, request)`: a request's value
+  overrides the saved `secret:` of the same name for that request only. Keep them out
+  of the store, the model and the trace, and keep the MCP discovery cache keyed by the
+  resolved connection so two users never share discovered tools.
+- `audit.py` + `trace.py` record every model call when `llm_audit` is on: the
+  normalized request (messages content-addressed as zlib blobs, tool schemas,
+  allowlisted params), the response with reasoning, the langgraph node and the
+  execution group. Diffs against the previous call in the same group produce
+  `new_message_indexes`/`repeated_prefix` so the audit UI can show one turn's new
+  input. Scrub known secret values, `Bearer` tokens and URL secret parameters;
+  never store raw provider exceptions.
+- Compaction is research configuration: `compaction_config` builds the engine's
+  summarization settings per role from `CompactionSpec` and the role model's
+  declared context window, with `prompts.compaction` as the summary template
+  (it must keep opened URLs, verbatim quotes, dates and receipt ids). The host's
+  chat summarization thresholds never apply to research.
+  The engine keeps a subagent's leading system prompt out of compaction
+  (`_leading_system_messages` in `summarization_middleware.py`); without that a
+  researcher loses its methodology mid-run and the human-anchored summary trimmer
+  reduces the window to that prompt, discarding the actual research turns.
+- The graph starts at `rewrite`: the conversation becomes one complete
+  `ResearchRequest` (`user_query`, optional `acknowledgement`, at most three
+  clarification questions) before planning, mirroring ChatGPT deep research. A
+  plan edit and a follow-up that needs new research both re-enter `rewrite`,
+  which merges the change into the previous request and writes the
+  acknowledgement. `plan.brief` is the rewritten request.
+
 Regression commands, from `backend/`:
 
 ```sh
 uv run --no-sync python -m pytest ../tests/deepresearch -q
-uv run --no-sync python -m pytest tests/test_subagent_executor.py -q
+uv run --no-sync python -m pytest tests/test_subagent_executor.py tests/test_summarization_middleware.py -q
 uv run --no-sync ruff check deepresearch
 uv run --no-sync ruff format --check deepresearch
 ```

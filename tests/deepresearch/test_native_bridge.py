@@ -18,6 +18,7 @@ class Agent:
     model: str = "local-chat"
     max_turns: int = 20
     timeout_seconds: int = 180
+    skills: list[str] | None = None
 
 
 @pytest.mark.asyncio
@@ -25,7 +26,8 @@ async def test_roles_use_native_executor_with_scoped_tools_and_credentials(setti
     from deerflow.config.app_config import AppConfig
 
     config = AppConfig.model_validate({"sandbox": {"use": "deerflow.sandbox.local:LocalSandboxProvider"}, "models": [{"name": "local-chat", "model": "local-chat", "use": "langchain_openai:ChatOpenAI", "max_tokens": 32768}]})
-    settings.native_tools = ["read_file"]
+    # This test exercises the engine boundary with the engine's own model list.
+    settings.models, settings.default_model = [], None
     captured = {}
     completed = types.SimpleNamespace(is_terminal=True)
     result = types.SimpleNamespace(status=completed, result="ordinary prose", stop_reason=None, snapshot_tool_receipts=lambda: [])
@@ -38,12 +40,12 @@ async def test_roles_use_native_executor_with_scoped_tools_and_credentials(setti
             captured["prompt"] = prompt
             return "native-execution"
 
-    def tools(**kwargs):
-        assert kwargs["include_mcp"] is False
-        return [types.SimpleNamespace(name="read_file"), types.SimpleNamespace(name="unrelated_network_tool")]
+    def host_tools(**kwargs):
+        raise AssertionError("Research roles do not inherit the host tool list")
 
     monkeypatch.setitem(sys.modules, "deerflow.config", types.SimpleNamespace(get_app_config=lambda: config))
-    monkeypatch.setitem(sys.modules, "deerflow.tools", types.SimpleNamespace(get_available_tools=tools))
+    monkeypatch.setitem(sys.modules, "deerflow.tools", types.SimpleNamespace(get_available_tools=host_tools))
+    monkeypatch.setattr("deepresearch.native.engine_tools", lambda names: [types.SimpleNamespace(name=name) for name in sorted(names)])
     monkeypatch.setitem(
         sys.modules,
         "deerflow.subagents.executor",
@@ -62,9 +64,10 @@ async def test_roles_use_native_executor_with_scoped_tools_and_credentials(setti
     await store.create(run, "k", "h")
     from deepresearch.trace import metric_scope
 
+    source = types.SimpleNamespace(name="web_search")
     token = metric_scope.set({"phase": "dispatch", "cycle": 0})
     try:
-        reply = await execute_role(settings, store, run, "technical-route", {"unit": {"id": "R1"}}, [], Agent(), {"secrets": {"research_cookie": "private-value"}, "user_role": "member"})
+        reply = await execute_role(settings, store, run, "technical-route", {"unit": {"id": "R1"}}, [source], Agent(), {"secrets": {"research_cookie": "private-value"}, "user_role": "member"})
     finally:
         metric_scope.reset(token)
     assert reply.answer == "ordinary prose"
@@ -76,7 +79,8 @@ async def test_roles_use_native_executor_with_scoped_tools_and_credentials(setti
     assert captured["thread_id"] == native_thread_id(run, "technical-route", "R1")
     assert captured["user_id"] == "alice"
     assert captured["request_secrets"] == {"research_cookie": "private-value"}
-    assert [t.name for t in captured["tools"]] == ["read_file"]
+    # The run's source tools plus the engine tools research settings allow.
+    assert [t.name for t in captured["tools"]] == ["read_file", "web_search"]
     assert captured["execution_callbacks"]
     assert captured["config"].max_turns == Agent().max_turns
     assert captured["app_config"].models[0].model_extra["max_tokens"] == settings.max_output_tokens
@@ -96,11 +100,19 @@ async def test_roles_use_native_executor_with_scoped_tools_and_credentials(setti
     await execute_role(settings, store, run, "technical-route", {"unit": {"id": "R3"}}, [], Agent(), {})
     assert captured["config"].max_turns == 5
 
-    settings.native_tools = ["read_file", "unrelated_network_tool"]
+    # An agent bound through an older file keeps read_file for its native skills.
+    settings.skills["deepresearch"].agent = "research-planner"
     await execute_role(settings, store, run, "deepresearch", {}, [], Agent(name="planner"), {})
     assert [tool.name for tool in captured["tools"]] == ["read_file"]
-    await execute_role(settings, store, run, "report-synthesis", {}, [], Agent(name="writer"), {})
-    assert [tool.name for tool in captured["tools"]] == ["read_file"]
+    # A self-contained planner or writer gets no tools: its methodology is in the prompt.
+    settings.skills["report-synthesis"].agent = None
+    await execute_role(settings, store, run, "report-synthesis", {}, [], Agent(name="writer", skills=[]), {})
+    assert captured["tools"] == []
+    assert "Skill files" not in captured["config"].system_prompt
+    # A role allowlist narrows sources and can add engine tools.
+    settings.skills["technical-route"].tools = ["grep"]
+    await execute_role(settings, store, run, "technical-route", {"unit": {"id": "R4"}}, [source], Agent(skills=[]), {})
+    assert [tool.name for tool in captured["tools"]] == ["grep"]
 
 
 def test_progress_sentences_name_the_reader_language():

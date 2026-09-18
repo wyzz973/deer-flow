@@ -258,6 +258,28 @@ def summarize(run, *, model_calls=(), tool_calls=(), agent_runs=(), events=(), s
                 domains[domain]["errors"] += 1
                 domains[domain]["error_types"][call.get("error_type") or "ToolReturnedError"] += 1
     error_types = sum((values["error_types"] for values in per_tool.values()), Counter())
+    # Provider-based sources: which backend answered and what failed or cooled down first.
+    per_provider = defaultdict(lambda: {"type": None, "attempts": 0, "answered": 0, "empty": 0, "errors": 0, "skipped": 0, "cached": 0, "error_kinds": Counter(), "durations": []})
+    for call in tool_calls:
+        for attempt in call.get("attempts") or []:
+            entry = per_provider[(call.get("tool_name") or "tool", attempt.get("provider") or "provider")]
+            entry["type"] = entry["type"] or attempt.get("type")
+            status = attempt.get("status")
+            if status == "skipped":
+                entry["skipped"] += 1
+                entry["error_kinds"][attempt.get("kind") or "cooldown"] += 1
+            elif status == "cache":
+                entry["cached"] += 1
+            else:
+                entry["attempts"] += 1
+                entry["durations"].append(attempt.get("ms"))
+                if status == "ok":
+                    entry["answered"] += 1
+                elif status == "empty":
+                    entry["empty"] += 1
+                else:
+                    entry["errors"] += 1
+                    entry["error_kinds"][attempt.get("kind") or "error"] += 1
     tool_summary = {
         "count": len(tool_calls),
         "errors": sum(call.get("status") == "error" for call in tool_calls),
@@ -275,6 +297,22 @@ def summarize(run, *, model_calls=(), tool_calls=(), agent_runs=(), events=(), s
             ({"domain": name, **values, "error_types": dict(values["error_types"].most_common())} for name, values in domains.items() if values["errors"]),
             key=lambda row: (-row["errors"], row["domain"]),
         )[:10],
+        "failovers": sum(call.get("failovers") or 0 for call in tool_calls),
+        "by_provider": sorted(
+            (
+                {
+                    "tool": tool,
+                    "provider": provider,
+                    "type": values["type"],
+                    **{key: values[key] for key in ("attempts", "answered", "empty", "errors", "skipped", "cached")},
+                    "error_rate": _ratio(values["errors"], values["attempts"]),
+                    "error_kinds": dict(values["error_kinds"].most_common()),
+                    "latency_ms": percentiles(values["durations"]),
+                }
+                for (tool, provider), values in per_provider.items()
+            ),
+            key=lambda row: (row["tool"], -row["attempts"]),
+        ),
         "by_tool": sorted(
             (
                 {

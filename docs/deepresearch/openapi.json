@@ -66,6 +66,334 @@
         }
       }
     },
+    "/api/deepresearch/settings": {
+      "get": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Get Settings",
+        "operationId": "get_settings_api_deepresearch_settings_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Update Settings",
+        "operationId": "update_settings_api_deepresearch_settings_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SettingsUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/deepresearch/settings/reset": {
+      "post": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Reset Settings",
+        "operationId": "reset_settings_api_deepresearch_settings_reset_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SettingsReset"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/deepresearch/settings/restore": {
+      "post": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Restore Settings",
+        "operationId": "restore_settings_api_deepresearch_settings_restore_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SettingsRestore"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/deepresearch/settings/history": {
+      "get": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Settings History",
+        "operationId": "settings_history_api_deepresearch_settings_history_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/deepresearch/settings/secrets": {
+      "post": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Update Secret",
+        "operationId": "update_secret_api_deepresearch_settings_secrets_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SecretUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/deepresearch/settings/test-model": {
+      "post": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Test Model",
+        "operationId": "test_model_api_deepresearch_settings_test_model_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ModelTest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/deepresearch/settings/test-provider": {
+      "post": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Test Source Provider",
+        "operationId": "test_source_provider_api_deepresearch_settings_test_provider_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProviderTest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/deepresearch/settings/mcp-tools": {
+      "post": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "List Mcp Tools",
+        "operationId": "list_mcp_tools_api_deepresearch_settings_mcp_tools_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/McpToolsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/deepresearch/settings/health": {
+      "get": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Provider Health",
+        "operationId": "provider_health_api_deepresearch_settings_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/deepresearch": {
       "post": {
         "tags": [
@@ -971,6 +1299,135 @@
         }
       }
     },
+    "/api/deepresearch/{run_id}/llm-calls": {
+      "get": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Llm Calls",
+        "operationId": "llm_calls_api_deepresearch__run_id__llm_calls_get",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/deepresearch/{run_id}/llm-calls/export": {
+      "get": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Export Llm Calls",
+        "operationId": "export_llm_calls_api_deepresearch__run_id__llm_calls_export_get",
+        "parameters": [
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/deepresearch/{run_id}/llm-calls/{call_id}": {
+      "get": {
+        "tags": [
+          "deepresearch"
+        ],
+        "summary": "Llm Call",
+        "operationId": "llm_call_api_deepresearch__run_id__llm_calls__call_id__get",
+        "parameters": [
+          {
+            "name": "call_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Call Id"
+            }
+          },
+          {
+            "name": "run_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Run Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/deepresearch/{run_id}/report": {
       "get": {
         "tags": [
@@ -1130,6 +1587,41 @@
         "type": "object",
         "title": "HTTPValidationError"
       },
+      "McpToolsRequest": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name"
+          },
+          "server": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Server"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "server"
+        ],
+        "title": "McpToolsRequest"
+      },
+      "ModelTest": {
+        "properties": {
+          "model": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Model"
+          }
+        },
+        "type": "object",
+        "required": [
+          "model"
+        ],
+        "title": "ModelTest"
+      },
       "PlanDecision": {
         "properties": {
           "plan_version": {
@@ -1163,6 +1655,61 @@
           "plan"
         ],
         "title": "PlanEdit"
+      },
+      "ProviderTest": {
+        "properties": {
+          "source": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Source"
+          },
+          "provider_id": {
+            "type": "string",
+            "title": "Provider Id"
+          },
+          "query": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 500
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Query"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 4000
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          },
+          "mcp_servers": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mcp Servers"
+          }
+        },
+        "type": "object",
+        "required": [
+          "source",
+          "provider_id"
+        ],
+        "title": "ProviderTest"
       },
       "ResearchBudget": {
         "properties": {
@@ -1400,6 +1947,101 @@
         "additionalProperties": false,
         "type": "object",
         "title": "RetryResearch"
+      },
+      "SecretUpdate": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Name"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 20000
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Value"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "title": "SecretUpdate"
+      },
+      "SettingsReset": {
+        "properties": {
+          "version": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Version"
+          },
+          "fields": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fields"
+          }
+        },
+        "type": "object",
+        "required": [
+          "version"
+        ],
+        "title": "SettingsReset"
+      },
+      "SettingsRestore": {
+        "properties": {
+          "version": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Version"
+          },
+          "target_version": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Target Version"
+          }
+        },
+        "type": "object",
+        "required": [
+          "version",
+          "target_version"
+        ],
+        "title": "SettingsRestore"
+      },
+      "SettingsUpdate": {
+        "properties": {
+          "version": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Version"
+          },
+          "settings": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Settings"
+          }
+        },
+        "type": "object",
+        "required": [
+          "version",
+          "settings"
+        ],
+        "title": "SettingsUpdate"
       },
       "SourcePolicy": {
         "properties": {

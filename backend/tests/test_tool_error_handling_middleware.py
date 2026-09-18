@@ -880,6 +880,8 @@ def test_subagent_compaction_injects_summary_before_assistant_tool_tail(monkeypa
                 # outgoing request is provider-valid: a single leading SystemMessage.
                 system_indices = [i for i, message in enumerate(messages) if isinstance(message, SystemMessage)]
                 assert system_indices == [0], f"request must have exactly one leading SystemMessage, got {system_indices}"
+                # The subagent's own standing instructions are never compacted away.
+                assert "subagent instructions" in messages[0].content
             return ChatResult(generations=[ChatGeneration(message=AIMessage(content=self.text))])
 
     summary_model = _StaticModel(text="COMPRESSED_SUBAGENT_HISTORY")
@@ -912,9 +914,15 @@ def test_subagent_compaction_injects_summary_before_assistant_tool_tail(monkeypa
     )
 
     tool_calls = [{"name": "web_search", "args": {"query": f"q{i}"}, "id": f"call_{i}", "type": "tool_call"} for i in range(3)]
+    # Earlier turns are the compactable history: the leading system prompt and the
+    # current request are preserved, so the removable window must be real work.
     seed = [
         SystemMessage(content="subagent instructions", id="system"),
         HumanMessage(content="research three regions", id="human"),
+        AIMessage(content="first pass", tool_calls=[{"name": "web_search", "args": {"query": "q-old-0"}, "id": "call_old_0", "type": "tool_call"}], id="assistant_old_0"),
+        ToolMessage(content="old result 0", tool_call_id="call_old_0", id="tool_old_0"),
+        AIMessage(content="second pass", tool_calls=[{"name": "web_search", "args": {"query": "q-old-1"}, "id": "call_old_1", "type": "tool_call"}], id="assistant_old_1"),
+        ToolMessage(content="old result 1", tool_call_id="call_old_1", id="tool_old_1"),
         AIMessage(content="searching", tool_calls=tool_calls, id="assistant"),
         *[ToolMessage(content=f"result {i}", tool_call_id=f"call_{i}", id=f"tool_{i}") for i in range(3)],
     ]

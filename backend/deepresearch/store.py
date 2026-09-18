@@ -97,6 +97,22 @@ class Store:
             CREATE TABLE IF NOT EXISTS research_agent_run (
               run_id TEXT NOT NULL REFERENCES research_run(id), id TEXT NOT NULL,
               body TEXT NOT NULL, PRIMARY KEY(run_id,id));
+            CREATE TABLE IF NOT EXISTS research_llm_exchange (
+              run_id TEXT NOT NULL REFERENCES research_run(id), id TEXT NOT NULL,
+              body TEXT NOT NULL, PRIMARY KEY(run_id,id));
+            CREATE TABLE IF NOT EXISTS research_llm_blob (
+              run_id TEXT NOT NULL REFERENCES research_run(id), hash TEXT NOT NULL,
+              body BLOB NOT NULL, PRIMARY KEY(run_id,hash));
+            CREATE TABLE IF NOT EXISTS research_profile (
+              id TEXT PRIMARY KEY, version INTEGER NOT NULL, body TEXT NOT NULL,
+              updated_at TEXT NOT NULL, updated_by TEXT);
+            CREATE TABLE IF NOT EXISTS research_profile_history (
+              id TEXT NOT NULL, version INTEGER NOT NULL, body TEXT NOT NULL,
+              updated_at TEXT NOT NULL, updated_by TEXT, PRIMARY KEY(id,version));
+            CREATE TABLE IF NOT EXISTS research_profile_snapshot (
+              hash TEXT PRIMARY KEY, body BLOB NOT NULL);
+            CREATE TABLE IF NOT EXISTS research_secret (
+              name TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL, updated_by TEXT);
             PRAGMA user_version=1;
             """)
 
@@ -262,12 +278,162 @@ class Store:
     async def model_calls(self, run_id):
         return await self._records("research_model_call", run_id)
 
+    async def model_call(self, run_id, call_id):
+        def op(db):
+            row = db.execute("SELECT body FROM research_model_call WHERE run_id=? AND id=?", (run_id, call_id)).fetchone()
+            return json.loads(row[0]) if row else None
+
+        return await self.call(op)
+
     async def record_agent_run(self, run_id, execution_id, details):
         """Metrics for one native subagent execution."""
         return await self._merge_record("research_agent_run", run_id, execution_id, details)
 
     async def agent_runs(self, run_id):
         return await self._records("research_agent_run", run_id)
+
+    async def record_llm_request(self, run_id, call_id, details, messages, tools):
+        """Store one model request; identical messages across agent turns are stored once."""
+        from .audit import encode
+
+        def op(db):
+            hashes = []
+            for message in messages:
+                digest, blob = encode(message)
+                db.execute("INSERT OR IGNORE INTO research_llm_blob VALUES (?,?,?)", (run_id, digest, blob))
+                hashes.append(digest)
+            tools_hash = None
+            if tools:
+                tools_hash, blob = encode(tools)
+                db.execute("INSERT OR IGNORE INTO research_llm_blob VALUES (?,?,?)", (run_id, tools_hash, blob))
+            old = db.execute("SELECT body FROM research_llm_exchange WHERE run_id=? AND id=?", (run_id, call_id)).fetchone()
+            record = {**(json.loads(old[0]) if old else {}), **details, "id": call_id, "message_hashes": hashes, "tools_hash": tools_hash}
+            db.execute("INSERT INTO research_llm_exchange VALUES (?,?,?) ON CONFLICT(run_id,id) DO UPDATE SET body=excluded.body", (run_id, call_id, dumps(record)))
+
+        await self.call(op)
+
+    async def record_llm_response(self, run_id, call_id, details):
+        return await self._merge_record("research_llm_exchange", run_id, call_id, details)
+
+    async def llm_exchanges(self, run_id):
+        """Call summaries in request order, without message bodies."""
+
+        def op(db):
+            items = []
+            for (body,) in db.execute("SELECT body FROM research_llm_exchange WHERE run_id=? ORDER BY rowid", (run_id,)):
+                record = json.loads(body)
+                record.pop("message_hashes", None)
+                record.pop("response", None)
+                items.append(record)
+            return items
+
+        return await self.call(op)
+
+    async def llm_exchange(self, run_id, call_id):
+        """One complete request/response, plus how much it repeats the previous turn."""
+        from .audit import decode, shared_prefix
+
+        def op(db):
+            rows = db.execute("SELECT rowid, body FROM research_llm_exchange WHERE run_id=? AND id=?", (run_id, call_id)).fetchone()
+            if rows is None:
+                return None
+            rowid, record = rows[0], json.loads(rows[1])
+            hashes = record.pop("message_hashes", []) or []
+            wanted = list(dict.fromkeys([*hashes, *([record["tools_hash"]] if record.get("tools_hash") else [])]))
+            blobs = {}
+            for start in range(0, len(wanted), 500):
+                chunk = wanted[start : start + 500]
+                marks = ",".join("?" for _ in chunk)
+                for digest, blob in db.execute(f"SELECT hash, body FROM research_llm_blob WHERE run_id=? AND hash IN ({marks})", (run_id, *chunk)):
+                    blobs[digest] = decode(blob)
+            record["messages"] = [blobs.get(digest) for digest in hashes]
+            record["message_hashes"] = hashes
+            record["tools"] = blobs.get(record.get("tools_hash")) if record.get("tools_hash") else None
+            # The previous request of the same agent loop (or conversion retry
+            # sequence) lets a reader see only what this turn added.
+            group = record.get("group")
+            previous = None
+            if group:
+                for (body,) in db.execute("SELECT body FROM research_llm_exchange WHERE run_id=? AND rowid<? ORDER BY rowid DESC", (run_id, rowid)):
+                    candidate = json.loads(body)
+                    if candidate.get("group") == group:
+                        previous = candidate
+                        break
+            record["previous_call_id"] = previous["id"] if previous else None
+            record["repeated_prefix"] = shared_prefix(previous.get("message_hashes") or [], hashes) if previous else 0
+            # Engines may insert per-turn messages before the history, so compare sets too.
+            seen = set(previous.get("message_hashes") or []) if previous else set()
+            record["new_message_indexes"] = [index for index, digest in enumerate(hashes) if digest not in seen] if previous else list(range(len(hashes)))
+            return record
+
+        return await self.call(op)
+
+    async def profile(self, profile_id="default"):
+        def op(db):
+            row = db.execute("SELECT version, body, updated_at, updated_by FROM research_profile WHERE id=?", (profile_id,)).fetchone()
+            return {"version": row[0], "overrides": json.loads(row[1]), "updated_at": row[2], "updated_by": row[3]} if row else None
+
+        return await self.call(op)
+
+    async def save_profile(self, overrides, expected_version, user=None, profile_id="default"):
+        """Store settings-page overrides; a stale editor cannot overwrite a newer version."""
+
+        def op(db):
+            row = db.execute("SELECT version FROM research_profile WHERE id=?", (profile_id,)).fetchone()
+            version = row[0] if row else 0
+            if expected_version != version:
+                raise ResearchError("PROFILE_VERSION", "研究设置已被其他人修改，请刷新后再保存", recoverable=False)
+            record = {"version": version + 1, "overrides": overrides, "updated_at": utcnow(), "updated_by": user}
+            body = dumps(overrides)
+            db.execute(
+                "INSERT INTO research_profile VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET version=excluded.version, body=excluded.body, updated_at=excluded.updated_at, updated_by=excluded.updated_by",
+                (profile_id, record["version"], body, record["updated_at"], user),
+            )
+            db.execute("INSERT INTO research_profile_history VALUES (?,?,?,?,?)", (profile_id, record["version"], body, record["updated_at"], user))
+            return record
+
+        return await self.call(op)
+
+    async def profile_history(self, profile_id="default", limit=50):
+        def op(db):
+            rows = db.execute("SELECT version, body, updated_at, updated_by FROM research_profile_history WHERE id=? ORDER BY version DESC LIMIT ?", (profile_id, limit))
+            return [{"version": row[0], "overrides": json.loads(row[1]), "updated_at": row[2], "updated_by": row[3]} for row in rows]
+
+        return await self.call(op)
+
+    async def secrets(self):
+        """Saved credential values; only the service reads them, never an API response."""
+        return await self.call(lambda db: dict(db.execute("SELECT name, value FROM research_secret").fetchall()))
+
+    async def secret_names(self):
+        return await self.call(lambda db: [{"name": row[0], "updated_at": row[1], "updated_by": row[2]} for row in db.execute("SELECT name, updated_at, updated_by FROM research_secret ORDER BY name")])
+
+    async def save_secret(self, name, value, user=None):
+        await self.call(
+            lambda db: (
+                db.execute(
+                    "INSERT INTO research_secret VALUES (?,?,?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at, updated_by=excluded.updated_by",
+                    (name, value, utcnow(), user),
+                ).rowcount
+            )
+        )
+
+    async def delete_secret(self, name):
+        return await self.call(lambda db: db.execute("DELETE FROM research_secret WHERE name=?", (name,)).rowcount)
+
+    async def save_snapshot(self, ref, body):
+        import zlib
+
+        await self.call(lambda db: db.execute("INSERT OR IGNORE INTO research_profile_snapshot VALUES (?,?)", (ref, zlib.compress(dumps(body).encode("utf-8"), 6))).rowcount)
+
+    async def snapshot(self, ref):
+        import zlib
+
+        def op(db):
+            row = db.execute("SELECT body FROM research_profile_snapshot WHERE hash=?", (ref,)).fetchone()
+            return json.loads(zlib.decompress(row[0]).decode("utf-8")) if row else None
+
+        return await self.call(op)
 
     async def unit_results(self, run_id):
         return await self.call(lambda db: [{"id": row[0], "result": json.loads(row[1])} for row in db.execute("SELECT id, result FROM research_unit WHERE run_id=? ORDER BY rowid", (run_id,))])

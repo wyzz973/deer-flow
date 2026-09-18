@@ -6,17 +6,42 @@
 
 ## 1. 模型在哪里配置
 
-- 所有模型都只在仓库根目录 `config.yaml` 的 `models:` 列表里定义，每个模型有唯一的 `name`。
-- 其他地方只写这个 `name`：
-  - `config.yaml` 的 `subagents.custom_agents.<角色>.model`
-  - `deepresearch.local.yaml` 的 `skills.<名字>.model` 和 `extraction_model`
-  - `config.yaml` 的 `title.model_name`、`summarization.model_name`（可以不填）
-- `models:` 列表里**第一个**模型是默认模型。
-- 形如 `$变量名` 的值，从环境变量或仓库根目录的 `.env` 读取。变量不存在时，网关启动直接报错
-  `Environment variable XXX not found`。
-- 改完 `config.yaml` 要重启网关才生效。
+**研究和宿主聊天用各自的模型列表，互不影响。**
 
-## 2. 字段说明
+| | 宿主聊天 | DeepResearch |
+| --- | --- | --- |
+| 在哪定义 | `config.yaml` 的 `models:` | 研究配置的 `models:`，或设置页“模型” |
+| 谁引用 | `subagents.*.model`、`title.model_name`、`summarization.model_name` | 研究配置的 `default_model`、`rewrite_model`、`extraction_model`、`skills.*.model`、`compaction.model` |
+| 默认模型 | 列表第一个 | `default_model` |
+| 何时生效 | 重启网关 | 设置页保存后立刻对新建的研究生效 |
+
+研究模型会被写进一份**私有**的引擎配置副本（同名时覆盖宿主模型），宿主的 `config.yaml` 不受影响。
+所以宿主可以只留一个能构造的模型，研究用完全不同的模型。
+
+研究模型的字段名更简单（`provider` 代替 `use`、`timeout_seconds` 代替 `request_timeout`），
+见 [RESEARCH_CONFIGURATION.md 第 3 节](RESEARCH_CONFIGURATION.md#3-models研究模型)：
+
+```yaml
+models:
+  - name: local-model
+    provider: vllm                       # openai | deepseek | vllm | anthropic | custom
+    model: Qwen3-32B                     # --served-model-name
+    base_url: http://127.0.0.1:8000/v1
+    api_key: $LOCAL_MODEL_API_KEY        # 只写引用，不写明文
+    max_tokens: 8192
+    context_window: 65536
+    timeout_seconds: 900
+    supports_thinking: true
+    extra: {}                            # 额外构造参数，原样传给模型类
+default_model: local-model
+```
+
+`api_key` 只接受 `$环境变量` 或 `secret:名字`（设置页保存，只写不读）；解析不到值时报 `MODEL_AUTH_REQUIRED`。
+形如 `$变量名` 的值从环境变量或仓库根目录的 `.env` 读取。
+
+## 2. 字段说明（宿主 `config.yaml` 的 `models:`）
+
+研究模型的等价字段见上一节的表格；`extra` 里可以写这里的任何原生字段。
 
 | 字段 | 必填 | 说明 |
 | --- | --- | --- |
@@ -123,6 +148,8 @@ Ollama 要注意两点：
 
 1. **必须支持工具调用（function calling）。** 研究员靠工具查资料，规划和写作角色靠 `read_file` 读取 Skill 文件。
    不支持工具调用的模型无法完成研究。
+   **只支持流式返回的服务也可以用**：研究的每一次直接调用（笔记整理、请求改写、模型探测）都走流式并聚合结果，
+   只有在服务拒绝流式或流式没有内容时才退回普通请求。
 2. **上下文至少 32k，建议 64k 以上。** 联网验收时，研究员单次输入最多约 4.4 万 Token。
 3. **单次输出至少 4096，建议 8192。** 报告章节和整理后的数据都比较长。
 4. **最好返回 Token 用量（usage）。** 不返回时，指标页的 Token 和费用为空，预算只能按估算扣减。
@@ -132,12 +159,13 @@ Ollama 要注意两点：
 
 | 环节 | 用哪个模型（从左往右，找到第一个就用） |
 | --- | --- |
-| 规划、研究、写作（Agent 执行） | `skills.<名字>.model` → `custom_agents.<角色>.model`（写 `inherit` 时用默认模型） → `models` 第一个 |
-| 输出整理（把回答整理成数据） | `extraction_model` → `skills.<名字>.model` → `custom_agents.<角色>.model`（不是 `inherit` 时） → `models` 第一个 |
+| 请求改写（对话 → 研究请求） | `rewrite_model` → `default_model` → 研究 `models` 第一个 |
+| 规划、研究、写作（Agent 执行） | `skills.<名字>.model` → `default_model` → 旧版绑定的子 Agent 模型 → 研究 `models` 第一个 |
+| 输出整理（把回答整理成数据） | `extraction_model` → 角色的模型（同上一行） |
+| 上下文压缩（研究角色） | `compaction.model` → 角色自己的模型 |
 | 单次输出上限 | 取模型的 `max_tokens` 和研究配置 `max_output_tokens` 中较小的值 |
-| 思考模式 | 研究角色和输出整理总是关闭思考（使用 `when_thinking_disabled`） |
-| 上下文压缩 | `summarization.model_name`；为 `null` 时用当前运行的模型 |
-| 会话标题 | `title.model_name`；为 `null` 时用本地规则生成，不调用模型 |
+| 思考模式 | 研究角色和输出整理总是关闭思考（`supports_thinking: true` 的模型会收到关闭开关） |
+| 宿主聊天的压缩与标题 | `summarization.model_name`、`title.model_name`，与研究无关 |
 
 建议所有研究环节先用同一个模型。等研究能跑通了，再考虑给输出整理（`extraction_model`）换一个更稳的模型。
 
@@ -147,12 +175,12 @@ Ollama 要注意两点：
 | --- | --- | --- |
 | 整理失败、`RESULT_CONTRACT` | `output_retries` 调到 3 或 4；`extraction_model` 用最稳的模型 | 研究配置 |
 | 报告章节反复修复、质量差 | `max_report_sections` 调到 4 或 5；`max_synthesis_repairs` 保持 1 | 研究配置 |
-| 超时、`NATIVE_AGENT_TIMEOUT` | 研究配置的 `skills.*.timeout_seconds` 和 `config.yaml` 的 `custom_agents.*.timeout_seconds` 都调到 1800（生效的是较小值）；模型的 `request_timeout` 和 `stream_chunk_timeout` 调到 900 | 两个文件都要改 |
+| 超时、`NATIVE_AGENT_TIMEOUT` | 研究配置的 `skills.*.timeout_seconds` 调到 1800；研究模型的 `timeout_seconds` 调到 900 | 研究配置 |
 | 显存不够、请求排队 | `max_concurrency` 调到 1；`subagent_runtime.max_running` 不能小于它 | 研究配置、`config.yaml` |
-| 上下文超长 | `summarization.trigger` 调到 `context_window` 的 40% 左右；调低 `sandbox.read_file_output_max_chars` 和 `tool_output.externalize_min_chars` | `config.yaml` |
+| 上下文超长 | 研究配置的 `compaction.trigger_fraction` 调到 0.4–0.5；模型要填 `context_window`；必要时调低 `sandbox.read_file_output_max_chars` | 研究配置（沙箱项在 `config.yaml`） |
 | 一次研究太久 | `budget_ceiling.max_units` 调到 3 或 4；`max_iterations` 调到 0 或 1 | 研究配置 |
 | 计划里要求了没配置的来源，研究单元报 `TOOL_DENIED` | 只有一类来源时设 `require_dual_source: false`，系统会自动去掉没有工具的来源要求 | 研究配置 |
-| 进度说明或报告不是中文 | 换中文能力更好的模型 | `config.yaml` |
+| 进度说明或报告不是中文 | 先确认 `researcher_output` 提示词里的语言要求没被改掉；仍不稳定时换中文能力更好的模型 | 设置页“提示词”、研究配置 |
 
 ## 7. 验证模型配置
 
@@ -162,6 +190,8 @@ Ollama 要注意两点：
 cd backend
 uv run --no-sync python -m deepresearch.doctor --config ../deepresearch.local.yaml --probe-model local-model
 ```
+
+设置页“模型 → 测试连接”做的是同一件事，并且用的是表单里当前（未保存）的配置。
 
 输出里 `model_probe` 各字段的含义：
 

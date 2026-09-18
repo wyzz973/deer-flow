@@ -18,6 +18,7 @@ from contextvars import ContextVar
 from logging.handlers import RotatingFileHandler
 from uuid import uuid4
 
+from .audit import audit_request, audit_response, request_summary, response_summary
 from .output import visible_text
 
 _parent: ContextVar[str | None] = ContextVar("research_span", default=None)
@@ -265,6 +266,8 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
     for key, value in (metric_scope.get() or {}).items():
         scope.setdefault(key, value)
     roles = {**NATIVE_ROLES, **{source.tool: source.role for source in trace.settings.sources}}
+    # Full request/response audit follows the same content-capture switch.
+    audited = trace.settings.trace_capture_content and getattr(trace.settings, "llm_audit", True)
     counters = ("model_calls", "model_errors", "unreported_model_calls", "tool_calls", "tool_errors", "input_tokens", "output_tokens", "total_tokens", "cache_read_tokens", "reasoning_tokens", "max_input_tokens")
 
     async def record_model(key, details):
@@ -273,6 +276,19 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
             await trace.store.record_model_call(trace.run_id, key, {**{k: scope[k] for k in METRIC_KEYS if scope.get(k) is not None}, **details})
         except Exception as exc:
             logger.warning(json.dumps({"event": "model_metrics_failed", "error": type(exc).__name__}))
+
+    async def audit(key, details, request=None):
+        """Complete prompt and answer records; like metrics, never allowed to stop research."""
+        if not audited:
+            return
+        try:
+            if request is None:
+                await trace.store.record_llm_response(trace.run_id, key, details)
+            else:
+                messages, tools = request
+                await trace.store.record_llm_request(trace.run_id, key, details, messages, tools)
+        except Exception as exc:
+            logger.warning(json.dumps({"event": "llm_audit_failed", "error": type(exc).__name__}))
 
     class LocalCallbacks(AsyncCallbackHandler):
         raise_error = True
@@ -284,6 +300,9 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
             self.budget_error = None
             self.provider_error = None
             self.totals = dict.fromkeys(counters, 0)
+            # Calls of one agent loop share its execution ID; a conversion's
+            # bounded retries share this handler instead.
+            self.group = "calls-" + uuid4().hex
 
         def elapsed_ms(self, run_id):
             entry = self.active.get(str(run_id))
@@ -327,6 +346,7 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
                     if kind == "model":
                         self.totals["model_errors"] += 1
                         await record_model(key, {"status": "interrupted", "ended_at": utcnow(), "duration_ms": self.elapsed_ms(key), "error_code": error.code, "estimated_tokens": reserved})
+                        await audit(key, {"status": "interrupted", "ended_at": utcnow(), "duration_ms": self.elapsed_ms(key), "error": {"code": error.code}})
                     await self.finish(key, error=error)
 
         async def on_chat_model_start(self, serialized, messages, *, run_id, **kwargs):
@@ -335,16 +355,39 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
             name = model_name or (serialized or {}).get("name", "model")
             await self.begin(run_id, name, "model", body)
             self.totals["model_calls"] += 1
+            started_at = utcnow()
             await record_model(
                 str(run_id),
                 {
                     "model": name,
                     "status": "running",
-                    "started_at": utcnow(),
+                    "started_at": started_at,
                     "prompt_messages": sum(len(batch) for batch in body),
                     "prompt_chars": sum(len(message["content"] or "") for batch in body for message in batch),
                 },
             )
+            if audited:
+                # Recorded before reservation, so a call rejected by the budget
+                # still shows what it would have sent.
+                try:
+                    normalized, tools, params = audit_request(messages[0] if messages else [], kwargs.get("invocation_params"), trace.secrets)
+                    metadata = kwargs.get("metadata") or {}
+                    details = {
+                        **{key: scope[key] for key in METRIC_KEYS if scope.get(key) is not None},
+                        "model": name,
+                        "status": "running",
+                        "started_at": started_at,
+                        # The engine graph node that made the call, e.g. the agent's model
+                        # node or a summarization middleware compressing its context.
+                        "node": metadata.get("langgraph_node") if isinstance(metadata.get("langgraph_node"), str) else None,
+                        "group": scope.get("execution_id") or self.group,
+                        "params": params,
+                        "batch_size": len(messages),
+                        **request_summary(normalized, tools),
+                    }
+                    await audit(str(run_id), details, (normalized, tools))
+                except Exception as exc:
+                    logger.warning(json.dumps({"event": "llm_audit_failed", "error": type(exc).__name__}))
             try:
                 from langchain_core.messages.utils import count_tokens_approximately
 
@@ -359,7 +402,9 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
             except Exception as exc:
                 self.budget_error = exc
                 self.totals["model_errors"] += 1
-                await record_model(str(run_id), {"status": "error", "ended_at": utcnow(), "duration_ms": self.elapsed_ms(run_id), "error_code": getattr(exc, "code", type(exc).__name__)})
+                code = getattr(exc, "code", type(exc).__name__)
+                await record_model(str(run_id), {"status": "error", "ended_at": utcnow(), "duration_ms": self.elapsed_ms(run_id), "error_code": code})
+                await audit(str(run_id), {"status": "error", "ended_at": utcnow(), "duration_ms": self.elapsed_ms(run_id), "error": {"code": code, "stage": "reservation"}})
                 await self.finish(run_id, error=exc)
                 raise
 
@@ -407,6 +452,13 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
                 "output_chars": sum(len(answer["content"] or "") for answer in answers),
                 "tool_calls": sum(len(answer["tool_calls"] or []) for answer in answers),
             }
+            exchange = {"ended_at": model_record["ended_at"], "duration_ms": model_record["duration_ms"], "usage": details, "usage_reported": known_usage, "response_model": response_model}
+            if audited:
+                try:
+                    returned = audit_response(response, trace.secrets)
+                    exchange.update(response=returned, **response_summary(returned))
+                except Exception as exc:
+                    logger.warning(json.dumps({"event": "llm_audit_failed", "error": type(exc).__name__}))
             if known_usage and reserved is not None:
 
                 def settle(run):
@@ -419,11 +471,13 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
                 if ceiling is not None and current["usage"]["model_tokens"] > ceiling:
                     self.budget_error = ResearchError("BUDGET_EXHAUSTED", "预算已用尽: max_model_tokens", recoverable=False)
                     await record_model(str(run_id), {**model_record, "status": "error", "error_code": self.budget_error.code})
+                    await audit(str(run_id), {**exchange, "status": "error", "error": {"code": self.budget_error.code, "stage": "settlement"}})
                     await self.finish(run_id, payload={"answers": answers, "reported_tokens": usage}, error=self.budget_error)
                     raise self.budget_error
             # Missing usage or a failed call keeps the conservative reservation;
             # uncertainty must not become a free retry or negative accounting.
             await record_model(str(run_id), {**model_record, "status": "ok"})
+            await audit(str(run_id), {**exchange, "status": "ok"})
             await self.finish(run_id, payload={"answers": answers, "reported_tokens": usage})
 
         async def on_llm_error(self, error, *, run_id, **kwargs):
@@ -432,6 +486,9 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
             self.totals["model_errors"] += 1
             code = self.provider_error.code if self.provider_error else type(error).__name__
             await record_model(str(run_id), {"status": "error", "ended_at": utcnow(), "duration_ms": self.elapsed_ms(run_id), "error_code": code, "estimated_tokens": reserved})
+            # Provider exception text may echo request headers; keep typed facts only.
+            status = getattr(error, "status_code", None)
+            await audit(str(run_id), {"status": "error", "ended_at": utcnow(), "duration_ms": self.elapsed_ms(run_id), "error": {"code": code, "type": type(error).__name__, **({"status_code": status} if isinstance(status, int) else {})}})
             await self.finish(run_id, error=error)
 
         async def on_tool_start(self, serialized, input_str, *, run_id, **kwargs):
@@ -468,10 +525,21 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
             # or mutate the object handed to the native model/tool loop.
             safe_content = redact(content, trace.secrets, 256000)
             found = observed_sources(safe_content, connector=spec.name if spec else name, origin=spec.origin if spec else "runtime") if status == "success" else []
-            fetched = fetched_source(redact(getattr(output, "artifact", None), trace.secrets), connector=spec.name, origin=spec.origin) if status == "success" and spec and spec.kind == "native" else None
+            artifact = getattr(output, "artifact", None)
+            fetched = fetched_source(redact(artifact, trace.secrets), connector=spec.name, origin=spec.origin) if status == "success" and spec and spec.kind in {"native", "channel"} else None
             if fetched:
                 found = [source for source in found if source["id"] != fetched["id"]] + [fetched]
             page = {"url": fetched["url"], "title": fetched["title"]} if fetched else {}
+            # Provider-based sources say which backend answered and what failed first.
+            if isinstance(artifact, dict) and artifact.get("provider"):
+                attempts = [{key: item.get(key) for key in ("provider", "type", "status", "kind", "ms")} for item in (artifact.get("attempts") or [])[:10] if isinstance(item, dict)]
+                page.update(provider=artifact["provider"], provider_type=artifact.get("provider_type"), attempts=attempts, failovers=sum(item["status"] in {"error", "empty"} for item in attempts))
+            elif status == "error" and spec and spec.kind == "channel":
+                from .channels import failed_attempts
+
+                attempts = failed_attempts(safe_content)
+                if attempts:
+                    page.update(attempts=attempts, failovers=len(attempts))
             call = await trace.store.record_call(
                 trace.run_id,
                 str(run_id),

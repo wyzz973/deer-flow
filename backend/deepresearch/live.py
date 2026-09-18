@@ -1,8 +1,10 @@
 """Opt-in, loopback-only acceptance launcher for the real DeerFlow Gateway.
 
-This is not an alternate agent runtime. It creates a private configuration
-copy and launches app.gateway.app with the normal extension lifecycle. The
-operator's config, credentials, databases, and skill directory stay unchanged.
+This is not an alternate agent runtime. It creates private configuration copies
+and launches app.gateway.app with the normal extension lifecycle. The engine copy
+only isolates storage; everything research needs (its model, sources with
+provider failover, roles) goes into a separate research configuration. The
+operator's config, credentials, databases and skills stay unchanged.
 """
 
 from __future__ import annotations
@@ -11,7 +13,6 @@ import argparse
 import copy
 import os
 import re
-import shutil
 import tempfile
 from pathlib import Path
 
@@ -19,6 +20,11 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 _SENSITIVE = re.compile(r"key|token|secret|password|authorization|cookie", re.I)
+# Host model fields that map onto a research model; the rest become constructor extras.
+_MODEL_FIELDS = {"base_url", "max_tokens", "context_window", "temperature", "supports_thinking", "max_retries"}
+_SKIPPED_MODEL_FIELDS = {"name", "display_name", "description", "use", "model", "api_key", "timeout", "request_timeout", "supports_vision"}
+# Research models send the provider's thinking switch themselves.
+_SKIPPED_MODEL_FIELDS |= {"when_thinking_enabled", "when_thinking_disabled", "supports_reasoning_effort", "use_responses_api", "output_version"}
 
 
 def private_config(value, environ, prefix="DEERFLOW_ACCEPTANCE_SECRET"):
@@ -45,20 +51,9 @@ def private_config(value, environ, prefix="DEERFLOW_ACCEPTANCE_SECRET"):
     return visit(value)
 
 
-def build_config(base, fragment, home: Path, model: str, *, max_output_tokens=None, unlimited_budget=False):
-    """Keep the configured providers and tools; isolate application state."""
-    if model not in {item["name"] for item in base.get("models", [])}:
-        raise ValueError("Choose an existing model name from the host configuration")
+def build_config(base, home: Path, roles=(), *, unlimited_budget=False):
+    """The engine configuration with isolated application state; research lives elsewhere."""
     value = copy.deepcopy(base)
-    if max_output_tokens is not None:
-        for profile in value["models"]:
-            if profile["name"] != model:
-                continue
-            key = "max_completion_tokens" if "max_completion_tokens" in profile else "max_tokens"
-            profile[key] = max_output_tokens
-            for variant in ("when_thinking_enabled", "when_thinking_disabled"):
-                if isinstance(profile.get(variant), dict):
-                    profile[variant][key] = max_output_tokens
     value["plugins"] = [{"name": "deepresearch", "use": "deepresearch.extension:install", "required": True, "config": {"config_path": str(home / "research.yaml")}}]
     value["database"] = {**value.get("database", {}), "backend": "sqlite", "sqlite_dir": str(home / "database"), "postgres_url": ""}
     value["checkpointer"] = None
@@ -66,19 +61,54 @@ def build_config(base, fragment, home: Path, model: str, *, max_output_tokens=No
     value["scheduler"] = {**value.get("scheduler", {}), "enabled": False}
     value["memory"] = {**value.get("memory", {}), "enabled": False}
     value["subagents"] = copy.deepcopy(value.get("subagents") or {})
-    custom = value["subagents"].setdefault("custom_agents", {})
-    for name, settings in fragment["subagents"]["custom_agents"].items():
-        settings = copy.deepcopy(settings)
-        settings["model"] = model
-        if name in {"industry-researcher", "technical-researcher"}:
-            settings["tools"] = None
-        custom["acceptance-" + name] = settings
-        if unlimited_budget:
-            # Native subagents resolve this policy separately from the lead
-            # agent's top-level token_budget. Disable only acceptance roles.
-            override = value["subagents"].setdefault("agents", {}).setdefault("acceptance-" + name, {})
+    if unlimited_budget:
+        # Native subagents resolve this policy separately from the lead agent's
+        # top-level token_budget. Disable it only for the research roles.
+        for role in roles:
+            override = value["subagents"].setdefault("agents", {}).setdefault("deepresearch-" + role, {})
             override["token_budget"] = {"enabled": False}
     return value
+
+
+def research_model(host_model, *, max_output_tokens=None):
+    """Copy one host model definition into a research model at launch time.
+
+    Research then runs from its own model entry; later host edits do not change it.
+    """
+    from .config import MODEL_PROVIDERS
+
+    use = host_model["use"]
+    provider = next((name for name, path in MODEL_PROVIDERS.items() if path == use), "custom")
+    spec = {"name": host_model["name"], "display_name": host_model.get("display_name") or "", "provider": provider, "model": host_model["model"]}
+    if provider == "custom":
+        spec["use"] = use
+    if host_model.get("api_key"):
+        spec["api_key"] = host_model["api_key"]
+    for field in _MODEL_FIELDS:
+        if host_model.get(field) is not None:
+            spec[field] = host_model[field]
+    timeout = host_model.get("timeout") or host_model.get("request_timeout")
+    if timeout:
+        spec["timeout_seconds"] = timeout
+    extra = {key: item for key, item in host_model.items() if key not in _MODEL_FIELDS | _SKIPPED_MODEL_FIELDS}
+    if extra:
+        spec["extra"] = extra
+    if max_output_tokens is not None:
+        spec["max_tokens"] = max_output_tokens
+    return spec
+
+
+def web_sources(environ, *, jina_key=True):
+    """Public web sources with provider failover, using whichever keys are present."""
+    search = [{"id": name, "type": name, "api_key": f"${variable}"} for name, variable in (("tavily", "TAVILY_API_KEY"), ("serper", "SERPER_API_KEY")) if environ.get(variable)]
+    search.append({"id": "duckduckgo", "type": "duckduckgo"})
+    reader = {"id": "jina", "type": "jina_reader"}
+    if jina_key and environ.get("JINA_API_KEY"):
+        reader["api_key"] = "$JINA_API_KEY"
+    return [
+        {"name": "public-web-search", "tool": "web_search", "role": "search", "origin": "external", "level": "L4", "publisher": "web-search-unclassified", "providers": search},
+        {"name": "public-web-read", "tool": "web_fetch", "role": "read", "origin": "external", "level": "L4", "publisher": "web-content-unclassified", "providers": [reader, {"id": "direct", "type": "direct"}]},
+    ]
 
 
 def _write_yaml(path, data, *, reuse=False, operator_keys=()):
@@ -99,10 +129,10 @@ def _write_yaml(path, data, *, reuse=False, operator_keys=()):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--allow-live", action="store_true", help="Explicitly allow the UI to call configured providers")
-    parser.add_argument("--model", required=True, help="Existing host model name, not a provider invented by this launcher")
+    parser.add_argument("--model", required=True, help="A host model to copy into the research configuration as its model")
     parser.add_argument("--port", type=int, default=8001)
     parser.add_argument("--frontend-port", type=int, default=3100)
-    parser.add_argument("--jina-no-key", action="store_true", help="Use the native Jina client's public mode in this process only")
+    parser.add_argument("--jina-no-key", action="store_true", help="Use Jina Reader without JINA_API_KEY (lower rate limit)")
     parser.add_argument("--max-output-tokens", type=int, help="Per-response limit verified against the configured provider")
     parser.add_argument("--unlimited-budget", action="store_true", help="Disable cumulative tokens, tool-call and elapsed budgets for this isolated acceptance; usage is still recorded")
     parser.add_argument("--resume-dir", type=Path, help="Reuse an existing private live directory after a code-only repair; configuration must match")
@@ -120,8 +150,6 @@ def main():
             os.environ[name] = ""
     for name in ("LANGSMITH_TRACING", "LANGCHAIN_TRACING_V2", "LANGCHAIN_TRACING", "LANGFUSE_ENABLED"):
         os.environ[name] = "false"
-    if args.jina_no_key:
-        os.environ["JINA_API_KEY"] = ""
 
     parent = ROOT / ".deerflow" / "deepresearch"
     parent.mkdir(parents=True, exist_ok=True)
@@ -129,28 +157,31 @@ def main():
     if args.resume_dir and (home.parent != parent.resolve() or not home.name.startswith("live-") or not home.is_dir()):
         parser.error("--resume-dir must be an existing private live directory under .deerflow/deepresearch")
     base = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8")) or {}
-    fragment = yaml.safe_load((ROOT / "examples/deepresearch/host-config.fragment.yaml").read_text(encoding="utf-8"))
-    host = private_config(build_config(base, fragment, home, args.model, max_output_tokens=args.max_output_tokens, unlimited_budget=args.unlimited_budget), os.environ)
-    _write_yaml(home / "host.yaml", host, reuse=bool(args.resume_dir))
+    host_model = next((item for item in base.get("models", []) if item.get("name") == args.model), None)
+    if host_model is None:
+        parser.error("--model must name a model in config.yaml; it is copied into the research configuration")
 
     research = yaml.safe_load((ROOT / "deepresearch.example.yaml").read_text(encoding="utf-8"))
-    sources = yaml.safe_load((ROOT / "examples/deepresearch/native-web.sources.yaml").read_text(encoding="utf-8"))
-    research.update(sources)
-    research.update(runner="deerflow", data_dir=str(home / "research"), native_tools=None, extraction_model=args.model)
+    model = private_config(research_model(host_model, max_output_tokens=args.max_output_tokens), os.environ, prefix="DEERFLOW_ACCEPTANCE_MODEL_SECRET")
+    research.update(
+        runner="deerflow",
+        data_dir=str(home / "research"),
+        models=[model],
+        default_model=model["name"],
+        extraction_model=model["name"],
+        sources=web_sources(os.environ, jina_key=not args.jina_no_key),
+        source_fallback=["public-web-search", "public-web-read"],
+        require_dual_source=False,
+    )
     if args.max_output_tokens is not None:
         research["max_output_tokens"] = args.max_output_tokens
     if args.unlimited_budget:
         # Null is a real disabled ceiling, not an arbitrarily large allowance.
         # Structural unit/iteration limits and native cancellation remain.
         research.setdefault("budget_ceiling", {}).update(max_model_tokens=None, max_tool_calls=None, max_elapsed_seconds=None)
-    (home / "skills" / "public").mkdir(parents=True, exist_ok=bool(args.resume_dir))
-    for name, spec in research["skills"].items():
-        spec["agent"] = "acceptance-" + spec["agent"]
-        spec["model"] = args.model
-        target = home / "skills" / "custom" / name
-        if not args.resume_dir:
-            target.mkdir(parents=True)
-            shutil.copyfile(ROOT / spec["path"], target / "SKILL.md")
+    host = private_config(build_config(base, home, research["skills"], unlimited_budget=args.unlimited_budget), os.environ)
+    _write_yaml(home / "host.yaml", host, reuse=bool(args.resume_dir))
+    (home / "skills" / "public").mkdir(parents=True, exist_ok=True)
     _write_yaml(home / "research.yaml", research, reuse=bool(args.resume_dir), operator_keys=("pricing",))
 
     os.environ.update(

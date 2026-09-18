@@ -86,7 +86,8 @@ class ConversationLifecycle:
                 raise ResearchError("PLAN_VERSION", "计划已变化，请刷新")
             if run["plan"].get("clarification_questions"):
                 raise ResearchError("CLARIFICATION_REQUIRED", "请先回答澄清问题")
-            deadline = (datetime.now(UTC) + timedelta(seconds=self.settings.plan_countdown_seconds)).isoformat()
+            settings = await self.load_settings_for(run)
+            deadline = (datetime.now(UTC) + timedelta(seconds=settings.plan_countdown_seconds)).isoformat()
             run = await self.store.patch(run_id, status="AWAITING_PLAN_CONFIRMATION", auto_start_at=deadline, auto_start_paused=False)
             context = self.context(run, secrets)
             self._arm_countdown(run, context)
@@ -105,8 +106,8 @@ class ConversationLifecycle:
             if run["status"] in STEERABLE_STATUSES:
                 return await self._steer(run_id, text, client_message_id, plan_version)
             self._admit(run_id)
-            if run["fingerprint"] != self.fingerprint:
-                raise ResearchError("CONFIG_CHANGED", "配置已变化，请创建新研究", recoverable=False)
+            await self.load_settings_for(run)
+            self._check_config(run)
             if run["status"] not in REVIEW_STATUSES | {"COMPLETED"}:
                 raise ResearchError("RUN_BUSY", "当前研究正在执行，请等待完成或先停止研究")
             editing = run["status"] in REVIEW_STATUSES

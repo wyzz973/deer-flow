@@ -9,18 +9,28 @@ from contextlib import AsyncExitStack
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
+from . import profile
+from .config import use_settings
 from .contracts import TERMINAL, CreateResearch, ResearchError, ResearchPlan, utcnow
 from .conversation import REVIEW_STATUSES, ConversationLifecycle
 from .evidence import digest
 from .favicons import Favicons
 from .runner import DeerFlowRunner, DemoRunner
+from .secrets import SECRETS, trace_secrets
 from .store import ProcessLock, Store
 from .trace import LocalTrace, install_log, logger
 
 
 class ResearchService(ConversationLifecycle):
     def __init__(self, settings, runner=None):
+        # ``operator`` is the YAML configuration. ``settings`` is what new runs
+        # use: the operator settings plus overrides saved on the settings page.
+        # Each run executes with its own snapshot (see settings_for).
+        self.operator = settings
         self.settings = settings
+        self.profile_version = 0
+        self.profile_error = None
+        self.snapshots = {}
         self.store = Store(settings.resolve(settings.data_dir) / "research.sqlite3")
         self.favicons = Favicons(self.store, enabled=settings.favicons)
         self.lock = ProcessLock(settings.resolve(settings.data_dir) / "worker.lock")
@@ -54,9 +64,11 @@ class ResearchService(ConversationLifecycle):
         try:
             await self.store.start()
             self.log_handler = install_log(self.settings.resolve(self.settings.data_dir))
-            bodies = {name: await asyncio.to_thread(self.settings.read_skill, name) for name in self.settings.skills}
-            self.fingerprint = digest([self.settings.model_dump(mode="json", exclude={"pricing"}), bodies])
-            self.settings._skill_cache = bodies
+            bodies = {name: await asyncio.to_thread(self.operator.read_skill, name) for name in self.operator.skills}
+            self.fingerprint = profile.fingerprint(self.operator, bodies)
+            self.operator._skill_cache = bodies
+            SECRETS.load(await self.store.secrets())
+            await self._load_profile()
             cp = await self.stack.enter_async_context(AsyncSqliteSaver.from_conn_string(str(self.settings.resolve(self.settings.data_dir) / "checkpoints.sqlite3")))
             await cp.setup()
             self.graph = build_workflow(self.settings, self.store, self.runner, cp)
@@ -109,6 +121,84 @@ class ResearchService(ConversationLifecycle):
             self.log_handler.close()
             self.log_handler = None
 
+    async def _load_profile(self):
+        """Apply saved settings-page overrides; invalid ones never block startup."""
+        record = await self.store.profile()
+        self.profile_version = record["version"] if record else 0
+        self.profile_error = None
+        try:
+            self.settings = profile.effective(self.operator, record["overrides"]) if record else self.operator
+        except ValueError as exc:
+            # Operator configuration may have changed underneath saved overrides.
+            self.settings, self.profile_error = self.operator, str(exc)[:2000]
+            logger.warning('{"event": "research_profile_invalid"}')
+        self._rebind_runner()
+
+    def _rebind_runner(self):
+        if hasattr(self.runner, "settings"):
+            try:
+                self.runner.settings = self.settings
+            except AttributeError:  # A custom runner may expose read-only settings.
+                pass
+
+    async def update_profile(self, overrides, expected_version, user=None):
+        """Validate and save settings-page overrides; new runs use them immediately."""
+        candidate = profile.effective(self.operator, overrides)
+        # Methodology files must exist before a run snapshots them.
+        for name in candidate.skills:
+            await asyncio.to_thread(candidate.read_skill, name)
+        record = await self.store.save_profile(profile.overrides_from(candidate, self.operator), expected_version, user)
+        self.settings, self.profile_version, self.profile_error = candidate, record["version"], None
+        self._rebind_runner()
+        return record
+
+    async def reset_profile(self, fields, expected_version, user=None):
+        """Return the named editable fields (or all of them) to the operator file."""
+        record = await self.store.profile()
+        overrides = dict((record or {}).get("overrides") or {})
+        for field in fields or list(overrides):
+            overrides.pop(field, None)
+        return await self.update_profile(overrides, expected_version, user)
+
+    async def restore_profile(self, target_version, expected_version, user=None):
+        history = {item["version"]: item for item in await self.store.profile_history(limit=1000)}
+        if target_version not in history:
+            raise ResearchError("PROFILE_VERSION", "要恢复的设置版本不存在", recoverable=False)
+        return await self.update_profile(history[target_version]["overrides"], expected_version, user)
+
+    async def save_secret(self, name, value, user=None):
+        from .secrets import NAME
+
+        if not NAME.match(name or ""):
+            raise ResearchError("SECRET_NAME", "密钥名只能包含字母、数字、点、下划线和连字符，最长 80 个字符", recoverable=False)
+        if value:
+            await self.store.save_secret(name, value, user)
+        else:
+            await self.store.delete_secret(name)
+        SECRETS.set(name, value or None)
+
+    def settings_for(self, run):
+        """Settings a run executes with: its snapshot, or the operator file for older runs."""
+        ref = (run.get("profile") or {}).get("hash")
+        if ref is None:
+            return self.operator
+        return self.snapshots.get(ref) or self.settings
+
+    async def load_settings_for(self, run):
+        ref = (run.get("profile") or {}).get("hash")
+        if ref is not None and ref not in self.snapshots:
+            body = await self.store.snapshot(ref)
+            if body is None:
+                raise ResearchError("PROFILE_MISSING", "该研究的配置快照不存在，无法继续", recoverable=False)
+            self.snapshots[ref] = profile.restore(self.operator, body)
+        return self.settings_for(run)
+
+    def _check_config(self, run):
+        # Snapshot runs carry their own settings. Older runs still require the
+        # operator configuration they were created with.
+        if not run.get("profile") and run["fingerprint"] != self.fingerprint:
+            raise ResearchError("CONFIG_CHANGED", "任务的 Skill/配置版本与当前部署不同，请恢复原配置或创建新任务", recoverable=False)
+
     def context(self, run, supplied=None):
         secrets = {key: os.environ[env] for key, env in self.settings.local_secret_env.items() if os.environ.get(env)}
         supplied = supplied or {}
@@ -143,6 +233,10 @@ class ResearchService(ConversationLifecycle):
             if not set(request.source_names).issubset({s.name for s in self.settings.sources}):
                 raise ResearchError("SOURCE_UNKNOWN", "请求包含未知数据源", recoverable=False)
             self._admit()
+            snapshot = await asyncio.to_thread(profile.snapshot, self.settings)
+            reference = digest(snapshot)
+            await self.store.save_snapshot(reference, snapshot)
+            self.snapshots.setdefault(reference, profile.restore(self.operator, snapshot))
             run_id = str(uuid4())
             now = utcnow()
             run = {
@@ -154,6 +248,7 @@ class ResearchService(ConversationLifecycle):
                 "created_at": now,
                 "updated_at": now,
                 "fingerprint": self.fingerprint,
+                "profile": {"hash": reference, "version": self.profile_version},
                 "plan": None,
                 "conversation": [{"id": "initial", "role": "user", "kind": "text", "text": request.query, "at": now}],
                 "cycle": 0,
@@ -186,15 +281,15 @@ class ResearchService(ConversationLifecycle):
                 raise ResearchError("PLAN_VERSION", "计划已变化或不在待确认状态，请刷新")
             if action == "approve" and run["plan"].get("clarification_questions"):
                 raise ResearchError("CLARIFICATION_REQUIRED", "请先回答澄清问题")
+            settings = await self.load_settings_for(run)
             if action == "edit":
                 try:
                     proposed = ResearchPlan.model_validate(plan)
-                    self.settings.check_plan(proposed, CreateResearch.model_validate({k: run[k] for k in ["query", "constraints", "source_names", "budget"]}).budget, run["source_names"])
+                    settings.check_plan(proposed, CreateResearch.model_validate({k: run[k] for k in ["query", "constraints", "source_names", "budget"]}).budget, run["source_names"])
                 except ValueError:
                     raise ResearchError("PLAN_INVALID", "计划不符合已注册 Skill、数据源、依赖或预算约束", recoverable=False) from None
             decision = {"action": action, "plan": plan}
-            if run["fingerprint"] != self.fingerprint:
-                raise ResearchError("CONFIG_CHANGED", "配置已变化，请创建新任务", recoverable=False)
+            self._check_config(run)
             operation = {"id": str(uuid4()), "kind": "decision", "decision": decision}
             updated = await self.store.patch(run_id, status="PLANNING" if action == "edit" else "RESEARCHING", auto_start_at=None, auto_start_paused=True, pending_operation=operation)
             self._cancel_countdown(run_id)
@@ -221,8 +316,8 @@ class ResearchService(ConversationLifecycle):
                 raise ResearchError("NOT_RETRYABLE", "该状态不可恢复，请检查限制或创建新任务", recoverable=False)
             snapshot = await self.graph.aget_state(self.config(run))
             initial = None if snapshot.values else {"run": run, "iteration": 0, "synthesis_repairs": 0}
-            if run["fingerprint"] != self.fingerprint:
-                raise ResearchError("CONFIG_CHANGED", "配置已变化，请创建新任务", recoverable=False)
+            await self.load_settings_for(run)
+            self._check_config(run)
             operation = run.get("pending_operation")
             if operation and snapshot.values.get("operation_id") != operation["id"]:
                 initial = self._operation_payload(run)
@@ -243,8 +338,7 @@ class ResearchService(ConversationLifecycle):
     def _launch(self, run, payload, secrets):
         if self.stopping:
             raise ResearchError("SERVICE_STOPPING", "研究服务正在停止，请稍后重试")
-        if run["fingerprint"] != self.fingerprint:
-            raise ResearchError("CONFIG_CHANGED", "任务的 Skill/配置版本与当前部署不同，请恢复原配置或创建新任务", recoverable=False)
+        self._check_config(run)
         self.tasks[run["run_id"]] = asyncio.create_task(self._drive(run, payload, self.context(run, secrets)), name="research-" + run["run_id"])
 
     async def _drive(self, run, payload, context):
@@ -252,14 +346,15 @@ class ResearchService(ConversationLifecycle):
 
         start = time.monotonic()
         pending_plan = None
+        settings = self.settings_for(run)
         try:
             ceiling = run["budget"]["max_elapsed_seconds"]
             remaining = None if ceiling is None else ceiling - run["usage"]["elapsed_seconds"]
             if remaining is not None and remaining <= 0:
                 raise ResearchError("TIME_BUDGET", "研究执行时间预算已用尽", recoverable=False)
-            with tracing_context(enabled=False):
+            with tracing_context(enabled=False), use_settings(settings):
                 async with asyncio.timeout(remaining):
-                    trace = LocalTrace(self.store, run["run_id"], self.settings, context.get("secrets", {}).values())
+                    trace = LocalTrace(self.store, run["run_id"], settings, trace_secrets(settings, context))
                     async with trace.span("workflow", "workflow", {"resume": payload is None}):
                         output = await self.graph.ainvoke(payload, config=self.config(run), context=context)
             operation_id = (run.get("pending_operation") or {}).get("id")
@@ -271,7 +366,7 @@ class ResearchService(ConversationLifecycle):
             await self.store.mutate(run["run_id"], acknowledge)
             if output.get("__interrupt__"):
                 questions = output["plan"].get("clarification_questions", [])
-                deadline = None if questions else (datetime.now(UTC) + timedelta(seconds=self.settings.plan_countdown_seconds)).isoformat()
+                deadline = None if questions else (datetime.now(UTC) + timedelta(seconds=settings.plan_countdown_seconds)).isoformat()
                 pending_plan = await self.store.patch(
                     run["run_id"], status="AWAITING_CLARIFICATION" if questions else "AWAITING_PLAN_CONFIRMATION", plan=output["plan"], units=output["units"], error=None, auto_start_at=deadline, auto_start_paused=bool(questions)
                 )

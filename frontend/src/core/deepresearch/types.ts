@@ -139,15 +139,29 @@ export type Run = {
   cycle?: number;
   conversation?: ResearchMessage[];
   steering?: { id: string; text: string; at: string }[];
+  /** Current rewritten research request (the brief researchers share). */
+  request?: {
+    user_query: string;
+    acknowledgement?: string;
+    clarification_questions?: string[];
+  } | null;
+  /** Settings snapshot this run executes with. */
+  profile?: { hash: string; version: number } | null;
 };
 export type ResearchMessage = {
   id: string;
   role: "user" | "assistant";
-  kind: "text" | "plan" | "report" | "clarification";
+  kind: "text" | "plan" | "report" | "clarification" | "rewrite";
   text: string;
   at: string;
   plan?: Plan;
   report?: Report;
+  /** The conversation rewritten into one complete research request. */
+  rewrite?: {
+    user_query: string;
+    revision: boolean;
+    clarification_questions?: string[];
+  };
   cycle?: number;
   /** A user update accepted while research was running. */
   steering?: boolean;
@@ -522,4 +536,288 @@ export type ResearchMetrics = {
     by_unit: MetricGroup[];
     by_cycle: MetricGroup[];
   };
+};
+
+/** One model request and its response, with complete prompts (GET /llm-calls/{id}). */
+export type AuditContentBlock = {
+  type: string;
+  text?: string;
+  mime_type?: string | null;
+  url?: string | null;
+  bytes?: number | null;
+  [key: string]: unknown;
+};
+export type AuditToolCall = {
+  id?: string | null;
+  name?: string | null;
+  args?: unknown;
+  error?: string | null;
+};
+export type AuditMessage = {
+  role: string;
+  content: string | AuditContentBlock[];
+  name?: string;
+  tool_call_id?: string;
+  status?: string;
+  tool_calls?: AuditToolCall[];
+  invalid_tool_calls?: AuditToolCall[];
+  reasoning?: string;
+};
+export type AuditGeneration = AuditMessage & {
+  finish_reason?: string | null;
+  response_model?: string | null;
+  usage?: Record<string, unknown>;
+};
+export type LlmCallSummary = {
+  id: string;
+  audited: boolean;
+  status?: string;
+  model?: string;
+  response_model?: string | null;
+  phase?: string;
+  purpose?: string;
+  skill?: string;
+  agent_name?: string;
+  unit_id?: string;
+  execution_id?: string;
+  contract?: string;
+  cycle?: number;
+  group?: string;
+  /** Engine graph node that made the call (agent model node, summarization…). */
+  node?: string | null;
+  started_at?: string;
+  ended_at?: string;
+  duration_ms?: number | null;
+  message_count?: number;
+  roles?: Record<string, number>;
+  system_chars?: number;
+  prompt_chars?: number;
+  tools?: string[];
+  last_input?: { role: string; name?: string | null; preview: string } | null;
+  preview?: string;
+  output_chars?: number;
+  reasoning_chars?: number;
+  tool_calls?: string[] | number;
+  finish_reason?: string | null;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  cache_read_tokens?: number | null;
+  reasoning_tokens?: number | null;
+  total_tokens?: number | null;
+  usage?: Record<string, number | null> | null;
+  error?: {
+    code?: string;
+    type?: string;
+    status_code?: number;
+    stage?: string;
+  } | null;
+  error_code?: string | null;
+  params?: Record<string, unknown>;
+};
+/** In a detail response ``tools`` holds the tool schemas, not just their names. */
+export type LlmCallDetail = Omit<LlmCallSummary, "tools"> & {
+  messages: (AuditMessage | null)[];
+  message_hashes: string[];
+  tools: Record<string, unknown>[] | null;
+  response?: { generations: AuditGeneration[] } | null;
+  previous_call_id: string | null;
+  repeated_prefix: number;
+  /** Messages not present in the previous request of the same agent loop. */
+  new_message_indexes?: number[];
+  openai_request: Record<string, unknown>;
+};
+
+export type SecretStatus = "set" | "missing" | "none";
+export type ModelSpec = {
+  name: string;
+  display_name?: string;
+  provider: "openai" | "deepseek" | "vllm" | "anthropic" | "custom";
+  use?: string | null;
+  model: string;
+  base_url?: string | null;
+  api_key?: string | null;
+  max_tokens?: number | null;
+  context_window?: number | null;
+  temperature?: number | null;
+  timeout_seconds?: number;
+  max_retries?: number;
+  supports_thinking?: boolean;
+  extra?: Record<string, unknown>;
+};
+export type RoleSpec = {
+  agent?: string | null;
+  path?: string | null;
+  methodology?: string | null;
+  name?: string;
+  description: string;
+  model?: string | null;
+  system_prompt?: string;
+  tools?: string[] | null;
+  enabled?: boolean;
+  max_turns?: number | null;
+  timeout_seconds?: number;
+};
+export type ProviderSpec = {
+  id: string;
+  type: string;
+  enabled?: boolean;
+  api_key?: string | null;
+  base_url?: string | null;
+  options?: Record<string, unknown>;
+  method?: "GET" | "POST";
+  url?: string | null;
+  headers?: Record<string, string>;
+  params?: Record<string, unknown>;
+  body?: Record<string, unknown> | null;
+  server?: string | null;
+  tool?: string | null;
+  arguments?: Record<string, unknown>;
+  timeout_seconds?: number;
+  allow_private_network?: boolean;
+};
+export type SourceSpec = {
+  name: string;
+  origin: Origin;
+  kind?: "channel" | "mcp" | "native";
+  tool: string;
+  role: "search" | "read" | "data";
+  level?: "L1" | "L2" | "L3" | "L4";
+  priority?: number;
+  publisher?: string;
+  description?: string;
+  providers: ProviderSpec[];
+  server?: string | null;
+  mcp_tool?: string | null;
+  [key: string]: unknown;
+};
+export type McpServerSpec = {
+  transport: "stdio" | "http" | "sse" | "streamable_http";
+  command?: string | null;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string | null;
+  headers?: Record<string, string>;
+  timeout_seconds?: number;
+  enabled?: boolean;
+  description?: string;
+};
+export type CompactionSpec = {
+  enabled: boolean;
+  trigger_fraction: number;
+  fallback_trigger_tokens: number;
+  keep_fraction: number;
+  max_summary_input_tokens: number;
+  model: string | null;
+};
+/** The editable part of the research configuration (settings page). */
+export type EditableSettings = {
+  compaction: CompactionSpec;
+  skills: Record<string, RoleSpec>;
+  prompts: Record<string, string>;
+  models: ModelSpec[];
+  default_model: string | null;
+  rewrite_model: string | null;
+  extraction_model: string | null;
+  mcp_servers: Record<string, McpServerSpec>;
+  engine_tools: string[];
+  sources: SourceSpec[];
+  source_fallback: string[];
+  require_dual_source: boolean;
+  max_concurrency: number;
+  plan_countdown_seconds: number;
+  max_output_tokens: number;
+  output_retries: number;
+  allow_limited_report: boolean;
+  cite_search_results: boolean;
+  max_synthesis_repairs: number;
+  max_report_sections: number;
+  trace_capture_content: boolean;
+  llm_audit: boolean;
+  pricing: Record<
+    string,
+    {
+      input_per_million: number;
+      output_per_million: number;
+      cached_input_per_million?: number | null;
+      currency: string;
+    }
+  >;
+};
+export type ProviderHealth = {
+  key: string;
+  source: string;
+  provider: string;
+  type: string;
+  successes: number;
+  failures: number;
+  cooling: boolean;
+  cooldown_seconds: number;
+  last_error_kind?: string;
+  last_error?: string;
+  last_latency_ms?: number;
+};
+export type SettingsView = {
+  version: number;
+  editable: boolean;
+  error: string | null;
+  settings: EditableSettings;
+  defaults: EditableSettings;
+  overridden: string[];
+  updated_at: string | null;
+  operator: {
+    runner: string;
+    max_active_runs: number;
+    favicons: boolean;
+    budget_ceiling: Budget;
+    native_tools: string[] | null;
+  };
+  catalog: {
+    model_providers: {
+      id: string;
+      label: string;
+      hint: string;
+      base_url: string | null;
+      use: string | null;
+    }[];
+    source_providers: {
+      type: string;
+      label: string;
+      role: "search" | "read" | "data" | null;
+      requires_key: boolean;
+      key_env: string | null;
+      base_url: string | null;
+      docs: string | null;
+    }[];
+    engine_tools: { name: string; description: string }[];
+    fixed_roles: string[];
+    prompts: {
+      key: string;
+      stage: string;
+      label: string;
+      description: string;
+      default: string;
+    }[];
+  };
+  secrets: { saved: string[]; references: Record<string, SecretStatus> };
+  health: ProviderHealth[];
+};
+export type ModelProbe = {
+  model: string;
+  ok: boolean;
+  error?: string;
+  use?: string;
+  max_tokens?: number | null;
+  context_window?: number | null;
+  plain_reply?: { seconds: number; text: string };
+  tool_call?: { seconds: number; tools: string[] };
+  usage?: Record<string, number | null>;
+  warnings?: string[];
+};
+export type ProviderProbe = {
+  ok: boolean;
+  ms: number;
+  kind?: string;
+  message?: string;
+  count?: number;
+  sample?: { title?: string | null; url?: string | null; snippet?: string }[];
 };

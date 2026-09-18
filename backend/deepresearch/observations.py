@@ -150,7 +150,32 @@ def research_observations(execution: NativeExecution, sources):
             raw_content_ref=f"execution:{execution.execution_id}:{call_id}",
         )
         evidence[raw_id] = item
-        fetched = fetched_source(message.get("artifact"), connector=source.name if source else name, origin=item.origin) if source and source.kind == "native" else None
+        artifact = message.get("artifact")
+        fetched = fetched_source(artifact, connector=source.name if source else name, origin=item.origin) if source and source.kind in {"native", "channel"} else None
+        # A knowledge source's records become separate citable evidence with
+        # their own titles; the combined tool output stays as a superseded copy.
+        records = artifact.get("records") if source and source.role == "data" and isinstance(artifact, dict) and artifact.get("schema") == "deepresearch.records.v1" else None
+        if records:
+            for index, record in enumerate(records[:100]):
+                if not isinstance(record, dict) or not str(record.get("snippet") or "").strip():
+                    continue
+                record_id = "rec_" + digest([execution.execution_id, call_id, index])[:24]
+                try:
+                    link = safe_http_url(record.get("url")) if record.get("url") else None
+                except ValueError:
+                    link = None
+                evidence[record_id] = item.model_copy(
+                    update={
+                        "raw_id": record_id,
+                        "title": str(record.get("title") or item.title)[:1000],
+                        "url": link,
+                        "source_uri": f"tool-result://{execution.execution_id}/{record_id}",
+                        "snippet": str(record["snippet"])[:20000],
+                        "published_at": None,
+                        "document_hash": digest(str(record["snippet"])),
+                    }
+                )
+                catalog.append({"raw_id": record_id, "receipt_id": receipt.get("id"), "tool_call_id": call_id, "tool_name": name, "origin": item.origin, "title": evidence[record_id].title, "url": link, "record": index + 1})
         if fetched:
             document_id = "doc_" + digest([execution.execution_id, call_id, fetched["id"]])[:24]
             document = item.model_copy(
@@ -169,7 +194,7 @@ def research_observations(execution: NativeExecution, sources):
             catalog.append({"raw_id": document_id, "receipt_id": receipt.get("id"), "tool_call_id": call_id, "tool_name": name, "origin": item.origin, "url": observed["url"], "title": observed["title"], "excerpt": observed["excerpt"]})
         # When the native reader registered the page itself, cite that page
         # (with its URL) rather than the anonymous tool envelope.
-        catalog.append({"raw_id": raw_id, "receipt_id": receipt.get("id"), "tool_call_id": call_id, "tool_name": name, "origin": item.origin, "excerpt": item.snippet, "superseded": bool(fetched)})
+        catalog.append({"raw_id": raw_id, "receipt_id": receipt.get("id"), "tool_call_id": call_id, "tool_name": name, "origin": item.origin, "excerpt": item.snippet, "superseded": bool(fetched or records)})
     return list(evidence.values()), catalog
 
 

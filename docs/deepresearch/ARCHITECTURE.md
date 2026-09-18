@@ -1,6 +1,6 @@
 # DeepResearch 架构与工作流
 
-更新时间：2026-09-17。本文描述当前代码的实际设计，是 DeepResearch 架构的权威说明。
+更新时间：2026-09-18。本文描述当前代码的实际设计，是 DeepResearch 架构的权威说明。
 `DESIGN_BASELINE.md`、`RUNTIME.md` 是早期设计记录；`NATIVE_RUNTIME.md`、`REUSE_AUDIT.md`
 是原生复用专题。接口契约以 [API.md](API.md) 与 [openapi.json](openapi.json) 为准，交接状态见
 [HANDOFF.md](HANDOFF.md)，交互对标依据见 [CHATGPT_BENCHMARK_2026-09-16.md](CHATGPT_BENCHMARK_2026-09-16.md)。
@@ -12,12 +12,14 @@ DeepResearch 是 DeerFlow 的可选扩展：`backend/deepresearch/extension.py` 
 
 | 原则 | 含义 |
 | --- | --- |
-| 复用原生运行时 | 规划、研究、写报告等角色都通过 `SubagentExecutor` 运行真正的 DeerFlow Agent，复用模型、工具、MCP、Skill、沙箱、授权和生命周期；不另建 Agent loop 或中间件链 |
-| 工具返回不做业务映射 | MCP 与原生工具的参数 schema 和返回值原样交给模型；研究结束后才从消息与 receipts 中观察来源和证据 |
+| 复用原生运行时 | 规划、研究、写报告等角色都通过 `SubagentExecutor` 运行真正的 DeerFlow Agent，复用模型工厂、中间件、Skill、沙箱、授权和生命周期；不另建 Agent loop 或中间件链 |
+| 配置与 DeerFlow 独立 | 模型、数据源与供应商、MCP 服务、角色、提示词、引擎工具、压缩策略、预算都是研究自己的配置；宿主 `config.yaml` 只负责 `plugins` 注册。研究模型写进一份**私有** AppConfig 副本，运营方配置对象不被修改 |
+| 数据源统一成固定工具 | 每个数据源对模型只暴露一套固定参数（`search`/`read`/`data`），背后的供应商按顺序故障切换；MCP 或宿主工具绑定的来源仍然原样交给模型，返回值不做业务映射 |
 | 不依赖 JSON mode | 结构化输出用普通文本解析加有限修复；报告正文直接是 Markdown |
 | 引用必须真实 | 报告只能引用本次运行中真正读取过、且有资格引用的证据；编号绑定由代码完成，无法验证的陈述被删除，绝不猜测替换 ID 或 URL |
 | 交互对标 ChatGPT 深度研究 | 研究简报式计划、倒计时与编辑、修改即开始、研究中更新、活动时间线、全屏阅读器与来源面板 |
-| 本地可观测 | 完整 Trace 存在本地数据库，受 owner/ACL 保护，不需要 LangSmith |
+| 本地可观测 | 完整 Trace 与每次模型调用的完整提示词/返回存在本地数据库，受 owner/ACL 保护，不需要 LangSmith |
+| 配置可编辑、运行可复现 | 管理员在设置页改配置会产生新版本；每个研究任务保存创建时的完整配置快照并全程使用它 |
 | 部署边界明确 | 单 worker、SQLite；外部工具至多保证 at-least-once；不宣称 exactly-once 或事实正确 |
 
 ## 2. 系统上下文
@@ -71,6 +73,14 @@ flowchart TB
 | `store.py` | SQLite 存储、事务、事件序号、原子发布、缓存、图标缓存 |
 | `favicons.py` | 网站图标代取：公网地址校验、位图识别、缓存 |
 | `config.py` / `contracts.py` | 配置 schema 与领域契约（计划、单元、结果、证据、大纲、错误、状态） |
+| `prompts.py` | 全部模型指令的默认值与 `PromptSet` 契约（含上下文压缩模板） |
+| `models.py` | `ModelSpec` → 引擎 `ModelConfig`，私有 AppConfig 副本、角色模型解析、压缩策略 |
+| `secrets.py` | `$ENV` / `secret:NAME` 引用解析、只写密钥、Trace 脱敏值 |
+| `profile.py` | 可编辑字段、设置页覆盖层、运行快照与还原、旧指纹兼容 |
+| `providers.py` / `channels.py` / `extract.py` | 供应商预设与错误分类；固定 schema 的数据源工具、健康度与故障切换；格式无关的结果解析 |
+| `mcp.py` | 研究自己的 MCP 服务：连接、工具发现缓存、调用与工具源 |
+| `audit.py` | 模型调用审计：消息内容寻址、工具与参数归一、脱敏、OpenAI 请求重建 |
+| `catalog.py` | 设置页目录：模型服务类型、供应商预设、引擎工具、固定角色、提示词默认值 |
 | `live.py` / `demo.py` / `doctor.py` | 隔离真实验收启动器、合成演示应用、配置检查与模型探测（`--probe-model`） |
 
 ### 3.2 前端 `frontend/src/`
@@ -85,6 +95,9 @@ flowchart TB
 | `components/deepresearch/citation-preview.tsx` | 引用悬浮卡（原文片段）与网站图标 `SiteIcon` |
 | `components/deepresearch/metrics-panel.tsx` | “指标”页签：耗时、Token、费用、调用、子 Agent 与效率 |
 | `components/deepresearch/trace-panel.tsx` | 本地 Trace 浏览与导出 |
+| `components/deepresearch/llm-calls-panel.tsx` / `llm-call-dialog.tsx` | “LLM 调用”审计：按阶段与轮次分组、逐次查看提示词/返回/工具定义/参数/原始 JSON |
+| `components/deepresearch/request-card.tsx` | 改写后的研究请求卡（`rewrite` 消息） |
+| `components/deepresearch/research-settings.tsx` + `settings/` | 研究设置页：模型、角色、提示词、数据源与供应商、MCP、运行参数、密钥与历史 |
 | `components/deepresearch/research-history.tsx` / `research-gallery.tsx` | 侧栏研究历史；空白页“推荐/报告” |
 | `components/deepresearch/workbench.tsx` | 兼容旧入口的别名导出 |
 | `core/deepresearch/api.ts` / `hooks.ts` / `events.ts` | 研究 API 客户端、查询与 SSE、事件解析与快照合并 |
@@ -148,12 +161,13 @@ stateDiagram-v2
 ```mermaid
 flowchart LR
   START((START)) -->|input_mode = follow_up| FU[follow_up]
-  START -->|其他| PL[planner]
+  START -->|其他| RW[rewrite]
+  RW --> PL[planner]
   FU -->|answer| E((END))
   FU -->|revise| SY[synthesis]
-  FU -->|research| PL
+  FU -->|research| RW
   PL --> RV[plan_review]
-  RV -->|edit| PL
+  RV -->|edit| RW
   RV -->|approve| DI[dispatch]
   RV -->|reject| RJ[rejected] --> E
   DI --> ME[evidence_merge] --> VA[validator]
@@ -171,7 +185,8 @@ flowchart LR
 
 | 节点 | 状态 | 做什么 | 关键事件 | 持久化与缓存 |
 | --- | --- | --- | --- | --- |
-| `planner` | `PLANNING` | 调用 `deepresearch` 角色生成 `ResearchPlan`：研究简报 `brief`、短标题、3–6 个带短标题的单元、前提假设、报告风格、来源策略；对话修改时写 `acknowledgement` 并设置 `auto_start`；`require_dual_source: false` 时由 `Settings.fit_origins` 去掉没有来源可用的 `required_origins` | `plan.created` / `plan.updated` | 缓存键 `plan:`；写入 `plan` 与 `units`；追加 `ack-N` 与 `plan-N` 对话消息 |
+| `rewrite` | `PLANNING` | 把整段对话改写成一条完整的研究请求 `ResearchRequest`（`user_query`、可选 `acknowledgement`、至多 3 个澄清问题），对标 ChatGPT 调用 Deep Research App 时的 `user_query`。修改计划或追问触发新研究时，从上一版请求出发合并本次修改并写确认话术。模型未按契约输出时退化为纯文本请求并发 `research.request.prose` | `research.request.rewritten` | 写入 `request`；追加 `request-N` 对话消息（`kind: rewrite`） |
+| `planner` | `PLANNING` | 调用 `deepresearch` 角色把改写后的请求变成 `ResearchPlan`：研究简报 `brief`（即改写后的请求）、短标题、3–6 个带短标题的单元、前提假设、报告风格、来源策略；对话修改时写 `acknowledgement` 并设置 `auto_start`；`require_dual_source: false` 时由 `Settings.fit_origins` 去掉没有来源可用的 `required_origins` | `plan.created` / `plan.updated` | 缓存键 `plan:`；写入 `plan` 与 `units`；追加 `ack-N` 与 `plan-N` 对话消息 |
 | `plan_review` | 等待确认 | `auto_start` 时记录 `plan.auto_started`（`source=revision`）并直接批准；否则 `interrupt` 等待决策 | `plan.waiting_confirmation`（由服务写入）、`plan.auto_started` | 中断前无副作用，恢复时节点重跑 |
 | `dispatch` | `RESEARCHING` | 按依赖分批并行（`max_concurrency`）运行研究单元；已提交结果直接复用；非致命失败降级为占位结果；致命错误或整批失败使运行失败 | `research.unit.started` / `completed` / `failed` | `research_unit` 结果；`unit_statuses`、`unit_failures` |
 | `evidence_merge` | — | `merge_results` 按计划顺序把原始证据合并为稳定的 `E###`，生成 `BoundFinding` 与 lineage | `evidence.pool.updated` | `research_evidence`；`evidence_count` |
@@ -422,6 +437,16 @@ workflow、节点、原生 Agent、模型调用、工具调用、结构化转换
 模型用量先按估算预留（`usage.reserved`），拿到提供方用量后结算（`usage.settled`）；未知用量保留预留。
 工具与 token 超出预算时报 `BUDGET_EXHAUSTED`。
 
+### 12.1.1 模型调用审计（`audit.py`）
+
+`llm_audit: true`（且 `trace_capture_content` 开启）时，每次模型调用都在 `on_chat_model_start` 记下归一化后的请求：
+消息按 sha256 内容寻址并 zlib 压缩存进 `research_llm_blob`，工具定义单独哈希，参数按白名单保留；
+返回（含推理内容、工具调用、finish reason、用量）在 `on_llm_end` 补齐，失败时记错误类别。
+每条记录带 `node`（langgraph 节点，例如上下文压缩中间件）与 `group`（执行 ID），读取时与同组上一次调用做差集，
+给出 `repeated_prefix` 与 `new_message_indexes`，界面据此显示“只看本轮新增”。
+已知凭据值、`Bearer` 令牌和 URL 中的密钥参数在存储前脱敏。
+接口：`GET /{id}/llm-calls`（合并指标）、`/{id}/llm-calls/{call_id}`（含可重建的 OpenAI 请求）、`/{id}/llm-calls/export`。
+
 ### 12.2 活动时间线（`activity.py`）
 
 `GET /{id}/activity` 从本轮 cycle 的事件与调用投影出结构化条目：`plan`、`step`、`note`（研究员进展说明）、
@@ -466,7 +491,8 @@ workflow、节点、原生 Agent、模型调用、工具调用、结构化转换
   列出未定价模型；多币种时只给分币种合计。
 - `model_calls`：次数、错误码、finish reason、延迟 p50/p95、最大上下文。
 - `tools`：次数、错误率与错误类型、延迟、返回字符、搜索次数、读取页面数、按工具明细；重复调用（同一工具同一参数、在一次成功之后，
-  区分同一子 Agent 内与跨 Agent；分页与失败重试不算）；读取失败最多的 10 个站点。
+  区分同一子 Agent 内与跨 Agent；分页与失败重试不算）；读取失败最多的 10 个站点；
+  `failovers` 与 `by_provider`（每个数据源供应商的尝试、应答、空结果、错误、冷却跳过、缓存命中、错误类别与延迟）。
 - `agents`：完成/失败/取消、失败码、最大并行数、按角色汇总、每次执行明细与费用。
 - `units`：按计划顺序列出每个研究单元（含补研）的耗时、模型调用、Token、费用、工具调用、搜索、读取页面、原始证据、
   被引用页面数（报告引用的 `unit_ids`）与每条引用 Token，用来找出高消耗、低产出的单元。
@@ -491,11 +517,13 @@ workflow、节点、原生 Agent、模型调用、工具调用、结构化转换
 | 对话与控制 | `POST /{id}/messages`、`POST /{id}/cancel`、`POST /{id}/retry` |
 | 过程 | `GET /{id}/events`（SSE）、`GET /{id}/activity`、`GET /{id}/sources`、`GET /{id}/evidences` |
 | 成本与效率 | `GET /{id}/metrics`、`GET /{id}/metrics/export` |
-| 报告与审计 | `GET /{id}/report?format=json\|md\|html\|docx&version=N`、`GET /{id}/trace`、`GET /{id}/trace/export` |
+| 报告与审计 | `GET /{id}/report?format=json\|md\|html\|docx&version=N`、`GET /{id}/trace`、`GET /{id}/trace/export`、`GET /{id}/llm-calls`、`GET /{id}/llm-calls/{call_id}`、`GET /{id}/llm-calls/export` |
+| 设置（读取需登录，修改需管理员） | `GET/POST /settings`、`POST /settings/reset`、`/settings/restore`、`GET /settings/history`、`POST /settings/secrets`、`/settings/test-model`、`/settings/test-provider`、`/settings/mcp-tools`、`GET /settings/health` |
 | 资源 | `GET /favicon?domain=`（网站图标） |
 
-错误映射：`SERVICE_STOPPING` → 503；`RUN_BUSY`、`PLAN_VERSION`、`NOT_RETRYABLE`、`IDEMPOTENCY_CONFLICT`、`CONFIG_CHANGED`
-→ 409；`CAPACITY` → 429；其他研究错误 → 422。owner 不匹配与不存在同样返回 404。
+错误映射：`SERVICE_STOPPING` → 503；`RUN_BUSY`、`PLAN_VERSION`、`NOT_RETRYABLE`、`IDEMPOTENCY_CONFLICT`、`CONFIG_CHANGED`、
+`PROFILE_VERSION`（设置版本冲突）→ 409；`CAPACITY` → 429；设置校验失败 → 422（只返回字段路径与消息，不回显提交值）；
+其他研究错误 → 422。owner 不匹配与不存在同样返回 404；非管理员修改设置 → 403。
 
 ## 14. 前端架构
 
@@ -541,8 +569,13 @@ Gateway 依次尝试主机与上级站点的 `/favicon.ico`、首页声明的最
 | --- | --- | --- |
 | `runner` / `runner_factory` | `demo` / 无 | `deerflow` 为真实执行；工厂由管理员指定 |
 | `data_dir` | `.deerflow/deepresearch` | 数据库、检查点、日志 |
-| `skills` | 必填 | 必须包含 `deepresearch` 与 `report-synthesis`；研究 Skill 的 `agent`、`model`、`max_turns`、`timeout_seconds` |
-| `sources` | `[]` | `name`、`kind`（`native` / `mcp`）、`tool`、`server`、`origin`（internal / external）、`level`、`role`（search / read / data） |
+| `models` / `default_model` / `rewrite_model` / `extraction_model` | `[]` / 无 | 研究自己的模型；注入私有 AppConfig 副本，宿主 `models` 不受影响 |
+| `skills` | 必填 | 必须包含 `deepresearch` 与 `report-synthesis`；`methodology` 或 `path`、`model`、`system_prompt`、`tools`、`enabled`、`max_turns`、`timeout_seconds`（`agent` 是旧版绑定） |
+| `sources` | `[]` | `name`、`tool`、`role`（search / read / data）、`origin`、`level`、`providers`（按序故障切换）；`kind: mcp` 直接暴露 MCP 工具，`kind: native` 是旧版宿主工具绑定 |
+| `mcp_servers` / `engine_tools` | `{}` / `[read_file]` | 研究自己的 MCP 服务；研究员可用的引擎工具（不继承宿主工具表） |
+| `prompts` | 默认见 `prompts.py` | 17 条指令全部可覆盖，含 `rewrite` 与 `compaction` |
+| `compaction` | 见 `CompactionSpec` | 上下文压缩：按角色模型上下文比例触发、按 token 保留、研究自己的摘要提示词 |
+| `llm_audit` | `true` | 是否保存每次模型调用的完整提示词与返回 |
 | `max_concurrency` / `max_active_runs` | 3 / 8 | 单运行并行度与全局容量 |
 | `plan_countdown_seconds` | 45 | 计划倒计时 |
 | `max_output_tokens` / `output_retries` / `extraction_model` | 4096 / 2 / 无 | 单次输出上限与转换修复 |
@@ -556,13 +589,22 @@ Gateway 依次尝试主机与上级站点的 `/favicon.ico`、首页声明的最
 | `trace_capture_content` / `trace_max_chars` | true / 16000 | Trace 内容采集 |
 | `local_secret_env` / `request_secret_headers` / `access_policy` | 空 | 本地密钥环境变量名、请求头到凭据键的映射、读取时 ACL 钩子 |
 
-示例见仓库根 `deepresearch.example.yaml`、`examples/deepresearch/host-config.fragment.yaml`
-（研究角色超时 600 秒）与 `examples/deepresearch/native-web.sources.yaml`（原生搜索为 `search`、抓取为 `read`）。
+示例见仓库根 `deepresearch.example.yaml`、`examples/deepresearch/host-config.fragment.yaml`（只有 `plugins`）、
+`examples/deepresearch/web-sources.fragment.yaml`（公网搜索/阅读的供应商链）与
+`examples/deepresearch/mcp-sources.fragment.yaml`（研究自己的 MCP 服务与按请求凭据）。
 离线模板在 `examples/deepresearch/offline/`（本地模型、内网知识库、`LocalSandboxProvider`），由 `test_offline_config.py` 校验。
 逐字段说明见 [RESEARCH_CONFIGURATION.md](RESEARCH_CONFIGURATION.md)，模型与宿主配置见
 [MODEL_CONFIGURATION.md](MODEL_CONFIGURATION.md)、[DEERFLOW_CONFIGURATION.md](DEERFLOW_CONFIGURATION.md)。
 `python -m deepresearch.doctor --config <研究配置> [--probe-model <模型名>]` 检查配置与研究角色；加 `--probe-model` 时
 对该模型发一次普通请求和一次工具调用，报告工具调用、用量与上下文告警，失败时退出码为 1。
+
+### 15.1.1 设置页与运行快照
+
+管理员在 `/workspace/deepresearch/settings` 修改的字段（`profile.EDITABLE`）以覆盖层存进 `research_profile`，
+每次保存产生新版本并记入 `research_profile_history`；运维字段（`profile.OPERATOR_ONLY`）只能改文件。
+创建研究任务时把生效配置写成内容寻址的快照（`research_profile_snapshot`，方法论正文内联），运行全程用它，
+所以保存设置只影响之后新建的研究。快照与覆盖层在反序列化时会丢弃当前 schema 不认识的字段并告警，
+保证升级后旧任务仍可恢复。更早期没有快照的任务继续沿用配置指纹校验。
 
 ### 15.2 Skills
 

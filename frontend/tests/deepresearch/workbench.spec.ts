@@ -114,6 +114,11 @@ for (const entry of ["/deepresearch-demo", "/workspace/deepresearch"]) {
     );
     await page.getByRole("button", { name: "关闭报告", exact: true }).click();
     await page.getByRole("button", { name: "查看 Trace", exact: true }).click();
+    // The inspector opens on the model-call audit; the demo runner never calls a model.
+    await expect(page.getByTestId("llm-calls-panel")).toContainText(
+      "还没有模型调用",
+    );
+    await page.getByRole("tab", { name: "Trace 时间线", exact: true }).click();
     await expect(page.locator('[aria-label="Trace 时间轴"]')).toBeVisible();
     await page
       .getByRole("textbox", { name: "搜索 Trace", exact: true })

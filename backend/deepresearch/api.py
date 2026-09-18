@@ -12,8 +12,52 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel, Field, ValidationError
 
 from .contracts import TERMINAL, ConversationMessage, CreateResearch, PlanDecision, PlanEdit, ResearchError, RetryResearch, utcnow
+
+
+class SettingsUpdate(BaseModel):
+    version: int = Field(ge=0)
+    settings: dict
+
+
+class SettingsReset(BaseModel):
+    version: int = Field(ge=0)
+    fields: list[str] | None = None
+
+
+class SettingsRestore(BaseModel):
+    version: int = Field(ge=0)
+    target_version: int = Field(ge=1)
+
+
+class SecretUpdate(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    value: str | None = Field(default=None, max_length=20000)
+
+
+class ModelTest(BaseModel):
+    model: dict
+
+
+class ProviderTest(BaseModel):
+    source: dict
+    provider_id: str
+    query: str | None = Field(default=None, max_length=500)
+    url: str | None = Field(default=None, max_length=4000)
+    mcp_servers: dict | None = None
+
+
+class McpToolsRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    server: dict
+
+
+def validation_detail(error):
+    """Field paths and messages only; submitted values may contain credentials."""
+    errors = [{"field": ".".join(str(part) for part in item.get("loc", ())), "message": item.get("msg", "")} for item in error.errors(include_input=False, include_url=False)[:30]]
+    return {"code": "SETTINGS_INVALID", "message": "研究设置未通过校验", "errors": errors}
 
 
 def build_router(service, *, local_demo=False, demo_origins=None):
@@ -32,6 +76,7 @@ def build_router(service, *, local_demo=False, demo_origins=None):
             allowed_origins.add(str(request.base_url).rstrip("/"))
             if origin and origin not in allowed_origins:
                 raise HTTPException(403, "Origin denied")
+            request.state.research_admin = True
             return "local-demo"
         from deerflow_extension_api import resolve_principal
 
@@ -42,6 +87,7 @@ def build_router(service, *, local_demo=False, demo_origins=None):
             "user_role": "admin" if getattr(user, "is_admin", False) else next(iter(getattr(user, "roles", ())), "user"),
             "is_internal": getattr(user, "is_internal", False),
         }
+        request.state.research_admin = bool(getattr(user, "is_admin", False))
         return str(user.user_id)
 
     async def can_read(request, run):
@@ -112,6 +158,125 @@ def build_router(service, *, local_demo=False, demo_origins=None):
             return Response(status_code=404, headers={**headers, "Cache-Control": "private, max-age=86400"})
         return Response(icon["body"], media_type=icon["content_type"], headers={**headers, "Cache-Control": "private, max-age=604800"})
 
+    async def administrator(request: Request, owner: str = Depends(principal)):
+        # Research settings affect every user's research: administrators only.
+        if not getattr(request.state, "research_admin", False):
+            raise HTTPException(403, "Administrator access is required to change research settings")
+        return owner
+
+    async def settings_view(request):
+        from . import profile
+        from .catalog import settings_catalog
+        from .channels import HEALTH
+        from .secrets import SECRETS, references
+
+        current = await asyncio.to_thread(profile.editable_view, service.settings)
+        stored = await service.store.profile()
+        return {
+            "version": service.profile_version,
+            "editable": bool(getattr(request.state, "research_admin", False)),
+            "error": service.profile_error,
+            "settings": current,
+            "defaults": await asyncio.to_thread(profile.editable_view, service.operator),
+            "overridden": sorted(((stored or {}).get("overrides") or {}).keys()),
+            "updated_at": (stored or {}).get("updated_at"),
+            "operator": {
+                "runner": service.operator.runner,
+                "max_active_runs": service.operator.max_active_runs,
+                "favicons": service.operator.favicons,
+                "budget_ceiling": service.operator.budget_ceiling.model_dump(),
+                "native_tools": service.operator.native_tools,
+            },
+            "catalog": settings_catalog(),
+            "secrets": {"saved": SECRETS.names(), "references": {reference: SECRETS.status(reference) for reference in sorted(references(current))}},
+            "health": HEALTH.snapshot(),
+        }
+
+    async def settings_call(request, awaitable):
+        try:
+            await awaitable
+        except ValidationError as exc:
+            raise HTTPException(422, validation_detail(exc)) from None
+        except ResearchError as exc:
+            raise HTTPException(409 if exc.code == "PROFILE_VERSION" else 422, {"code": exc.code, "message": str(exc), "recoverable": exc.recoverable}) from None
+        except ValueError as exc:
+            raise HTTPException(422, {"code": "SETTINGS_INVALID", "message": str(exc)[:2000]}) from None
+        return await settings_view(request)
+
+    @router.get("/settings")
+    async def get_settings(request: Request, owner=Depends(principal)):
+        return await settings_view(request)
+
+    @router.post("/settings")
+    async def update_settings(body: SettingsUpdate, request: Request, owner=Depends(administrator)):
+        return await settings_call(request, service.update_profile(body.settings, body.version, owner))
+
+    @router.post("/settings/reset")
+    async def reset_settings(body: SettingsReset, request: Request, owner=Depends(administrator)):
+        return await settings_call(request, service.reset_profile(body.fields, body.version, owner))
+
+    @router.post("/settings/restore")
+    async def restore_settings(body: SettingsRestore, request: Request, owner=Depends(administrator)):
+        return await settings_call(request, service.restore_profile(body.target_version, body.version, owner))
+
+    @router.get("/settings/history")
+    async def settings_history(owner=Depends(principal)):
+        items = await service.store.profile_history()
+        return {"items": [{"version": item["version"], "updated_at": item["updated_at"], "updated_by": item["updated_by"], "fields": sorted(item["overrides"])} for item in items]}
+
+    @router.post("/settings/secrets")
+    async def update_secret(body: SecretUpdate, request: Request, owner=Depends(administrator)):
+        return await settings_call(request, service.save_secret(body.name, body.value, owner))
+
+    @router.post("/settings/test-model")
+    async def test_model(body: ModelTest, owner=Depends(administrator)):
+        from .config import ModelSpec
+        from .doctor import probe_model
+
+        try:
+            spec = ModelSpec.model_validate(body.model)
+        except ValidationError as exc:
+            raise HTTPException(422, validation_detail(exc)) from None
+        candidate = service.settings.model_copy(update={"models": [spec], "default_model": spec.name})
+        return await probe_model(spec.name, timeout=120, settings=candidate)
+
+    @router.post("/settings/test-provider")
+    async def test_source_provider(body: ProviderTest, owner=Depends(administrator)):
+        from .channels import test_provider
+        from .config import McpServerSpec, SourceSpec
+
+        try:
+            source = SourceSpec.model_validate(body.source)
+            servers = {name: McpServerSpec.model_validate(value) for name, value in (body.mcp_servers or {}).items()} if body.mcp_servers is not None else service.settings.mcp_servers
+        except ValidationError as exc:
+            raise HTTPException(422, validation_detail(exc)) from None
+        provider = next((item for item in source.providers if item.id == body.provider_id), None)
+        if provider is None:
+            raise HTTPException(404, "Provider not found in the submitted source")
+        candidate = service.settings.model_copy(update={"mcp_servers": servers})
+        return await test_provider(source, provider, candidate, query=body.query, url=body.url)
+
+    @router.post("/settings/mcp-tools")
+    async def list_mcp_tools(body: McpToolsRequest, owner=Depends(administrator)):
+        from .config import McpServerSpec
+        from .mcp import MANAGER
+
+        try:
+            spec = McpServerSpec.model_validate(body.server)
+        except ValidationError as exc:
+            raise HTTPException(422, validation_detail(exc)) from None
+        try:
+            tools = await MANAGER.tools(body.name, spec, refresh=True)
+        except Exception as exc:
+            return {"ok": False, "error": type(exc).__name__, "tools": []}
+        return {"ok": True, "tools": [{"name": tool.name, "description": (tool.description or "")[:1000], "arguments": getattr(tool, "args", {}) or {}} for tool in tools]}
+
+    @router.get("/settings/health")
+    async def provider_health(owner=Depends(principal)):
+        from .channels import HEALTH
+
+        return {"providers": HEALTH.snapshot()}
+
     @router.post("", status_code=202)
     async def create(body: CreateResearch, request: Request, owner=Depends(principal), idempotency_key: str | None = Header(default=None)):
         if service.graph is None or service.stopping:
@@ -166,7 +331,7 @@ def build_router(service, *, local_demo=False, demo_origins=None):
 
         events = await service.store.activity_events(run["run_id"])
         calls = await service.store.calls(run["run_id"])
-        return build(run, events, calls, tool_roles(service.settings))
+        return build(run, events, calls, tool_roles(await service.load_settings_for(run)))
 
     @router.get("/{run_id}/metrics")
     async def research_metrics(run=Depends(owned)):
@@ -261,6 +426,40 @@ def build_router(service, *, local_demo=False, demo_origins=None):
                 cursor = items[-1]["seq"]
 
         return StreamingResponse(stream(), media_type="application/x-ndjson", headers={"Content-Disposition": f'attachment; filename="research-{run["run_id"]}-trace.jsonl"', "Cache-Control": "no-store"})
+
+    @router.get("/{run_id}/llm-calls")
+    async def llm_calls(run=Depends(owned)):
+        # Summaries in request order; complete prompts and answers are read per call.
+        metrics = {record["id"]: record for record in await service.store.model_calls(run["run_id"])}
+        items = [{**metrics.pop(exchange["id"], {}), **exchange, "audited": True} for exchange in await service.store.llm_exchanges(run["run_id"])]
+        # Calls recorded before full auditing (or with content capture off) keep their metrics.
+        items.extend({**record, "audited": False} for record in metrics.values())
+        items.sort(key=lambda item: item.get("started_at") or "")
+        return {"items": items}
+
+    @router.get("/{run_id}/llm-calls/export")
+    async def export_llm_calls(request: Request, run=Depends(owned)):
+        from .audit import openai_request
+
+        async def stream():
+            for index, summary in enumerate(await service.store.llm_exchanges(run["run_id"])):
+                if index % 50 == 0:
+                    await owned(run["run_id"], request, run["owner"])
+                detail = await service.store.llm_exchange(run["run_id"], summary["id"])
+                if detail is not None:
+                    yield json.dumps({**detail, "openai_request": openai_request(detail)}, ensure_ascii=False, default=str) + "\n"
+
+        return StreamingResponse(stream(), media_type="application/x-ndjson", headers={"Content-Disposition": f'attachment; filename="research-{run["run_id"]}-llm-calls.jsonl"', "Cache-Control": "no-store"})
+
+    @router.get("/{run_id}/llm-calls/{call_id}")
+    async def llm_call(call_id: str, run=Depends(owned)):
+        from .audit import openai_request
+
+        detail = await service.store.llm_exchange(run["run_id"], call_id)
+        if detail is None:
+            raise HTTPException(404, "Model call not found")
+        metrics = await service.store.model_call(run["run_id"], call_id) or {}
+        return {**metrics, **detail, "openai_request": openai_request(detail)}
 
     @router.get("/{run_id}/report")
     async def report(format: Literal["json", "md", "html", "docx"] = "json", version: int | None = Query(default=None, ge=1), run=Depends(owned)):

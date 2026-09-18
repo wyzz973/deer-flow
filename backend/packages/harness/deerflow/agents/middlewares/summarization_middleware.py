@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import html
 import logging
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, override, runtime_checkable
 
 from deerflow_extension_api import CompactionEvent, canonical_hash
 from langchain.agents import AgentState
 from langchain.agents.middleware import SummarizationMiddleware
-from langchain_core.messages import AnyMessage, HumanMessage, RemoveMessage, get_buffer_string, trim_messages
+from langchain_core.messages import AnyMessage, HumanMessage, RemoveMessage, SystemMessage, get_buffer_string, trim_messages
 from langgraph.config import get_config
 from langgraph.constants import TAG_NOSTREAM
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
@@ -347,7 +347,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
         if model is None:
             return None
         try:
-            response = model.invoke(prompt, config={"metadata": {"lc_source": "summarization"}})
+            response = _complete(model, prompt, {"metadata": {"lc_source": "summarization"}})
             return self._checked_summary(response, last)
         except Exception:
             self._log_summary_error(last)
@@ -369,7 +369,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
             invoke_config = {"metadata": {"lc_source": "summarization"}}
             extensions = getattr(self, "_extensions", None)
             if extensions is None:
-                response = await model.ainvoke(prompt, config=invoke_config)
+                response = await _acomplete(model, prompt, invoke_config)
             else:
                 from deerflow_extension_api import SystemOperationKind
 
@@ -381,7 +381,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
                     messages=prompt,
                     model_name=model_name,
                     invoke_config=invoke_config,
-                    invoke=lambda: model.ainvoke(prompt, config=invoke_config),
+                    invoke=lambda: _acomplete(model, prompt, invoke_config),
                     task_store=task_store,
                 )
             return self._checked_summary(response, last)
@@ -580,8 +580,20 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
                 latest_user_id = msg.id
                 break
 
+        # A subagent keeps its own system prompt as the leading SystemMessage in
+        # state (the executor builds it into the initial messages). It is the
+        # agent's standing instruction, not history: summarizing it would leave the
+        # rest of the run without its role, and would hand the human-anchored
+        # summary trimmer a window whose only non-AI/Tool message is that prompt.
+        leading_system_ids = {msg.id for msg in _leading_system_messages(messages)}
+
         messages_to_summarize, preserved_messages = self._partition_messages(messages, cutoff_index)
-        messages_to_summarize, preserved_messages = self._preserve_dynamic_context_reminders(messages_to_summarize, preserved_messages, latest_user_id=latest_user_id)
+        messages_to_summarize, preserved_messages = self._preserve_dynamic_context_reminders(
+            messages_to_summarize,
+            preserved_messages,
+            latest_user_id=latest_user_id,
+            standing_ids=leading_system_ids,
+        )
         if not messages_to_summarize:
             return None
         return messages_to_summarize, preserved_messages, previous_summary, total_tokens
@@ -746,6 +758,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
         preserved_messages: list[AnyMessage],
         *,
         latest_user_id: str | None = None,
+        standing_ids: Collection[str | None] = (),
     ) -> tuple[list[AnyMessage], list[AnyMessage]]:
         """Keep tagged dynamic-context reminders and the current user request out of compression.
 
@@ -756,12 +769,13 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
         allowed to compress — the source of cross-turn prompt contamination. The
         *current* request is instead identified by ``latest_user_id``, so a
         first-turn long analysis keeps its ``__user`` request while its early
-        AI/Tool turns still compress.
+        AI/Tool turns still compress. ``standing_ids`` names the agent's own leading
+        system prompt, which is kept verbatim as well.
         """
         rescued: list[AnyMessage] = []
         remaining: list[AnyMessage] = []
         for msg in messages_to_summarize:
-            if is_dynamic_context_reminder(msg) or (latest_user_id is not None and msg.id == latest_user_id):
+            if is_dynamic_context_reminder(msg) or (latest_user_id is not None and msg.id == latest_user_id) or (msg.id is not None and msg.id in standing_ids):
                 rescued.append(msg)
             else:
                 remaining.append(msg)
@@ -790,6 +804,55 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
             except Exception:
                 hook_name = getattr(hook, "__name__", None) or type(hook).__name__
                 logger.exception("before_summarization hook %s failed", hook_name)
+
+
+def _answered(response: Any) -> bool:
+    """Whether a response carries usable summary text (never calls the deprecated ``.text()``)."""
+    content = getattr(response, "content", None)
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        return any(str(part.get("text", "") if isinstance(part, dict) else part).strip() for part in content)
+    text = getattr(response, "text", None)
+    return bool(isinstance(text, str) and text.strip())
+
+
+async def _acomplete(model: Any, prompt: str, invoke_config: dict) -> Any:
+    """Ask for a summary, consuming the stream the agent loop also consumes.
+
+    OpenAI-compatible servers that only answer in streaming mode return an empty
+    message for a plain request, which would look like a failed summary and
+    leave compaction unavailable for that deployment. A provider that refuses
+    streaming still answers: the streamed attempt falls back to a plain call.
+    """
+    merged = None
+    try:
+        async for chunk in model.astream(prompt, config=invoke_config):
+            merged = chunk if merged is None else merged + chunk
+    except Exception:  # No streaming support here; the plain call reports any real error.
+        merged = None
+    return merged if _answered(merged) else await model.ainvoke(prompt, config=invoke_config)
+
+
+def _complete(model: Any, prompt: str, invoke_config: dict) -> Any:
+    """Synchronous counterpart of :func:`_acomplete`."""
+    merged = None
+    try:
+        for chunk in model.stream(prompt, config=invoke_config):
+            merged = chunk if merged is None else merged + chunk
+    except Exception:
+        merged = None
+    return merged if _answered(merged) else model.invoke(prompt, config=invoke_config)
+
+
+def _leading_system_messages(messages: list[AnyMessage]) -> list[AnyMessage]:
+    """The contiguous SystemMessages that open the state (an agent's own prompt)."""
+    leading: list[AnyMessage] = []
+    for msg in messages:
+        if not isinstance(msg, SystemMessage):
+            break
+        leading.append(msg)
+    return leading
 
 
 def _build_summary_anchor(candidate_names: list[str | None], app_config: Any) -> tuple[Any | None, str | None]:

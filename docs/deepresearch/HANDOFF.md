@@ -1,6 +1,6 @@
 # DeepResearch 交接文档
 
-更新时间：2026-09-17。本文面向继续开发本项目的工程师或 Agent，记录当前状态、验收证据、运行方式、
+更新时间：2026-09-18。本文面向继续开发本项目的工程师或 Agent，记录当前状态、验收证据、运行方式、
 风险和下一步。架构与工作流细节见 [ARCHITECTURE.md](ARCHITECTURE.md)，接口契约见 [API.md](API.md)。
 本文不是产品宣传，也不是全量安全认证。
 
@@ -14,7 +14,7 @@
 | 远端分支 | `origin/feat/deepresearch-v1-fullstack-20260914`（不是同名远端分支） |
 | 已推送提交 | `eb3ce656` 对标 ChatGPT 深度研究的完整改造与本文、[ARCHITECTURE.md](ARCHITECTURE.md)；其后的提交依次修复浏览器端到端测试与 CI 依赖、加入成本与效率观测、加入离线交接文档与配置模板。以 `git log` 为准 |
 | 更早的基线 | `5fa0299c` `feat(deepresearch): unify native research chat and harden workflow recovery` |
-| 功能状态 | 交互、工作流、报告与前端改造完成；三次真实 DeepSeek 研究端到端完成；成本与效率观测完成并经两次真实研究核对 |
+| 功能状态 | 交互、工作流、报告与前端改造完成；五次真实 DeepSeek 研究端到端完成；配置与 DeerFlow 解耦（研究自己的模型、数据源与供应商故障切换、MCP、角色、提示词、上下文压缩）、请求改写节点、设置页、LLM 调用审计均已完成并真实验收 |
 | 离线开发 | 不联网的本地 Agent 从 [OFFLINE_AGENT_GUIDE.md](OFFLINE_AGENT_GUIDE.md) 开始；配置见 [MODEL_CONFIGURATION.md](MODEL_CONFIGURATION.md)、[DEERFLOW_CONFIGURATION.md](DEERFLOW_CONFIGURATION.md)、[RESEARCH_CONFIGURATION.md](RESEARCH_CONFIGURATION.md)；模板在 `examples/deepresearch/offline/` |
 | 本次回归 | 见第 6 节 |
 | 未验证 | 干净克隆部署、生产构建、公司 MCP 与 SSO、真实手机视口、报告事实逐条核验；远端 CI 以 GitHub Actions 结果为准 |
@@ -42,9 +42,9 @@
 
 改变上述方向前先与用户确认，不要悄悄改回旧设计。
 
-## 3. 本轮完成的工作
+## 3. 上一轮完成的工作（2026-09-17）
 
-按层概括，细节见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+按层概括，细节见 [ARCHITECTURE.md](ARCHITECTURE.md)。本轮（2026-09-18）的工作见第 3.5 节。
 
 **计划与对话**
 - planner 输出研究简报、短标题、短步骤、前提假设；澄清只用于找不到研究对象的请求。
@@ -107,6 +107,70 @@
 - `backend/deepresearch/requirements.txt` 补充 `markdown-it-py`。CI 的演示后端只安装该清单，缺少它时报告渲染失败（已在同等环境复现）。
 - 网站图标的首字母徽标与图片标为装饰性（`aria-hidden`），不改变域名标题的可读名称。
 
+## 3.5 本轮完成的工作（2026-09-18）：配置独立、改写节点、设置页、调用审计
+
+用户要求：①搜索经常被免费额度限流，要能接别的搜索接口或用 MCP 顶替（返回格式不固定）；②补上 ChatGPT 深度研究缺失的第一步——改写用户请求；
+③subagent / skills / 提示词 / 模型都不要写死，用户自己可配；④Trace 要能看到每次 LLM 调用的完整提示词与返回，界面要好读。
+追加要求：**所有研究配置都与 DeerFlow 独立，DeerFlow 只是功能引擎底座。**
+
+**配置独立（新增 `models.py`、`profile.py`、`secrets.py`、`catalog.py`）**
+- 研究模型写在研究配置的 `models` 里，注入一份**私有** AppConfig 副本（`private_config` 重建名称索引），宿主 `config.yaml` 不被修改；
+  宿主只需要 `plugins` 一段。凭据只写 `$环境变量` 或 `secret:名字`，保存的密钥只写不读。
+- 修复一个潜伏缺陷：`model_copy` 不会重建引擎的模型名索引，导致研究的单次输出上限从未真正生效。
+- 角色（`skills`）不再必须绑定宿主子 Agent：可以直接写 `methodology` 正文、模型、系统提示词、工具白名单、步数与超时。
+  引擎工具由 `engine_tools` 决定（默认只有 `read_file`），不再继承宿主工具表。
+- 设置页的修改按字段存成覆盖层（`research_profile`），每次保存产生新版本；**每个研究任务创建时保存完整配置快照并全程使用它**，
+  所以改配置不会影响已经在跑的研究。旧版本写入的字段被移除后，快照与覆盖层会丢弃未知字段并告警，不会让旧任务再也跑不起来。
+
+**数据源与供应商故障切换（新增 `providers.py`、`channels.py`、`extract.py`、`mcp.py`）**
+- 一个数据源对模型只暴露一套固定参数（search / read / data），背后按顺序尝试多个供应商。限流、额度用尽、鉴权失败、超时、
+  网络错误、服务异常让该供应商进入冷却；单个页面打不开、无结果只换下一个供应商重试。
+- 预设：tavily、serper、brave、exa、bocha、searxng、jina_search、duckduckgo；jina_reader、tavily_extract、firecrawl、direct；
+  ragflow、lightrag；外加 `http`（自定义接口模板）与 `mcp`（按工具 schema 自动对应参数）。
+- 返回格式不固定也能用：`extract.py` 从 JSON、Markdown 链接、`Title/URL` 文本块或 HTML 中识别标题、链接与正文，
+  并产出与原生工具相同的 `deerflow.web_page.v1` / 记录型证据。
+- 指标新增 `tools.failovers` 与 `tools.by_provider`（尝试、应答、错误、跳过、缓存、错误类别、延迟）。
+
+**请求改写（新增 `rewrite` 节点、`ResearchRequest` 契约、`prompts.REWRITE_INSTRUCTIONS`）**
+- 图从 `START → rewrite → planner`；计划编辑与“追问触发新研究”都回到 `rewrite`，由它合并上一版请求并写确认话术。
+  对话里以 `kind: rewrite` 的卡片展示，`plan.brief` 就是改写后的请求。观察依据见 CHATGPT_BENCHMARK 第 7 节。
+
+**设置页（`/workspace/deepresearch/settings`，管理员）**
+- 模型（含真实“测试连接”）、研究角色、提示词（17 条，可搜索、可逐条恢复默认）、数据源与供应商（含单独测试与健康度）、
+  MCP 服务（可连接并列出工具）、运行参数与上下文压缩、密钥与历史（只写密钥、凭据解析状态、版本回滚）。
+- 保存前在前端做一次校验（`draftProblems`），保存时带版本号，冲突返回 409 并提供“载入最新版本”。
+
+**LLM 调用审计（新增 `audit.py`，`trace.py` 扩展）**
+- `llm_audit: true` 时保存每次模型调用的完整请求（消息按 sha256+zlib 内容寻址）、工具定义、参数、返回与推理，
+  并记录 langgraph 节点与执行分组；与上一次调用做差集得到 `new_message_indexes`，界面可“只看本轮新增”。
+- 界面：研究页顶部“LLM 调用 / Trace 时间线”两个页签，按阶段与执行分组、可搜索、可导出 JSONL、可查看可重建的 OpenAI 请求。
+
+**引擎修复（`packages/harness/deerflow/agents/middlewares/summarization_middleware.py`）**
+- 子 Agent 的系统提示词保存在 `messages` 里，上下文压缩会把它一起压缩掉：研究员因此在循环中途丢失方法论与输出要求；
+  更糟的是压缩窗口里只剩系统提示词时，LangChain 的 `start_on="human"` 裁剪器把整段研究过程直接丢弃，摘要写成“尚未开始研究”。
+  现在压缩会保留开头连续的 `SystemMessage`（`_leading_system_messages`），研究过程才真正进入摘要。
+- 研究自己决定何时压缩（`compaction`）：按角色模型声明的上下文长度比例触发，保留量按 **token** 且只占阈值的一部分，
+  摘要模板是研究自己的提示词（要求保留网址、原文摘录、数字、日期与回执 ID）。
+
+**按请求传凭据**
+- 企业部署的 `request_secret_headers` 现在也覆盖研究自己的 MCP 服务（连接头与环境变量）和 `type: http` 供应商的请求头：
+  某次请求带来的凭据只在这次请求内覆盖同名的 `secret:`，不同凭据各自建立连接、各自缓存工具列表，值不入库、不进 Trace。
+
+**只支持流式的模型（2026-09-18 用户报告）**
+- 症状：本地模型只支持流式返回时，非流式请求拿到的 `content` 为空，contract 节点判定为失败（`OUTPUT_SCHEMA`）。
+- 修复：`models.complete` 统一处理研究的每一次直接调用（笔记整理、请求改写、`doctor` 探测），先流式并聚合，
+  服务拒绝流式或流式没有内容时才退回普通请求；只有工具调用没有正文也算有效回答。
+  引擎的上下文压缩摘要（`summarization_middleware`）同样改为先流式，否则这类部署的压缩会永远失败。
+- 验证：写了一个「非流式返回空、流式返回内容」的本地 OpenAI 兼容服务，通过真实网关验证：
+  `POST /settings/test-model` 返回 `ok: true`（普通回复 ready、工具调用 lookup、用量 30 tokens），
+  把 `rewrite_model` 指向它后新建研究，改写节点拿到完整契约并进入规划；假服务日志显示全程只有 `stream=True` 请求。
+
+**其他修复**
+- 角色方法论不再把 SKILL 文件的 YAML 头信息发给模型（`Settings.methodology`）。
+- 证据的展示字段（标题、发布方）超长时截断而不是校验失败：一条 1584 字符的签名图片链接曾让 `evidence_merge` 抛出
+  ValidationError，整个研究失败（真实运行 `52e358b9` 中复现）。
+- 研究员进度说明的语言要求增加对比强调（“即使这些指令和你读到的网页是别的语言”）。
+
 ## 4. 真实验收
 
 使用 DeepSeek `deepseek-v4-flash`、原生 `web_search` / `web_fetch`（Jina 无 key 模式），非演示 Runner。
@@ -153,6 +217,60 @@
 浏览器检查（1568×691 视口）：计划卡、编辑引用条、确认消息、进度卡与“更新”、统计行、报告卡、阅读器悬停目录、
 来源页签（网站图标、摘要）、活动页签（网站标签、跟随）、引用悬浮卡（原文片段）。窄屏只在 Chrome 最小窗口宽度 606 px
 检查过（阅读器与来源抽屉无横向滚动），未在 390 px 或真实手机上验证。
+
+### 2026-09-18：配置独立、改写、供应商故障切换与调用审计的真实验收
+
+数据目录 `live-lm9f03p0`，模型 DeepSeek `deepseek-v4-flash`，研究配置由设置页保存的第 1/2 版驱动。
+本次验收刻意用**全部付费搜索接口都不可用**的环境跑：Tavily 额度用尽（HTTP 432）、Serper 密钥无效（403）、Jina 密钥无效（401）。
+
+| 任务 | 覆盖的流程 | 结果 |
+| --- | --- | --- |
+| `52e358b9-5f29-47c7-a6d7-8a514d3caca0` | 推理框架选型；倒计时中“编辑”→ 改写合并 → 确认话术 → 直接开始；6 个单元 + 6 个补研单元；设置页把压缩阈值调到 0.12 的压力设置 | 一次 `evidence_merge` 失败（见下）后从检查点恢复，`COMPLETED`：70 条引用、29.6k 字符、13 张表、2 张图、5 条局限；186 次搜索、132 个页面；模型调用 287 次、Token 5.94M |
+| `19f489e5-89b8-481e-b9d9-f9eccfe3e0a2` | uv 与 Poetry 选型；默认压缩设置（阈值 0.6、保留 0.4）下的对照跑；5 个单元 + 2 轮补研 | `COMPLETED`：885 秒、115 次搜索、112 个页面、72 条引用、21.9k 字符、18 张表、1 张图、5 条局限；无单元失败；模型调用 176 次（**压缩 0 次**）、模型耗时 669 秒、Token 4.33M |
+
+**供应商故障切换（`/metrics` 的 `tools.by_provider`，共 132 次切换）**
+
+| 工具 | 供应商 | 尝试 | 应答 | 错误 | 跳过（冷却） | 错误类别 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `web_search` | tavily | 12 | 0 | 12 | 174 | quota（HTTP 432，账户额度用尽） |
+| `web_search` | serper | 12 | 0 | 12 | 174 | auth（密钥无效） |
+| `web_search` | duckduckgo | 186 | 185 | 1 | 0 | empty 1 |
+| `web_fetch` | jina | 7 | 0 | 7 | 192 | auth（密钥无效） |
+| `web_fetch` | direct | 199 | 149 | 50 | 0 | blocked 30、not_found 17、empty 3（都是单个页面的问题，没有冷却整个供应商） |
+
+结论：三个付费接口全部不可用时，研究仍然完成，靠的是自动切换到不需要密钥的兜底供应商；
+这正是用户反馈“搜索经常失败”的根因与修复。
+
+**改写链路**：首次改写 3.7 秒产出完整研究请求；倒计时中补充“只看单台 4090 / 单台 A100 80G，并补上 Qwen3 支持情况”后，
+改写合并出新请求并写出确认话术“已更新需求：硬件范围限定为……并新增各框架对 Qwen3 系列模型支持情况的对比维度。”，
+计划从 5 步变成 6 步并立即开始。
+
+**压缩开销对照（本轮发现的重要问题）**
+
+| | `52e358b9`（压力设置：阈值 0.12、按条数保留 16 条） | `19f489e5`（默认：阈值 0.6、按 token 保留 40%） |
+| --- | --- | --- |
+| 压缩次数 | 94 | 0 |
+| 压缩耗时 / 模型总耗时 | 2188 秒 / 2908 秒（**75%**） | 0 秒 / 669 秒 |
+| 单次压缩耗时 | 45–55 秒 | — |
+
+原因：压缩后保留的消息本身仍然超过阈值，于是每一轮都要重新压缩一次。修复是把保留策略改为**按 token 且只占阈值的一部分**
+（`keep_fraction`，默认 0.4），压缩后上下文必然降到阈值以下，不可能连续触发。128K 上下文的模型在默认阈值（76.8k）下，
+一个研究单元通常根本不会触发压缩。
+
+**故障切换（`19f489e5`，164 次切换）**：tavily 与 serper 各尝试 11 次后进入冷却（各跳过 104 次），
+duckduckgo 应答 88/115，direct 应答 115/143（28 次是单页面级错误），jina 5 次鉴权失败后跳过 138 次。
+
+**验收中发现并已修复的问题**
+
+1. 引擎压缩会把子 Agent 的系统提示词一起压缩掉，研究员中途丢失方法论；而且当压缩窗口里只剩系统提示词时，
+   LangChain 的人类锚点裁剪器会把整段研究过程丢弃，摘要写成“尚未开始研究、未执行任何操作”。已在引擎修复并加回归测试。
+2. 一条 1584 字符的 GitHub 签名图片链接被当作页面标题（页面没有标题时用 URL），超过 `RawEvidence.title` 的 1000 字符上限，
+   `evidence_merge` 抛 ValidationError，整个研究失败。展示字段现在截断而不是拒绝，重试后直接复用已完成的单元结果并写出报告。
+3. 角色方法论把 SKILL 文件的 YAML 头信息也发给了模型。
+4. 上一轮遗留：`model_copy` 不重建引擎模型索引，研究的单次输出上限从未生效。
+
+**语言合规**：`52e358b9`（提示词加强前）的 38 条进度说明中英文各半——英文全部来自同一个研究循环，一旦第一句是英文就一直是英文。
+提示词加入对比强调（“即使这些指令和你读到的网页是别的语言”）后，`19f489e5` 的 **132 条进度说明全部是中文**。
 
 历史验收：2026-09-16 的 `fa984b8d-91bd-4dd6-8609-6e88d4660a86`（数据目录 `live-3j8hr_hv`）暴露了线程 ID 超长、AIO `ls`
 阻塞等问题，修复后从检查点恢复完成，过程与证据见 [STABILITY_AUDIT_2026-09-16.md](STABILITY_AUDIT_2026-09-16.md)。
@@ -285,9 +403,36 @@ DEEPRESEARCH_E2E_FRONTEND_PORT=3200 DEEPRESEARCH_E2E_REUSE_BACKEND=1 DEEPRESEARC
 未运行：`make test-blocking-io`、`make test-live`、前端生产构建。远端 CI 结果见 GitHub Actions 的 “DeepResearch full-stack checks”。单元测试使用伪造提供方，只证明适配与生命周期行为，
 不能代替真实研究与浏览器验收。
 
+### 2026-09-18 回归
+
+从 `backend/`：
+
+```sh
+uv run --no-sync --with python-docx python -m pytest ../tests/deepresearch tests/test_subagent_executor.py tests/test_summarization_middleware.py tests/test_context_compaction.py -q   # 387 passed
+uv run --no-sync python -m pytest tests -q -k "summar or compact or subagent or middleware"                                                                                        # 2661 passed, 10 skipped
+uv run ruff check deepresearch packages/harness/deerflow/agents/middlewares/summarization_middleware.py && uv run ruff format --check deepresearch
+DEEPRESEARCH_E2E_FRONTEND_PORT=3101 uv run --no-sync --with python-docx python ../scripts/pnpm.py exec playwright test -c playwright.deepresearch.config.ts                          # 5 passed
+```
+
+从 `frontend/`：
+
+```sh
+python3 ../scripts/pnpm.py check   # eslint + tsc，通过
+python3 ../scripts/pnpm.py test    # 1363 passed（新增 32 条：llm-calls / settings helpers、设置页与审计面板 DOM）
+```
+
+注意：`tests/test_tool_error_handling_middleware.py::test_build_subagent_runtime_middlewares_threads_app_config_to_llm_middleware`
+单独运行时会因中间件顺序断言失败，用 HEAD 的引擎文件复现同样失败，属于既有问题，与本轮改动无关；整批运行时通过。
+浏览器端到端需要独占前端开发服务器（Next 16 不允许同目录第二个 dev server），跑之前先停掉本地的 3100。
+
 ## 7. 残余风险与未验证项
 
-- 只在本机用 DeepSeek 与无 key 的 Jina 抓取验收；公司 MCP、其他模型、SSO 与多用户权限未验收。
+- 只在本机用 DeepSeek 验收；公司 MCP、其他模型、SSO 与多用户权限未验收。设置页的“测试模型 / 测试供应商 / 列出 MCP 工具”
+  只在 DeepSeek、Tavily、Serper、Jina、DuckDuckGo、direct 上真实跑过，其余预设（brave、exa、bocha、searxng、firecrawl、
+  tavily_extract、ragflow、lightrag、http 模板、mcp 供应商）只有单元测试与假服务覆盖。
+- 研究员进度说明的语言在提示词加强后于一次验收中做到 132/132 全中文；其他语言、其他模型未验证。
+- 上下文压缩的新默认值（阈值 0.6、保留 0.4）只做了一次对照跑（128K 上下文下根本没有触发）；
+  小上下文模型（例如 32K 的本地模型）真正频繁压缩时的摘要质量与研究结论完整性没有验证。
 - 报告事实没有逐条人工核验；引用校验只保证标记指向本次读取的页面，不保证语义支持。
 - 部分引用来自二手站点（律所文章、第三方编纂站点），报告局限中已披露；“一手来源优先”依赖模型遵循。
 - 研究耗时约 14–16 分钟，约为 ChatGPT 的 2 倍；并发度、补研轮次和单元数量还可调优。
@@ -305,7 +450,8 @@ DEEPRESEARCH_E2E_FRONTEND_PORT=3200 DEEPRESEARCH_E2E_REUSE_BACKEND=1 DEEPRESEARC
 
 ## 8. 建议下一步
 
-1. 人工评审 82490499 与 68ff862b 的报告事实与结构，形成报告质量验收标准（一手来源比例、状态与日期准确性、事实/推断区分）。
+1. 人工评审 82490499、68ff862b 与 52e358b9 的报告事实与结构，形成报告质量验收标准（一手来源比例、状态与日期准确性、事实/推断区分）。
+2. 用真实的企业 MCP 服务验证 `mcp` 供应商与 `kind: mcp` 数据源：工具发现缓存、按请求凭据（已实现并有单元测试，未接真实服务验收）、异构返回的解析结果。
 2. 跑远端 CI、干净克隆部署与前端生产构建。
 3. 用公司实际 MCP 与普通 Chat Completions 模型验证异构返回、身份、工具授权、跨用户读取与导出。
 4. 在真实手机与深色主题下复验阅读器、来源抽屉、引用悬浮卡。

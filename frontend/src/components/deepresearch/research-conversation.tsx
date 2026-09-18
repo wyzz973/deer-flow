@@ -9,8 +9,10 @@ import {
   ListTree,
   Plus,
   ScrollText,
+  Settings2,
   X,
 } from "lucide-react";
+import Link from "next/link";
 import { useCallback, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
@@ -31,6 +33,7 @@ import { ChatSurface } from "@/components/workspace/chats/chat-surface";
 import { MessageList } from "@/components/workspace/messages";
 import { ThreadContext } from "@/components/workspace/messages/context";
 import { useResearchConversation } from "@/core/deepresearch/hooks";
+import type { CallStage } from "@/core/deepresearch/llm-calls";
 import {
   firstText,
   formatElapsed,
@@ -41,16 +44,20 @@ import {
   reviewStatuses,
   steerableStatuses,
   terminal,
+  type LlmCallSummary,
   type Report,
   type ResearchMessage,
 } from "@/core/deepresearch/types";
 import type { AgentThreadState } from "@/core/threads";
 import { cn } from "@/lib/utils";
 
+import { LlmCallDialog } from "./llm-call-dialog";
+import { ResearchLlmCalls } from "./llm-calls-panel";
 import { ResearchMetricsPanel } from "./metrics-panel";
 import { ResearchPlanCard } from "./plan-card";
 import { ResearchReportReader } from "./report-reader";
 import { ResearchReportActions, ResearchReportCard } from "./report-view";
+import { ResearchRequestCard } from "./request-card";
 import { ResearchGallery } from "./research-gallery";
 import { ResearchActivityPanel, ResearchSourcesPanel } from "./sources-panel";
 import { ResearchTraceInspector } from "./trace-panel";
@@ -84,6 +91,13 @@ function ResearchView({
   if (panel) lastPanel.current = panel;
   const [selectedCitation, setSelectedCitation] = useState<string>();
   const [traceFocus, setTraceFocus] = useState<string>();
+  // The audit view opens on model calls; activity links open the span timeline.
+  const [traceMode, setTraceMode] = useState<"calls" | "timeline">("calls");
+  const [callStage, setCallStage] = useState<CallStage>();
+  const [auditCall, setAuditCall] = useState<{
+    id: string;
+    calls: LlmCallSummary[];
+  } | null>(null);
   const [reading, setReading] = useState<Report | null>(null);
   const [updating, setUpdating] = useState(false);
   const composer = useRef<HTMLDivElement>(null);
@@ -205,14 +219,23 @@ function ResearchView({
     },
     [api, runId],
   );
-  const inspect = useCallback((id?: string) => {
+  const inspect = useCallback((id?: string, stage?: CallStage) => {
     setTraceFocus(id);
+    setTraceMode(id ? "timeline" : "calls");
+    setCallStage(stage);
     setPanel("trace");
   }, []);
   const renderMessage = useCallback(
     (message: Message) => {
       const record = byId.get(message.id ?? "");
       if (!record || !run) return undefined;
+      if (record.kind === "rewrite")
+        return (
+          <ResearchRequestCard
+            message={record}
+            onInspect={() => inspect(undefined, "rewrite")}
+          />
+        );
       if (record.kind === "plan" && record.plan)
         return (
           <ResearchPlanCard
@@ -259,6 +282,7 @@ function ResearchView({
       download,
       edit,
       focusComposer,
+      inspect,
       run,
       safeAction,
       state.busy,
@@ -278,7 +302,26 @@ function ResearchView({
               <ArrowLeft className="size-3" />
               活动
             </Button>
-            <span className="ml-2 text-xs">Trace</span>
+            <div role="tablist" aria-label="调用审计" className="flex gap-1">
+              <Button
+                variant={traceMode === "calls" ? "secondary" : "ghost"}
+                size="sm"
+                role="tab"
+                aria-selected={traceMode === "calls"}
+                onClick={() => setTraceMode("calls")}
+              >
+                LLM 调用
+              </Button>
+              <Button
+                variant={traceMode === "timeline" ? "secondary" : "ghost"}
+                size="sm"
+                role="tab"
+                aria-selected={traceMode === "timeline"}
+                onClick={() => setTraceMode("timeline")}
+              >
+                Trace 时间线
+              </Button>
+            </div>
           </>
         ) : (
           <div role="tablist" aria-label="来源与活动" className="flex gap-1">
@@ -351,6 +394,18 @@ function ResearchView({
           runId && (
             <ResearchMetricsPanel api={api} runId={runId} active={running} />
           )
+        ) : traceMode === "calls" ? (
+          runId && (
+            <ResearchLlmCalls
+              key={`${runId}:${callStage ?? "all"}`}
+              api={api}
+              runId={runId}
+              run={run ?? undefined}
+              active={running}
+              stage={callStage}
+              onOpen={(id, calls) => setAuditCall({ id, calls })}
+            />
+          )
         ) : (
           runId && (
             <ResearchTraceInspector
@@ -369,6 +424,18 @@ function ResearchView({
   const quoted = editing || steering;
   return (
     <ThreadContext.Provider value={{ thread, isMock: Boolean(apiBase) }}>
+      {runId && auditCall && (
+        <LlmCallDialog
+          key={runId}
+          api={api}
+          runId={runId}
+          run={run ?? undefined}
+          calls={auditCall.calls}
+          callId={auditCall.id}
+          onSelect={(id) => setAuditCall({ ...auditCall, id })}
+          onClose={() => setAuditCall(null)}
+        />
+      )}
       <ChatBox
         threadId={run?.thread_id ?? "new-research"}
         browserEnabled={false}
@@ -427,12 +494,30 @@ function ResearchView({
                       variant="ghost"
                       size="icon-sm"
                       aria-label="查看 Trace"
+                      title="LLM 调用审计与 Trace"
                       onClick={() => inspect()}
                     >
                       <ScrollText className="size-4" />
                     </Button>
                   </>
                 )}
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="研究设置"
+                  title="研究设置：模型、角色、提示词与数据源"
+                  asChild
+                >
+                  <Link
+                    href={
+                      apiBase
+                        ? "/deepresearch-demo/settings"
+                        : "/workspace/deepresearch/settings"
+                    }
+                  >
+                    <Settings2 className="size-4" />
+                  </Link>
+                </Button>
                 <Button
                   variant="ghost"
                   size="icon-sm"

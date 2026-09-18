@@ -1,6 +1,6 @@
 # 离线开发交接：给本地 Agent
 
-更新时间：2026-09-17。读者：在不联网的机器上继续开发 DeepResearch 的本地 Agent，以及使用它的人。
+更新时间：2026-09-18。读者：在不联网的机器上继续开发 DeepResearch 的本地 Agent，以及使用它的人。
 
 本文只讲怎么做。为什么这样设计见 [ARCHITECTURE.md](ARCHITECTURE.md)，历史进度和验收记录见 [HANDOFF.md](HANDOFF.md)。
 配置分三份：[模型配置](MODEL_CONFIGURATION.md)、[DeerFlow 宿主配置](DEERFLOW_CONFIGURATION.md)、[研究配置](RESEARCH_CONFIGURATION.md)。
@@ -37,7 +37,9 @@
 3. 不要修改 `CLAUDE.md`。
 4. 不要为了通过测试而放宽引用校验，也不要伪造证据 ID 或网址。引用校验的代码在 `report.py` 和 `report_policy.py`。
 5. 不要删除测试，也不要加 `skip`。测试失败时修代码；修不好就如实记录。
-6. 不要另写一套 Agent 循环、MCP 客户端、工具注册或登录系统。DeepResearch 复用 DeerFlow 原生能力（见 ARCHITECTURE.md 第 1 节）。
+6. 不要另写一套 Agent 循环、工具注册或登录系统。DeepResearch 复用 DeerFlow 的执行引擎（见 ARCHITECTURE.md 第 1 节）。
+   但**配置是独立的**：研究的模型、数据源与供应商、MCP 服务、角色、提示词都写在研究配置或设置页里，不要改成读宿主
+   `config.yaml` 的 `models` / `tools` / `subagents` 或 `extensions_config.json`。
 7. 不要要求模型开启 JSON mode。模型输出普通文本，由 `structured.py` 解析。
 8. 交互保持 ChatGPT 风格：计划卡、倒计时、编辑、更新、报告阅读器。不要改成表单填约束。
 9. 离线时不要运行需要联网的命令：`uv sync`、`pip install`、`pnpm install`、`git push`、`playwright install`。
@@ -165,17 +167,23 @@ SKIP_ENV_VALIDATION=1 DEER_FLOW_AUTH_DISABLED=1 DEER_FLOW_ENV=development \
 
 | 任务 | 后端文件（`backend/deepresearch/`） | 前端文件（`frontend/src/`） | 测试 |
 | --- | --- | --- | --- |
-| 计划内容、计划提示词 | `runner.py`（`PLANNER_INSTRUCTIONS`）、`workflow.py`（`planner`） | `components/deepresearch/plan-card.tsx` | `test_runner.py`、`test_workflow.py`、`plan-card.dom.test.tsx` |
+| 任何提示词 | `prompts.py`（全部默认值，17 条） | 设置页“提示词”（`settings/prompts-section.tsx`） | `test_runner.py`、`test_research_settings.py` |
+| 请求改写（第一步） | `workflow.py`（`rewrite` 节点）、`structured.py`（`rewrite_request`）、`prompts.py`（`rewrite`） | `components/deepresearch/request-card.tsx` | `test_workflow.py`、`test_runner.py` |
+| 计划内容、计划提示词 | `runner.py`（`plan`）、`workflow.py`（`planner`）、`prompts.py`（`plan`） | `components/deepresearch/plan-card.tsx` | `test_runner.py`、`test_workflow.py`、`plan-card.dom.test.tsx` |
 | 倒计时、编辑、更新、追问 | `conversation.py`、`service.py` | `components/deepresearch/research-conversation.tsx`、`core/deepresearch/hooks.ts` | `test_conversation.py`、`hooks.dom.test.tsx` |
 | 研究员怎么查资料 | `runner.py`（`RESEARCH_INSTRUCTIONS`）、`native.py`、`examples/deepresearch/skills/*/SKILL.md` | — | `test_native_bridge.py`、`test_runner.py` |
 | 回答整理成数据 | `structured.py`、`output.py` | — | `test_structured_role.py` |
 | 报告大纲、章节、摘要 | `runner.py`（`write_report` 及写作指令）、`report.py` | `components/deepresearch/report-view.tsx`、`report-reader.tsx` | `test_report_quality.py` |
 | 引用资格、来源 | `report_policy.py`、`observations.py`、`sources.py`、`evidence.py` | `components/deepresearch/sources-panel.tsx`、`citation-preview.tsx` | `test_sources.py`、`test_native_sources.py`、`citation-preview.dom.test.tsx` |
+| 数据源、供应商与故障切换 | `providers.py`、`channels.py`、`extract.py`、`mcp.py` | 设置页“数据源与搜索”（`settings/sources-section.tsx`） | `test_source_providers.py` |
+| 研究模型、上下文压缩 | `models.py`、`native.py`（`model_budget_config`） | 设置页“模型 / 运行参数” | `test_research_models.py` |
+| 设置、快照、密钥 | `profile.py`、`secrets.py`、`catalog.py`、`service.py` | `components/deepresearch/research-settings.tsx`、`core/deepresearch/settings.ts` | `test_research_settings.py`、`settings.test.ts`、`research-settings.dom.test.tsx` |
+| 模型调用审计 | `audit.py`、`trace.py`、`store.py` | `components/deepresearch/llm-calls-panel.tsx`、`llm-call-dialog.tsx`、`core/deepresearch/llm-calls.ts` | `test_llm_audit.py`、`llm-calls.test.ts`、`llm-calls.dom.test.tsx` |
 | 活动时间线 | `activity.py` | `sources-panel.tsx`（活动页签） | `test_activity.py`、`activity-panel.dom.test.tsx` |
 | 成本与效率指标 | `metrics.py`、`trace.py` | `components/deepresearch/metrics-panel.tsx` | `test_metrics.py`、`metrics-panel.dom.test.tsx` |
 | Trace | `trace.py`、`store.py` | `components/deepresearch/trace-panel.tsx`、`core/deepresearch/trace-model.ts` | `test_trace_finalization.py`、`trace-panel.dom.test.tsx` |
 | 接口 | `api.py` | `core/deepresearch/api.ts`、`types.ts` | `test_api.py` |
-| 配置项 | `config.py`、`contracts.py` | — | `test_core.py`、`test_offline_config.py` |
+| 配置项 | `config.py`、`contracts.py` | `core/deepresearch/types.ts` | `test_core.py`、`test_offline_config.py` |
 | 配置检查、模型探测 | `doctor.py` | — | `test_doctor.py` |
 
 后端测试在 `tests/deepresearch/`，前端测试在 `frontend/tests/unit/**/deepresearch/`。

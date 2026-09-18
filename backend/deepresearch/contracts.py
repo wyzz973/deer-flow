@@ -105,6 +105,21 @@ class SourcePolicy(Contract):
         return [safe_http_url(value) for value in values]
 
 
+class ResearchRequest(Contract):
+    """The conversation rewritten into one complete research request.
+
+    ChatGPT's conversation model produces this before a deep research session
+    starts (the ``user_query`` of its research tool call). The planner, the
+    researchers and the writer share it as the research brief.
+    """
+
+    user_query: str = Field(min_length=3, max_length=12000)
+    # One or two sentences confirming how a revision changes the research.
+    acknowledgement: str = Field(default="", max_length=1000)
+    # Only when the conversation has no identifiable research subject.
+    clarification_questions: list[str] = Field(default_factory=list, max_length=3)
+
+
 class ResearchPlan(Contract):
     goal: str = Field(min_length=3, max_length=12000)
     # A short plan title for the card and report defaults.
@@ -164,6 +179,23 @@ def safe_http_url(value: str | None) -> str | None:
     return value
 
 
+def bounded(limit: int):
+    """Truncate display text from the open web instead of failing validation.
+
+    A page without a title is labeled by its URL, and a URL with a signed query
+    string can run to thousands of characters. Titles and publisher labels are
+    display metadata, so one such page must not fail a whole research run when
+    results are revalidated. Identity fields (url, source_uri, ids) stay strict.
+    """
+
+    def clamp(value):
+        if isinstance(value, str) and len(value) > limit:
+            return value[: limit - 1] + "…"
+        return value
+
+    return clamp
+
+
 class RawEvidence(Contract):
     raw_id: Identifier
     title: str = Field(min_length=1, max_length=1000)
@@ -183,6 +215,8 @@ class RawEvidence(Contract):
     document_hash: str | None = None
 
     _url = field_validator("url")(safe_http_url)
+    _title = field_validator("title", mode="before")(bounded(1000))
+    _publisher = field_validator("publisher", mode="before")(bounded(200))
 
     @model_validator(mode="after")
     def locator_required(self):
