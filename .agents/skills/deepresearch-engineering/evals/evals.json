@@ -1,0 +1,34 @@
+{
+  "skill_name": "deepresearch-engineering",
+  "evals": [
+    {
+      "id": 1,
+      "name": "audit-slow-run",
+      "prompt": "帮我审计一下这次深度研究：http://127.0.0.1:3112/workspace/deepresearch/244cd6d5-793a-4ef9-b560-cb4a3cebdfe4 。它跑了十分钟，我想知道时间和 token 都花在哪了、缓存有没有生效、有什么值得调的。给我一份审计报告（markdown），要有具体数字和可以直接改的设置。",
+      "expected_output": "一份有具体数字、根因取证和可执行设置的中文审计报告。",
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "debug-failed-run",
+      "prompt": "431584b1 这次研究直接 FAILED 了，报 NO_EVIDENCE，但我看检索工具明明是好的。帮我查根因，告诉我怎么避免。结论写成 markdown。",
+      "expected_output": "失败根因、排除项和避免方法。",
+      "files": []
+    },
+    {
+      "id": 3,
+      "name": "verify-tuning-before-after",
+      "prompt": "我昨天改了提示词缓存相关的代码。8654f210 是改之前跑的，244cd6d5 是改之后跑的，同一个问题同一个模型。帮我验证这个改动到底有没有效果，有没有副作用，写一份对比结论（markdown）。注意两次的计划可能不一样。",
+      "expected_output": "先比比例再比总量的前后对比结论，包含副作用排查。",
+      "files": []
+    },
+    {
+      "id": 4,
+      "name": "plan-a-new-setting",
+      "prompt": "我想给 DeepResearch 加一个设置：限制每个研究步骤最多能打开多少个网页（比如 max_pages_per_unit），设置页也要能改。先别写代码，告诉我需要改哪些文件、要同步哪些文档、怎么测、有什么规矩不能犯。写成 markdown 的实施计划。",
+      "expected_output": "列出要改的文件、要同步的文档、测试方法和不能违反的规矩的实施计划。",
+      "files": []
+    }
+  ],
+  "note": "只放任务，不放参考答案：在本仓库里跑对照组时，答案会被 grep 到。评分脚本与答案放在仓库外的工作目录。"
+}
