@@ -119,7 +119,7 @@ LOCAL_MODEL_API_KEY=local-not-checked
 
 ### 3.2 其他 OpenAI 兼容服务
 
-适用于 Xinference、LM Studio、公司模型网关，以及 Ollama 的 `/v1` 接口：
+适用于 Xinference、LM Studio、自建模型网关，以及 Ollama 的 `/v1` 接口：
 
 ```yaml
 models:
@@ -159,26 +159,36 @@ Ollama 要注意两点：
 
 | 环节 | 用哪个模型（从左往右，找到第一个就用） |
 | --- | --- |
-| 请求改写（对话 → 研究请求） | `rewrite_model` → `default_model` → 研究 `models` 第一个 |
-| 规划、研究、写作（Agent 执行） | `skills.<名字>.model` → `default_model` → 旧版绑定的子 Agent 模型 → 研究 `models` 第一个 |
-| 输出整理（把回答整理成数据） | `extraction_model` → 角色的模型（同上一行） |
+| 请求改写（对话 → 研究请求） | `nodes.rewrite.model` → `rewrite_model` → 规划角色模型 → `default_model` → 研究 `models` 第一个 |
+| 规划、追问分流 | `nodes.plan.model` / `nodes.follow_up.model` → `skills.deepresearch.model` → `default_model` |
+| 检索研究（每个研究员的 Agent 循环） | `skills.<研究员>.model` → `nodes.research.model` → `default_model` → 旧版绑定的子 Agent 模型 → 研究 `models` 第一个 |
+| 大纲、章节、摘要、报告改写 | `nodes.outline/section/summary/revision.model` → `skills.report-synthesis.model` → `default_model` |
+| 输出整理（把回答整理成数据） | `nodes.conversion.model` → `extraction_model` → 角色的模型 |
 | 上下文压缩（研究角色） | `compaction.model` → 角色自己的模型 |
-| 单次输出上限 | 取模型的 `max_tokens` 和研究配置 `max_output_tokens` 中较小的值 |
+| 单次输出上限 | 取模型的 `max_tokens` 和 `nodes.<节点>.max_tokens`（没写则用 `max_output_tokens`）中较小的值 |
+| 采样参数 | `nodes.<节点>` 的 `temperature` / `top_p` / `extra_body` 覆盖模型自己的；详见 RESEARCH_CONFIGURATION 3.1 |
 | 思考模式 | 研究角色和输出整理总是关闭思考（`supports_thinking: true` 的模型会收到关闭开关） |
 | 宿主聊天的压缩与标题 | `summarization.model_name`、`title.model_name`，与研究无关 |
 
-建议所有研究环节先用同一个模型。等研究能跑通了，再考虑给输出整理（`extraction_model`）换一个更稳的模型。
+建议所有研究环节先用同一个模型，先用 `nodes` 把输出 JSON 的节点温度压到 0–0.2；等研究能跑通了，再看“指标 → 按节点”
+里哪个节点格式重试多、被截断多、P95 延迟高，给它单独换模型或调 `max_tokens`。
+
+只支持 OpenAI Chat Completions 协议的模型网关：`provider: openai` + `base_url`。研究不使用 JSON mode、Responses API
+或结构化输出；输出上限参数名（`max_tokens_param`）和流式用量（`stream_usage`）默认自动适配，见 RESEARCH_CONFIGURATION 第 3 节。
 
 ## 6. 模型较弱时怎么调
 
 | 现象 | 调整 | 在哪里改 |
 | --- | --- | --- |
-| 整理失败、`RESULT_CONTRACT` | `output_retries` 调到 3 或 4；`extraction_model` 用最稳的模型 | 研究配置 |
+| 整理失败、`RESULT_CONTRACT`、`OUTPUT_SCHEMA` | `nodes.conversion` 温度 0、`output_retries` 3–4、`max_tokens` 留足（6000 左右）；`max_findings_per_unit` 调到 8–10；换最稳的模型 | 研究配置 |
+| 计划或大纲不是合法 JSON | `nodes.plan` / `nodes.outline` 温度 0–0.1；回复被截断时调大该节点 `max_tokens`（指标“按节点”里“被截断”> 0） | 研究配置 |
 | 报告章节反复修复、质量差 | `max_report_sections` 调到 4 或 5；`max_synthesis_repairs` 保持 1 | 研究配置 |
 | 超时、`NATIVE_AGENT_TIMEOUT` | 研究配置的 `skills.*.timeout_seconds` 调到 1800；研究模型的 `timeout_seconds` 调到 900 | 研究配置 |
 | 显存不够、请求排队 | `max_concurrency` 调到 1；`subagent_runtime.max_running` 不能小于它 | 研究配置、`config.yaml` |
 | 上下文超长 | 研究配置的 `compaction.trigger_fraction` 调到 0.4–0.5；模型要填 `context_window`；必要时调低 `sandbox.read_file_output_max_chars` | 研究配置（沙箱项在 `config.yaml`） |
-| 一次研究太久 | `budget_ceiling.max_units` 调到 3 或 4；`max_iterations` 调到 0 或 1 | 研究配置 |
+| 一次研究太久 | `plan_max_units` 2–4；`supplement_gap_codes: [coverage, unsupported]` 或 `max_iterations: 0`；`max_searches_per_unit` 8–12；`max_seconds_per_unit` 给每步设软时限；很慢时关掉 `nodes.rewrite` / `nodes.summary`；`max_report_sections` 4–5 | 研究配置 |
+| 到时间整个研究失败 | 不会再发生：研究在剩余 `report_time_reserve_seconds` 时收尾并照常写报告；报告阶段也超时才会失败，此时调大 `max_elapsed_seconds` 或该预留 | 研究配置 |
+| Token / 费用指标全是 “—” | 网关没有上报流式用量：确认 `stream_usage` 没有被关掉；网关确实不支持时只能看估算值 | 研究配置 |
 | 计划里要求了没配置的来源，研究单元报 `TOOL_DENIED` | 只有一类来源时设 `require_dual_source: false`，系统会自动去掉没有工具的来源要求 | 研究配置 |
 | 进度说明或报告不是中文 | 先确认 `researcher_output` 提示词里的语言要求没被改掉；仍不稳定时换中文能力更好的模型 | 设置页“提示词”、研究配置 |
 

@@ -126,7 +126,7 @@ curl http://127.0.0.1:8001/api/deepresearch/capabilities
 | --- | --- | --- |
 | `plugins` | 加载 `deepresearch.extension:install` | `config_path` 相对仓库根目录；没有这一段，研究接口就不存在。这是研究唯一必须的宿主配置 |
 | `sandbox` | `deerflow.sandbox.local:LocalSandboxProvider` | 不需要 Docker。要用容器沙箱（`AioSandboxProvider`）的话，必须在联网时先拉好镜像 |
-| `subagent_runtime.max_running` | 不小于研究配置的 `max_concurrency` | 子 Agent 同时运行的上限，超出的会排队 |
+| `subagent_runtime.max_running` | 不小于研究配置的 `max_concurrency` 与 `writer_concurrency` 中较大者 | 子 Agent 同时运行的上限，启动时读取。超出的在引擎里排队，**研究侧的“排队秒”看不到这段等待**，等过 `queue_timeout_seconds`（默认 300）的角色直接失败。宿主默认是 3：6 路并发的研究实测有三个步骤各空等 200–290 秒。`python -m deepresearch.doctor` 的 `engine_capacity` 会报告不匹配 |
 | `database` | 保持示例（sqlite） | DeerFlow 自己的数据库，和研究数据库不是同一个 |
 | `skills` | 保持示例 | `container_path` 保持 `/mnt/skills`；只影响宿主自己的 Skill 索引 |
 | `models` | 至少留一个能构造的模型 | 宿主聊天用；研究用研究配置里的 `models`。两边可以完全不同 |
@@ -147,11 +147,11 @@ curl http://127.0.0.1:8001/api/deepresearch/capabilities
 
 ```yaml
 mcp_servers:
-  company-kb:
+  internal-kb:
     transport: http
     url: http://10.0.0.8:9000/mcp
     headers:
-      Authorization: secret:company-kb-token   # 或 $COMPANY_KB_TOKEN
+      Authorization: secret:internal-kb-token   # 或 $INTERNAL_KB_TOKEN
     timeout_seconds: 60
 
 sources:
@@ -163,7 +163,7 @@ sources:
     providers:
       - id: kb
         type: mcp
-        server: company-kb
+        server: internal-kb
         tool: search            # MCP 工具原名
 ```
 

@@ -63,15 +63,23 @@ def test_effective_subagent_policy_preserves_per_agent_caps_and_disabled_policy(
         }
     )
     role = SubagentConfig(name="researcher", description="research", system_prompt="research", model="local")
-    run = {"budget": {"max_model_tokens": 120000}, "units": ["one", "two"], "usage": {"model_tokens": 100000}}
+    run = {"budget": {"max_model_tokens": 120000}, "units": ["one", "two"], "usage": {"model_tokens": 0}}
     bounded, _ = model_budget_config(config, role, 4096, run=run, researcher=True)
     policy = bounded.subagents.get_token_budget_for("researcher")
     assert policy.max_tokens == 10000 and policy.max_input_tokens == 8000
-    assert policy.hard_stop_threshold == 0.8 and policy.warn_threshold == 0.25
+    assert policy.hard_stop_threshold == 0.8 and policy.warn_threshold == 0.5
     assert config.subagents.get_token_budget_for("researcher").warn_threshold == 0.5
+    # A step's share may tighten the operator's cap, never loosen it.
+    spent = {**run, "usage": {"model_tokens": 100000}}
+    tightened, _ = model_budget_config(config, role, 4096, run=spent, researcher=True)
+    assert tightened.subagents.get_token_budget_for("researcher").max_tokens == 1000
+    # A host that turned its own backstop off for the role still gets the
+    # run's research budget, without the disabled caps.
     config.subagents.agents["researcher"].token_budget.enabled = False
     disabled, _ = model_budget_config(config, role, 4096, run=run, researcher=True)
-    assert not disabled.subagents.get_token_budget_for("researcher").enabled
+    share = disabled.subagents.get_token_budget_for("researcher")
+    assert share.enabled and share.max_tokens == 60000 // 2 - 2 * 4096 and share.max_input_tokens is None
+    assert share.hard_stop_threshold == 1.0 and share.warn_threshold == 0.5
 
 
 @pytest.mark.parametrize("status,code", [(401, "MODEL_AUTH_REQUIRED"), (402, "MODEL_BILLING_REQUIRED"), (403, "MODEL_ACCESS_DENIED"), (429, "MODEL_RATE_LIMIT"), (504, "MODEL_TIMEOUT"), (503, "MODEL_UNAVAILABLE")])
@@ -185,7 +193,9 @@ async def test_accepted_input_survives_a_crash_before_task_submission(settings, 
         assert final["status"] == "COMPLETED", final.get("error")
         assert not final.get("pending_operation")
         assert len([m for m in final["conversation"] if m["id"] == "durable-message"]) == 1
-        assert final["usage"]["tool_calls"] == 4
+        # A plan edit continues the same task; a follow-up after the report starts a new budget.
+        assert final["usage"]["tool_calls"] == (4 if editing else 0)
+        assert [item["tool_calls"] for item in final.get("usage_history", [])] == ([] if editing else [4])
         if editing:
             assert final["plan"]["plan_version"] == 2
             assert len([m for m in final["conversation"] if m["kind"] == "report"]) == 1
@@ -234,7 +244,9 @@ async def test_followup_replay_does_not_advance_cycle_twice_or_hide_events(setti
         assert pending["report"] is None
         await service.decision(rid, pending["plan"]["plan_version"], "approve")
         final = await settle(service, rid)
-        assert final["status"] == "COMPLETED" and final["usage"]["tool_calls"] == 8
+        # The new research cycle has its own budget; the first cycle's spend is kept in the history.
+        assert final["status"] == "COMPLETED" and final["usage"]["tool_calls"] == 4
+        assert [item["tool_calls"] for item in final["usage_history"]] == [4]
         done = [e for e in await service.store.events(rid, limit=1000) if e["type"] == "research.unit.completed"]
         assert len(done) == 4 and {e["data"]["cycle"] for e in done} == {0, 1}
     finally:

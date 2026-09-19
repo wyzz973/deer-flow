@@ -1,9 +1,9 @@
 import { expect, it, rs } from "@rstest/core";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 
 import { ResearchMetricsPanel } from "@/components/deepresearch/metrics-panel";
-import type { ResearchMetrics } from "@/core/deepresearch/types";
+import type { NodeMetric, ResearchMetrics } from "@/core/deepresearch/types";
 
 const group = (key: string, total: number, cost: number | null) => ({
   key,
@@ -278,5 +278,218 @@ it("marks runs from before per-call metering as unmeasured instead of zero", asy
   );
   expect(screen.queryByText(/null/)).toBeNull();
   expect(screen.getByText(/并行累计：模型 — · 工具/)).toBeTruthy();
+  view.unmount();
+});
+
+const node = (
+  name: string,
+  overrides: Partial<NodeMetric> = {},
+): NodeMetric => ({
+  node: name,
+  models: ["gateway-flash"],
+  model_calls: 2,
+  model_errors: 0,
+  unreported_usage: 0,
+  input_tokens: 2884,
+  output_tokens: 1904,
+  cache_read_tokens: 512,
+  reasoning_tokens: 0,
+  total_tokens: 4788,
+  max_input_tokens: 2884,
+  avg_output_tokens: 952,
+  truncated: 0,
+  retries: 0,
+  model_ms: 8757,
+  latency_ms: { count: 2, avg: 4378, p50: 2801, p95: 8757, max: 8757 },
+  cost: 0.0063,
+  ...overrides,
+});
+
+function mount(value: ResearchMetrics) {
+  const api = {
+    root: "/api/deepresearch",
+    metrics: async () => value,
+    downloadMetrics: rs.fn(async () => undefined),
+  };
+  return render(
+    <QueryClientProvider client={new QueryClient()}>
+      <ResearchMetricsPanel api={api} runId={value.run_id} active={false} />
+    </QueryClientProvider>,
+  );
+}
+
+it("breaks model work down by node and flags truncation and format retries", async () => {
+  const view = mount({
+    ...metrics,
+    run_id: "nodes",
+    breakdown: {
+      ...metrics.breakdown,
+      by_node: [
+        // An agent loop whose requests only append: most of its prompt could
+        // be served from a prefix cache, and the provider served part of it.
+        node("plan", { cache_read_ratio: 0.178, prefix_reuse_ratio: 0.82 }),
+        node("section", {
+          models: ["gateway-pro", "gateway-flash"],
+          truncated: 3,
+          retries: 2,
+          model_errors: 1,
+          unreported_usage: 1,
+        }),
+        // Nothing measured yet: unknown stays unknown, never zero.
+        node("compaction", {
+          models: [],
+          max_input_tokens: null,
+          avg_output_tokens: null,
+          cost: null,
+          latency_ms: { count: 0, avg: null, p50: null, p95: null, max: null },
+        }),
+        node("brand_new_node"),
+      ],
+    },
+  });
+  const heading = await screen.findByRole("heading", { name: "按节点" });
+  const section = within(heading.parentElement!);
+  expect(
+    section.getAllByRole("columnheader").map((cell) => cell.textContent),
+  ).toEqual([
+    "节点",
+    "模型",
+    "调用",
+    "错误",
+    "Token",
+    "缓存命中 / 可复用",
+    "平均输出",
+    "被截断",
+    "格式重试",
+    "P50 / P95 延迟",
+    "耗时",
+    "费用",
+  ]);
+  const cells = (label: string) =>
+    [...section.getByText(label).closest("tr")!.querySelectorAll("td")].map(
+      (cell) => cell.textContent,
+    );
+  expect(cells("研究计划")).toEqual([
+    "研究计划",
+    "gateway-flash",
+    "2",
+    "0",
+    "4.8k",
+    "18% / 82%",
+    "952",
+    "0",
+    "0",
+    "2.8s / 8.8s",
+    "8.8s",
+    "$0.0063",
+  ]);
+  expect(cells("章节写作").slice(1, 5)).toEqual([
+    "gateway-pro、gateway-flash",
+    "2",
+    "1",
+    "4.8k1 次未上报用量",
+  ]);
+  expect(cells("上下文压缩")).toEqual([
+    "上下文压缩",
+    "—",
+    "2",
+    "0",
+    "4.8k",
+    // Records from before the measure existed: unknown, not 0%.
+    "— / —",
+    "—",
+    "0",
+    "0",
+    "— / —",
+    "8.8s",
+    "—",
+  ]);
+  // An unknown node keeps its raw name instead of disappearing.
+  expect(section.getByText("brand_new_node")).toBeTruthy();
+
+  // Only the cells that call for tuning stand out.
+  const flagged = (label: string) =>
+    [
+      ...section
+        .getByText(label)
+        .closest("tr")!
+        .querySelectorAll("[data-flagged]"),
+    ].map((cell) => cell.textContent);
+  expect(flagged("章节写作")).toEqual(["1", "3", "2"]);
+  expect(flagged("研究计划")).toEqual([]);
+  expect(
+    section.getByText(
+      "被截断：输出碰到上限，调大该节点 max_tokens；格式重试：JSON/引用未通过校验，降低该节点温度或换模型",
+    ),
+  ).toBeTruthy();
+  view.unmount();
+});
+
+it("omits the node table for a gateway without per-node metrics", async () => {
+  const view = mount({ ...metrics, run_id: "no-nodes" });
+  expect(await screen.findByText("13m 30s")).toBeTruthy();
+  expect(screen.queryByRole("heading", { name: "按节点" })).toBeNull();
+  expect(screen.queryByRole("heading", { name: "此前任务用量" })).toBeNull();
+  view.unmount();
+});
+
+it("lists the tasks that ended earlier in the conversation", async () => {
+  const view = mount({
+    ...metrics,
+    run_id: "follow-up",
+    budget: {
+      ...metrics.budget,
+      earlier_tasks: [
+        {
+          cycle: 0,
+          closed_at: "2026-09-17T00:20:00+00:00",
+          model_tokens: 348000,
+          tool_calls: 40,
+          elapsed_seconds: 615,
+        },
+        {
+          cycle: null,
+          closed_at: null,
+          model_tokens: null,
+          tool_calls: null,
+          elapsed_seconds: null,
+        },
+      ],
+    },
+  });
+  const heading = await screen.findByRole("heading", { name: "此前任务用量" });
+  const rows = [...heading.parentElement!.querySelectorAll("tbody tr")].map(
+    (row) => [...row.querySelectorAll("td")].map((cell) => cell.textContent),
+  );
+  expect(rows[0]![0]).toBe("第 1 个");
+  expect(rows[0]!.slice(2)).toEqual(["348.0k", "40", "10m 15s"]);
+  expect(rows[1]).toEqual(["—", "—", "—", "—", "—"]);
+  expect(screen.getByText(/预算按任务计/)).toBeTruthy();
+  view.unmount();
+});
+
+it("shows an unmetered subagent as unknown, not as zero calls", async () => {
+  const view = mount({
+    ...metrics,
+    run_id: "unmetered-agent",
+    agents: {
+      ...metrics.agents,
+      runs: [
+        {
+          ...metrics.agents.runs[0]!,
+          model_calls: null,
+          tool_calls: null,
+          total_tokens: null,
+          seconds: null,
+          cost: null,
+        },
+      ],
+    },
+  });
+  const heading = await screen.findByRole("heading", { name: "子 Agent" });
+  const cells = [...heading.parentElement!.querySelectorAll("tbody tr td")].map(
+    (cell) => cell.textContent,
+  );
+  expect(cells.slice(2)).toEqual(["—", "— / —", "—", "—"]);
   view.unmount();
 });

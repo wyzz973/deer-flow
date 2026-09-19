@@ -167,7 +167,7 @@ SKIP_ENV_VALIDATION=1 DEER_FLOW_AUTH_DISABLED=1 DEER_FLOW_ENV=development \
 
 | 任务 | 后端文件（`backend/deepresearch/`） | 前端文件（`frontend/src/`） | 测试 |
 | --- | --- | --- | --- |
-| 任何提示词 | `prompts.py`（全部默认值，17 条） | 设置页“提示词”（`settings/prompts-section.tsx`） | `test_runner.py`、`test_research_settings.py` |
+| 任何提示词 | `prompts.py`（全部默认值，20 条） | 设置页“提示词”（`settings/prompts-section.tsx`） | `test_runner.py`、`test_research_settings.py` |
 | 请求改写（第一步） | `workflow.py`（`rewrite` 节点）、`structured.py`（`rewrite_request`）、`prompts.py`（`rewrite`） | `components/deepresearch/request-card.tsx` | `test_workflow.py`、`test_runner.py` |
 | 计划内容、计划提示词 | `runner.py`（`plan`）、`workflow.py`（`planner`）、`prompts.py`（`plan`） | `components/deepresearch/plan-card.tsx` | `test_runner.py`、`test_workflow.py`、`plan-card.dom.test.tsx` |
 | 倒计时、编辑、更新、追问 | `conversation.py`、`service.py` | `components/deepresearch/research-conversation.tsx`、`core/deepresearch/hooks.ts` | `test_conversation.py`、`hooks.dom.test.tsx` |
@@ -177,6 +177,12 @@ SKIP_ENV_VALIDATION=1 DEER_FLOW_AUTH_DISABLED=1 DEER_FLOW_ENV=development \
 | 引用资格、来源 | `report_policy.py`、`observations.py`、`sources.py`、`evidence.py` | `components/deepresearch/sources-panel.tsx`、`citation-preview.tsx` | `test_sources.py`、`test_native_sources.py`、`citation-preview.dom.test.tsx` |
 | 数据源、供应商与故障切换 | `providers.py`、`channels.py`、`extract.py`、`mcp.py` | 设置页“数据源与搜索”（`settings/sources-section.tsx`） | `test_source_providers.py` |
 | 研究模型、上下文压缩 | `models.py`、`native.py`（`model_budget_config`） | 设置页“模型 / 运行参数” | `test_research_models.py` |
+| 按节点的模型与参数（`nodes:`） | `config.py`（`NodeSpec`）、`models.py`（`model_for`、`with_node`）、`native.py`（`node_of`）、`structured.py` | 设置页“节点调参”（`settings/nodes-section.tsx`）；指标“按节点”表 | `test_tuning.py` |
+| 只用 MCP、没有原文时的引用规则 | `report_policy.py`（`results_citable`）、`runner.py`（`records_only`）、`observations.py`、`prompts.py`（`research_records`） | 设置页“数据源与搜索”顶部提示 | `test_tuning.py`、`test_review_fixes.py` |
+| MCP 白名单、鉴权、失败诊断 | `mcp.py`、`secrets.py`、`config.py`（`McpServerSpec.allowed_tools`） | 设置页“MCP 服务” | `test_tuning.py` |
+| 时间预算收尾、预算按任务计 | `store.py`（`research_seconds_left`）、`channels.py`（`SearchBudget.deadline`）、`runner.py`、`service.py`、`conversation.py` | 指标“预算”区 | `test_tuning.py`、`test_conversation.py` |
+| 设置页能保存什么（安全边界） | `profile.py`（`guard`、`masked`） | — | `test_review_fixes.py` |
+| 只支持 Chat Completions 的模型网关 | `chat_completions.py`、`models.py`（`legacy_token_param`、流式用量） | 设置页“模型”的兼容项 | `test_review_fixes.py` |
 | 设置、快照、密钥 | `profile.py`、`secrets.py`、`catalog.py`、`service.py` | `components/deepresearch/research-settings.tsx`、`core/deepresearch/settings.ts` | `test_research_settings.py`、`settings.test.ts`、`research-settings.dom.test.tsx` |
 | 模型调用审计 | `audit.py`、`trace.py`、`store.py` | `components/deepresearch/llm-calls-panel.tsx`、`llm-call-dialog.tsx`、`core/deepresearch/llm-calls.ts` | `test_llm_audit.py`、`llm-calls.test.ts`、`llm-calls.dom.test.tsx` |
 | 活动时间线 | `activity.py` | `sources-panel.tsx`（活动页签） | `test_activity.py`、`activity-panel.dom.test.tsx` |

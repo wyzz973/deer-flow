@@ -51,9 +51,16 @@ def private_config(value, environ, prefix="DEERFLOW_ACCEPTANCE_SECRET"):
     return visit(value)
 
 
-def build_config(base, home: Path, roles=(), *, unlimited_budget=False):
+def build_config(base, home: Path, roles=(), *, unlimited_budget=False, concurrency=None):
     """The engine configuration with isolated application state; research lives elsewhere."""
     value = copy.deepcopy(base)
+    if concurrency:
+        # The engine queues native roles beyond subagent_runtime.max_running and
+        # fails one that waits past its admission timeout. With the host default
+        # of 3, six configured research steps ran three at a time and the rest
+        # waited minutes that no research metric shows.
+        runtime = value["subagent_runtime"] = dict(value.get("subagent_runtime") or {})
+        runtime["max_running"] = max(runtime.get("max_running") or 0, concurrency)
     value["plugins"] = [{"name": "deepresearch", "use": "deepresearch.extension:install", "required": True, "config": {"config_path": str(home / "research.yaml")}}]
     value["database"] = {**value.get("database", {}), "backend": "sqlite", "sqlite_dir": str(home / "database"), "postgres_url": ""}
     value["checkpointer"] = None
@@ -111,14 +118,40 @@ def web_sources(environ, *, jina_key=True):
     ]
 
 
-def _write_yaml(path, data, *, reuse=False, operator_keys=()):
+def setting_defaults():
+    """Default values of research settings as plain data, for comparing a stored file with a newer one."""
+    from pydantic import BaseModel
+    from pydantic_core import PydanticUndefined
+
+    from .config import Settings
+
+    defaults = {}
+    for name, field in Settings.model_fields.items():
+        value = field.default_factory() if field.default_factory is not None else field.default
+        if value is PydanticUndefined:
+            continue
+        defaults[name] = value.model_dump(mode="json") if isinstance(value, BaseModel) else value
+    return defaults
+
+
+def _write_yaml(path, data, *, reuse=False, operator_keys=(), defaults=None, refresh=()):
     if reuse:
         # A code-only restart may reuse checkpoints, but a changed execution
         # configuration must not silently acquire the old run's identity.
         # Operator keys (prices) do not change execution and may be added later.
+        # A setting added by an upgrade is not a change either while it holds
+        # its default: the stored file, which lacks it, already runs that way.
         stored = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        if {k: v for k, v in stored.items() if k not in operator_keys} != {k: v for k, v in data.items() if k not in operator_keys}:
-            raise ValueError(f"Acceptance configuration changed; cannot resume {path.name}")
+        defaults = defaults or {}
+        missing = object()
+        for key in (set(stored) | set(data)) - set(operator_keys) - set(refresh):
+            if stored.get(key, defaults.get(key, missing)) != data.get(key, defaults.get(key, missing)):
+                raise ValueError(f"Acceptance configuration changed; cannot resume {path.name}")
+        # Capacity settings say how much runs at once, not what a run is: an
+        # existing directory takes the launcher's current value.
+        changed = {key: data[key] for key in refresh if key in data and stored.get(key) != data[key]}
+        if changed:
+            path.write_text(yaml.safe_dump({**stored, **changed}, allow_unicode=True, sort_keys=True), encoding="utf-8")
         return
     # Generated configuration may still contain private non-credential metadata.
     with path.open("x", encoding="utf-8") as output:
@@ -136,6 +169,7 @@ def main():
     parser.add_argument("--max-output-tokens", type=int, help="Per-response limit verified against the configured provider")
     parser.add_argument("--unlimited-budget", action="store_true", help="Disable cumulative tokens, tool-call and elapsed budgets for this isolated acceptance; usage is still recorded")
     parser.add_argument("--resume-dir", type=Path, help="Reuse an existing private live directory after a code-only repair; configuration must match")
+    parser.add_argument("--research-overlay", type=Path, help="YAML whose top-level keys replace the generated research configuration, e.g. MCP sources, mcp_servers, nodes and budgets")
     args = parser.parse_args()
     if not args.allow_live:
         parser.error("Live acceptance requires --allow-live")
@@ -175,14 +209,22 @@ def main():
     )
     if args.max_output_tokens is not None:
         research["max_output_tokens"] = args.max_output_tokens
+    if args.research_overlay:
+        # Try a deployment's own sources and tuning (MCP tools, per-node
+        # parameters) on the acceptance gateway without editing the example file.
+        overlay = yaml.safe_load(args.research_overlay.read_text(encoding="utf-8")) or {}
+        if not isinstance(overlay, dict) or {"runner", "data_dir"} & set(overlay):
+            parser.error("--research-overlay must be a mapping and cannot set runner or data_dir")
+        research.update(overlay)
     if args.unlimited_budget:
         # Null is a real disabled ceiling, not an arbitrarily large allowance.
         # Structural unit/iteration limits and native cancellation remain.
         research.setdefault("budget_ceiling", {}).update(max_model_tokens=None, max_tool_calls=None, max_elapsed_seconds=None)
-    host = private_config(build_config(base, home, research["skills"], unlimited_budget=args.unlimited_budget), os.environ)
-    _write_yaml(home / "host.yaml", host, reuse=bool(args.resume_dir))
+    concurrency = max(research.get("max_concurrency") or 1, research.get("writer_concurrency") or 1)
+    host = private_config(build_config(base, home, research["skills"], unlimited_budget=args.unlimited_budget, concurrency=concurrency), os.environ)
+    _write_yaml(home / "host.yaml", host, reuse=bool(args.resume_dir), refresh=("subagent_runtime",))
     (home / "skills" / "public").mkdir(parents=True, exist_ok=True)
-    _write_yaml(home / "research.yaml", research, reuse=bool(args.resume_dir), operator_keys=("pricing",))
+    _write_yaml(home / "research.yaml", research, reuse=bool(args.resume_dir), operator_keys=("pricing",), defaults=setting_defaults())
 
     os.environ.update(
         DEER_FLOW_CONFIG_PATH=str(home / "host.yaml"),

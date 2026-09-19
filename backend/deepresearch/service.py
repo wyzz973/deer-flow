@@ -17,7 +17,7 @@ from .evidence import digest
 from .favicons import Favicons
 from .runner import DeerFlowRunner, DemoRunner
 from .secrets import SECRETS, trace_secrets
-from .store import ProcessLock, Store
+from .store import ProcessLock, Store, report_time_reserve
 from .trace import LocalTrace, install_log, logger
 
 
@@ -350,8 +350,16 @@ class ResearchService(ConversationLifecycle):
         try:
             ceiling = run["budget"]["max_elapsed_seconds"]
             remaining = None if ceiling is None else ceiling - run["usage"]["elapsed_seconds"]
-            if remaining is not None and remaining <= 0:
-                raise ResearchError("TIME_BUDGET", "研究执行时间预算已用尽", recoverable=False)
+            if remaining is not None:
+                # Research winds down on its own when only the report reserve is
+                # left (store.research_seconds_left), so the report still has
+                # time after the ceiling. This timeout is the backstop for a
+                # report that does not finish either: one more reserve past it.
+                remaining += report_time_reserve(run, settings)
+                if remaining <= 0:
+                    raise ResearchError("TIME_BUDGET", "研究执行时间预算已用尽", recoverable=False)
+            # Wall clock of this drive, so nodes can tell how much time is left.
+            await self.store.patch(run["run_id"], drive_started_at=time.time())
             with tracing_context(enabled=False), use_settings(settings):
                 async with asyncio.timeout(remaining):
                     trace = LocalTrace(self.store, run["run_id"], settings, trace_secrets(settings, context))
@@ -385,7 +393,12 @@ class ResearchService(ConversationLifecycle):
         finally:
             elapsed = time.monotonic() - start
             try:
-                await self.store.mutate(run["run_id"], lambda r: r["usage"].update(elapsed_seconds=r["usage"]["elapsed_seconds"] + elapsed))
+
+                def charge(current):
+                    current["usage"].update(elapsed_seconds=current["usage"]["elapsed_seconds"] + elapsed)
+                    current.pop("drive_started_at", None)
+
+                await self.store.mutate(run["run_id"], charge)
             finally:
                 self.tasks.pop(run["run_id"], None)
                 try:

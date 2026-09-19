@@ -11,11 +11,15 @@ export function ChatSurface({
   messages,
   composer,
   isWelcomeMode,
+  headerClassName,
 }: {
   header: ReactNode;
   messages: ReactNode;
   composer: ReactNode;
   isWelcomeMode: boolean;
+  /** Lets a domain surface restyle the header bar (e.g. a reader without the
+   * resting shadow); layout stays shared. */
+  headerClassName?: string;
 }) {
   return (
     <div className="relative flex size-full min-h-0 justify-between">
@@ -25,6 +29,7 @@ export function ChatSurface({
           isWelcomeMode
             ? "bg-background/0 z-40 backdrop-blur-none"
             : "bg-background/80 z-30 shadow-xs backdrop-blur",
+          headerClassName,
         )}
       >
         {header}

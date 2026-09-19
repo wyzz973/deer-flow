@@ -1,6 +1,12 @@
 import { expect, it } from "@rstest/core";
 
-import { latestSnapshot, parseResearchEvent } from "@/core/deepresearch/events";
+import {
+  isRejection,
+  latestSnapshot,
+  parseResearchEvent,
+  runIdFromPath,
+  streamRetryDelay,
+} from "@/core/deepresearch/events";
 
 import { makeRun } from "./fixtures";
 
@@ -39,4 +45,33 @@ it("keeps a newer snapshot but never borrows data from another run", () => {
     "run_id",
     "another",
   );
+});
+
+it("tells a refused request from an uncertain one", () => {
+  const http = (status: number) => Object.assign(new Error("x"), { status });
+  expect(isRejection(http(409))).toBe(true);
+  expect(isRejection(http(422))).toBe(true);
+  // A proxy error says nothing about what the gateway accepted.
+  expect(isRejection(http(502))).toBe(false);
+  expect(isRejection(http(504))).toBe(false);
+  expect(isRejection(new TypeError("Failed to fetch"))).toBe(false);
+  expect(isRejection(undefined)).toBe(false);
+});
+
+it("backs off stream rebuilds from 1s to a 15s ceiling", () => {
+  expect([0, 1, 2, 3, 4, 5, 50].map(streamRetryDelay)).toEqual([
+    1000, 2000, 4000, 8000, 15000, 15000, 15000,
+  ]);
+});
+
+it("reads the selected conversation from a workspace address", () => {
+  expect(runIdFromPath("/workspace/deepresearch")).toBeUndefined();
+  expect(runIdFromPath("/workspace/deepresearch/")).toBeUndefined();
+  expect(runIdFromPath("/workspace/deepresearch/run-1")).toBe("run-1");
+  expect(runIdFromPath("/workspace/deepresearch/a%2Fb")).toBe("a/b");
+  // Not a conversation: the hook must leave its selection alone.
+  expect(runIdFromPath("/workspace/deepresearch/settings")).toBeNull();
+  expect(runIdFromPath("/workspace/chats/new")).toBeNull();
+  expect(runIdFromPath("/workspace/deepresearch/x/y")).toBeNull();
+  expect(runIdFromPath("/workspace/deepresearch/%E0%A4%A")).toBeNull();
 });

@@ -108,7 +108,14 @@ class ConversationLifecycle:
             self._admit(run_id)
             await self.load_settings_for(run)
             self._check_config(run)
-            if run["status"] not in REVIEW_STATUSES | {"COMPLETED"}:
+            # A follow-up that was stopped or failed leaves the published report
+            # in place, and the conversation about it goes on (as it does in
+            # ChatGPT after "stop"). Without a report there is nothing to
+            # follow up on: that run is retried or replaced by a new one.
+            resumable = run["status"] in {"CANCELLED", "FAILED"} and bool(run.get("report"))
+            if run["status"] in {"CANCELLED", "FAILED"} and not resumable:
+                raise ResearchError("RUN_STOPPED", "研究已停止或未完成，且还没有报告可以继续讨论；请重试或新建研究", recoverable=False)
+            if run["status"] not in REVIEW_STATUSES | {"COMPLETED"} and not resumable:
                 raise ResearchError("RUN_BUSY", "当前研究正在执行，请等待完成或先停止研究")
             editing = run["status"] in REVIEW_STATUSES
             if editing and plan_version != run["plan"]["plan_version"]:
@@ -120,7 +127,18 @@ class ConversationLifecycle:
 
             def accept(current):
                 current.setdefault("conversation", []).append({"id": client_message_id, "role": "user", "kind": "text", "text": text, "at": utcnow(), "request_plan_version": plan_version})
-                current.update(status="PLANNING" if editing else "RESPONDING", auto_start_at=None, auto_start_paused=True, error=None, pending_operation=operation)
+                # cancel_requested fences every new call; a stopped run that continues must drop it.
+                current.update(status="PLANNING" if editing else "RESPONDING", auto_start_at=None, auto_start_paused=True, error=None, cancel_requested=False, pending_operation=operation)
+                if not editing:
+                    # A follow-up after the report is a new task in the same
+                    # conversation. Budgets are per task: charging it to what
+                    # the finished research left over made a question or a
+                    # report edit fail with TIME_BUDGET or BUDGET_EXHAUSTED
+                    # whenever the research had used most of its allowance.
+                    # Metrics read the per-call records, which keep everything.
+                    closed = {**current.get("usage", {}), "cycle": current.get("cycle", 0), "closed_at": utcnow()}
+                    current["usage_history"] = [*current.get("usage_history", []), closed][-50:]
+                    current["usage"] = {"tool_calls": 0, "model_tokens": 0, "reported_model_tokens": 0, "elapsed_seconds": 0}
 
             # One transaction owns acceptance and its pending graph input. A
             # restart between this write and task submission can replay it.

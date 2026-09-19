@@ -1,0 +1,85 @@
+# Acceptance overlay for `python -m deepresearch.live --research-overlay`: MCP tools only, no originals.
+# - The model is reached through a plain OpenAI-compatible Chat Completions endpoint.
+# - Web search and web fetch are switched off; only MCP tools may be used.
+# - None of those tools can open an original document.
+models:
+  - name: gateway-flash
+    display_name: Gateway (chat completions)
+    provider: openai
+    model: deepseek-v4-flash
+    base_url: https://api.deepseek.com/v1
+    api_key: $DEEPSEEK_API_KEY
+    max_tokens: 8192
+    context_window: 128000
+    extra: {extra_body: {thinking: {type: disabled}}}
+default_model: gateway-flash
+extraction_model: null
+sources:
+  - name: public-web-search
+    enabled: false
+    tool: web_search
+    role: search
+    origin: external
+    providers: [{id: duckduckgo, type: duckduckgo}]
+  - name: public-web-read
+    enabled: false
+    tool: web_fetch
+    role: read
+    origin: external
+    providers: [{id: direct, type: direct}]
+  - name: kb-docs
+    tool: kb_docs
+    role: data
+    origin: internal
+    level: L1
+    publisher: platform-team
+    description: Search the engineering knowledge base (benchmarks, cost reviews, architecture decisions). Returns passages that can be cited.
+    providers: [{id: kb, type: mcp, server: kb, tool: search_docs}]
+  - name: kb-wiki
+    tool: kb_wiki
+    role: search
+    origin: internal
+    level: L2
+    publisher: kb-wiki
+    description: Search the wiki (onboarding guides, SLA, runbooks, team and growth plans). Returns page titles, links and summaries.
+    providers: [{id: wiki, type: mcp, server: kb, tool: search_wiki}]
+  - name: kb-tickets
+    kind: mcp
+    server: kb
+    tool: search_tickets
+    role: data
+    origin: internal
+    level: L2
+    publisher: sre
+source_fallback: [kb-docs, kb-wiki, kb-tickets]
+require_dual_source: false
+mcp_servers:
+  kb:
+    transport: http
+    url: http://127.0.0.1:9731/mcp
+    headers:
+      Authorization: Bearer ${MCP_STUB_TOKEN}
+      Cookie: sid=${secret:kb-cookie}; lang=zh
+    allowed_tools: [search_docs, search_wiki, search_tickets]
+    timeout_seconds: 30
+nodes:
+  rewrite: {temperature: 0.2, max_tokens: 1500}
+  plan: {temperature: 0, max_tokens: 3000}
+  research: {temperature: 0.3}
+  conversion: {temperature: 0, json_mode: true}
+  outline: {temperature: 0.1}
+  section: {temperature: 0.5, max_tokens: 6000}
+  summary: {temperature: 0.4}
+plan_min_units: 2
+plan_max_units: 3
+max_searches_per_unit: 8
+supplement_gap_codes: [coverage, unsupported]
+plan_countdown_seconds: 3
+budget_ceiling:
+  max_iterations: 1
+  max_units: 6
+  max_tool_calls: 80
+  max_elapsed_seconds: 1500
+  max_model_tokens: 2000000
+pricing:
+  gateway-flash: {input_per_million: 1.0, cached_input_per_million: 0.2, output_per_million: 2.0, currency: CNY}

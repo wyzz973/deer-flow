@@ -2,6 +2,8 @@ import { firstText } from "./presentation";
 import type {
   EditableSettings,
   ModelSpec,
+  NodeName,
+  NodeSpec,
   ProviderSpec,
   RoleSpec,
   SettingsView,
@@ -10,6 +12,7 @@ import type {
 
 export type SettingsSection =
   | "models"
+  | "nodes"
   | "roles"
   | "prompts"
   | "sources"
@@ -19,6 +22,7 @@ export type SettingsSection =
 
 export const SECTION_LABELS: Record<SettingsSection, string> = {
   models: "模型",
+  nodes: "节点调参",
   roles: "研究角色",
   prompts: "提示词",
   sources: "数据源与搜索",
@@ -39,6 +43,7 @@ export const SECTION_FIELDS: Record<
     "extraction_model",
     "pricing",
   ],
+  nodes: ["nodes"],
   roles: ["skills"],
   prompts: ["prompts"],
   sources: [
@@ -52,12 +57,21 @@ export const SECTION_FIELDS: Record<
     "engine_tools",
     "compaction",
     "max_concurrency",
+    "writer_concurrency",
     "plan_countdown_seconds",
+    "plan_min_units",
+    "plan_max_units",
     "max_output_tokens",
+    "max_searches_per_unit",
+    "max_seconds_per_unit",
+    "max_findings_per_unit",
+    "report_time_reserve_seconds",
+    "supplement_gap_codes",
     "output_retries",
     "allow_limited_report",
     "max_synthesis_repairs",
     "max_report_sections",
+    "report_length_scale",
     "trace_capture_content",
     "llm_audit",
   ],
@@ -80,11 +94,21 @@ export const FIELD_LABELS: Record<keyof EditableSettings, string> = {
   max_concurrency: "同时研究的单元数",
   plan_countdown_seconds: "计划倒计时",
   max_output_tokens: "单次输出上限",
+  max_searches_per_unit: "每步检索次数上限",
+  max_seconds_per_unit: "单个研究步骤的软时限",
+  max_findings_per_unit: "每步发现条数上限",
+  report_time_reserve_seconds: "写报告预留时间",
+  plan_min_units: "计划最少步骤数",
+  plan_max_units: "计划最多步骤数",
+  supplement_gap_codes: "触发补研的缺口",
+  writer_concurrency: "章节写作并发",
+  nodes: "节点调参",
   output_retries: "整理失败重试次数",
   allow_limited_report: "缺口未补齐时仍写报告",
   cite_search_results: "引用搜索结果摘要",
   max_synthesis_repairs: "引用修复次数",
   max_report_sections: "报告最多章节数",
+  report_length_scale: "报告长度系数",
   trace_capture_content: "Trace 记录内容",
   llm_audit: "记录完整的 LLM 调用",
   pricing: "费用单价",
@@ -96,6 +120,9 @@ export function fieldLabels(fields: string[]) {
     .map((field) => FIELD_LABELS[field as keyof EditableSettings] ?? field)
     .join("、");
 }
+
+/** Bounds the server enforces on `report_length_scale`; 1.0 when unset. */
+export const REPORT_LENGTH_SCALE = { min: 0.2, max: 3, fallback: 1 } as const;
 
 export const FIXED_ROLES = ["deepresearch", "report-synthesis"] as const;
 export const ROLE_TITLES: Record<string, string> = {
@@ -131,14 +158,252 @@ export function changedSections(
   );
 }
 
+/** Page-local facts about a draft item that never reach the server: a stable
+ * React key (models, sources and providers are arrays without ids), and the
+ * name other settings still use for the item while its own name is being typed
+ * through a value references cannot follow. Kept beside the draft, keyed by
+ * object identity, so the saved payload stays exactly the settings. */
+type RowMeta = { key: string; refs: Record<string, string> };
+const ROW_META = new WeakMap<object, RowMeta>();
+let rowCount = 0;
+
+function rowMeta(item: object) {
+  let meta = ROW_META.get(item);
+  if (!meta) {
+    meta = { key: `row-${++rowCount}`, refs: {} };
+    ROW_META.set(item, meta);
+  }
+  return meta;
+}
+
+/** A React key that stays with the item when the list is reordered or shortened. */
+export function rowKey(item: object) {
+  return rowMeta(item).key;
+}
+
+/** Give a copy of the same shape the keys of the original: the clone behind
+ * every edit, and the server's answer to a save (the same lists, saved). */
+export function carryMeta(from: unknown, to: unknown) {
+  if (!from || !to || typeof from !== "object" || typeof to !== "object")
+    return;
+  const meta = ROW_META.get(from);
+  if (meta) ROW_META.set(to, { key: meta.key, refs: { ...meta.refs } });
+  if (Array.isArray(from)) {
+    if (Array.isArray(to))
+      from.forEach((item, index) => carryMeta(item, to[index]));
+    return;
+  }
+  for (const [key, value] of Object.entries(from))
+    carryMeta(value, (to as Record<string, unknown>)[key]);
+}
+
 /** A copy with one change applied, so React state stays immutable. */
 export function edit(
   settings: EditableSettings,
   change: (draft: EditableSettings) => void,
 ): EditableSettings {
   const draft = structuredClone(settings);
+  // Before the change runs the copy has the same shape, so every item keeps
+  // its key; moved, removed and added items then follow by identity.
+  carryMeta(settings, draft);
   change(draft);
   return draft;
+}
+
+/** The name other settings currently use for an item: its own name, except
+ * while a rename is passing through a value that references must not follow. */
+export function referencedAs<T extends object>(
+  item: T,
+  field: keyof T & string,
+): string {
+  return ROW_META.get(item)?.refs[field] ?? String(item[field] ?? "");
+}
+
+/** Rename an item and everything that refers to it. A name that is empty or
+ * belongs to another item is only a keystroke on the way to the final name:
+ * following it would hand this item's references to that other item (and the
+ * next keystroke would take the other item's references along). References
+ * wait at the last name they could follow and catch up afterwards. */
+function follow<T extends object>(
+  item: T,
+  field: keyof T & string,
+  value: string,
+  others: T[],
+  remap: (from: string, to: string) => void,
+  reserved: string[] = [],
+) {
+  const from = referencedAs(item, field);
+  const taken =
+    reserved.includes(value) ||
+    others.some(
+      (other) =>
+        other !== item &&
+        (String(other[field]) === value ||
+          referencedAs(other, field) === value),
+    );
+  (item as Record<string, unknown>)[field] = value;
+  const meta = rowMeta(item);
+  if (!value || taken) {
+    meta.refs[field] = from;
+    return;
+  }
+  delete meta.refs[field];
+  if (from !== value) remap(from, value);
+}
+
+const MODEL_FIELDS = [
+  "default_model",
+  "rewrite_model",
+  "extraction_model",
+] as const;
+
+function remapModel(draft: EditableSettings, from: string, to: string | null) {
+  for (const field of MODEL_FIELDS)
+    if (draft[field] === from) draft[field] = to;
+  if (draft.compaction.model === from) draft.compaction.model = to;
+  for (const role of Object.values(draft.skills))
+    if (role.model === from) role.model = to;
+  for (const name of Object.keys(draft.nodes ?? {}) as NodeName[])
+    editNode(draft, name, (node) => {
+      if (node.model === from) node.model = to;
+    });
+  const price = draft.pricing[from];
+  if (price) {
+    delete draft.pricing[from];
+    if (to) draft.pricing[to] = price;
+  }
+}
+
+/** Rename a model together with every setting that names it (default, rewrite,
+ * extraction and compaction models, role and node models, list prices). */
+export function renameModel(
+  draft: EditableSettings,
+  index: number,
+  value: string,
+) {
+  follow(draft.models[index]!, "name", value, draft.models, (from, to) =>
+    remapModel(draft, from, to),
+  );
+}
+
+/** Remove a model; settings that named it fall back to inheritance. */
+export function removeModel(draft: EditableSettings, index: number) {
+  const [model] = draft.models.splice(index, 1);
+  if (model) remapModel(draft, referencedAs(model, "name"), null);
+}
+
+/** Rename a source together with its place in the default source order. */
+export function renameSource(
+  draft: EditableSettings,
+  index: number,
+  value: string,
+) {
+  follow(draft.sources[index]!, "name", value, draft.sources, (from, to) => {
+    draft.source_fallback = draft.source_fallback.map((name) =>
+      name === from ? to : name,
+    );
+  });
+}
+
+/** Rename a source's model-facing tool together with the role allowlists that
+ * name it. Engine tool names are reserved: an allowlist entry such as
+ * read_file belongs to the engine tool, not to a source typed through it. */
+export function renameSourceTool(
+  draft: EditableSettings,
+  index: number,
+  value: string,
+  engineTools: string[] = [],
+) {
+  follow(
+    draft.sources[index]!,
+    "tool",
+    value,
+    draft.sources,
+    (from, to) => {
+      for (const role of Object.values(draft.skills))
+        if (role.tools?.includes(from))
+          role.tools = [
+            ...new Set(role.tools.map((tool) => (tool === from ? to : tool))),
+          ];
+    },
+    engineTools,
+  );
+}
+
+export function removeSource(draft: EditableSettings, index: number) {
+  const [source] = draft.sources.splice(index, 1);
+  if (!source) return;
+  const name = referencedAs(source, "name");
+  draft.source_fallback = draft.source_fallback.filter((item) => item !== name);
+}
+
+/** Rename an MCP server (a key, so only a free, valid name) together with the
+ * sources and providers bound to it; the order of servers is kept. */
+export function renameMcpServer(
+  draft: EditableSettings,
+  from: string,
+  to: string,
+) {
+  if (from === to || !draft.mcp_servers[from] || draft.mcp_servers[to])
+    return false;
+  draft.mcp_servers = Object.fromEntries(
+    Object.entries(draft.mcp_servers).map(([name, server]) => [
+      name === from ? to : name,
+      server,
+    ]),
+  );
+  for (const source of draft.sources) {
+    if (source.server === from) source.server = to;
+    for (const provider of source.providers)
+      if (provider.server === from) provider.server = to;
+  }
+  return true;
+}
+
+/** A node without a key inherits everything. */
+export const NODE_DEFAULTS: NodeSpec = {
+  enabled: true,
+  model: null,
+  temperature: null,
+  top_p: null,
+  max_tokens: null,
+  timeout_seconds: null,
+  output_retries: null,
+  json_mode: false,
+  extra_body: {},
+};
+/** Direct calls; only these can ask the provider for a JSON object. */
+export const JSON_MODE_NODES: readonly string[] = ["rewrite", "conversion"];
+export const NODE_LABELS: Record<NodeName, string> = {
+  rewrite: "请求改写",
+  plan: "研究计划",
+  research: "检索研究",
+  conversion: "笔记整理",
+  outline: "报告大纲",
+  section: "章节写作",
+  summary: "执行摘要",
+  revision: "报告改写",
+  follow_up: "追问分流",
+};
+/** Nodes research can do without (the catalog's `optional` when it is loaded). */
+const OPTIONAL_NODES: readonly string[] = ["rewrite", "summary"];
+
+export function nodeSpec(settings: EditableSettings, name: NodeName): NodeSpec {
+  return { ...NODE_DEFAULTS, ...settings.nodes?.[name] };
+}
+
+/** Change one node. A node that is back to full inheritance loses its key, so
+ * the saved overrides only ever list nodes that were actually tuned. */
+export function editNode(
+  draft: EditableSettings,
+  name: NodeName,
+  change: (node: NodeSpec) => void,
+) {
+  const node = structuredClone(nodeSpec(draft, name));
+  change(node);
+  draft.nodes ??= {};
+  if (sameValue(node, NODE_DEFAULTS)) delete draft.nodes[name];
+  else draft.nodes[name] = node;
 }
 
 export function uniqueName(base: string, taken: Iterable<string>) {
@@ -175,8 +440,13 @@ export function newModel(existing: ModelSpec[]): ModelSpec {
     max_tokens: 8192,
     context_window: null,
     temperature: null,
+    top_p: null,
     timeout_seconds: 600,
     max_retries: 2,
+    stream_usage: null,
+    max_tokens_param: null,
+    session_param: null,
+    session_header: null,
     supports_thinking: false,
     extra: {},
   };
@@ -248,6 +518,7 @@ export function newSource(
       existing.map((source) => source.tool),
     ).replace(/-/g, "_"),
     kind: "channel",
+    enabled: true,
     role,
     origin: role === "data" ? "internal" : "external",
     level: role === "data" ? "L1" : "L4",
@@ -278,6 +549,71 @@ export function providerTypesFor(role: SourceSpec["role"], view: SettingsView) {
   );
 }
 
+/** Sources research may use; a disabled one stays configured but is never offered. */
+export function activeSources(settings: EditableSettings) {
+  return settings.sources.filter((source) => source.enabled !== false);
+}
+
+/** Without an enabled read source, search results and records are the citable
+ * evidence and researchers work from the "no original text" prompts. */
+export function hasReadSource(settings: EditableSettings) {
+  return activeSources(settings).some((source) => source.role === "read");
+}
+
+/** Every MCP tool a source or provider calls (mirrors Settings.mcp_bindings). */
+export function mcpBindings(settings: EditableSettings) {
+  const found: { label: string; server: string; tool: string }[] = [];
+  for (const source of settings.sources) {
+    if ((source.kind ?? "channel") === "mcp" && source.server)
+      found.push({
+        label: `数据源“${source.name}”`,
+        server: source.server,
+        tool: firstText(source.mcp_tool, source.tool),
+      });
+    for (const provider of source.providers)
+      if (provider.type === "mcp" && provider.server && provider.tool)
+        found.push({
+          label: `供应商“${source.name}/${provider.id}”`,
+          server: provider.server,
+          tool: provider.tool,
+        });
+  }
+  return found;
+}
+
+const CREDENTIAL_KEY = /authorization|cookie|token|secret|key|password/i;
+
+/** Header and environment values may reference $ENV or secret:NAME, also inside
+ * a string ("Bearer ${TOKEN}"). A credential-looking key whose value holds no
+ * reference at all is a pasted credential, which must never be saved. */
+export function literalCredentials(
+  values: Record<string, unknown> | null | undefined,
+) {
+  return Object.entries(values ?? {})
+    .filter(
+      ([key, value]) =>
+        CREDENTIAL_KEY.test(key) &&
+        typeof value === "string" &&
+        value.trim() !== "" &&
+        !value.includes("$") &&
+        !value.includes("secret:"),
+    )
+    .map(([key]) => key);
+}
+
+const LITERAL_CREDENTIAL =
+  "请改用 $环境变量 或 secret:名字 引用，不要保存明文凭据";
+
+/** Keep the draft and its pinned version; only the secret names and the
+ * reference status come from a secrets call. Adopting the whole answer would
+ * re-pin an unsaved draft to the newest version and defeat the 409 guard. */
+export function mergeSecrets(
+  view: SettingsView,
+  next: Pick<SettingsView, "secrets">,
+): SettingsView {
+  return { ...view, secrets: next.secrets };
+}
+
 /** Problems the page can show before asking the server to validate. */
 export function draftProblems(
   settings: EditableSettings,
@@ -300,6 +636,13 @@ export function draftProblems(
     ["默认模型", settings.default_model],
     ["请求改写模型", settings.rewrite_model],
     ["整理模型", settings.extraction_model],
+    ...Object.entries(settings.nodes ?? {}).map(
+      ([name, node]) =>
+        [
+          `节点“${NODE_LABELS[name as NodeName] ?? name}”的模型`,
+          node?.model ?? null,
+        ] as [string, string | null],
+    ),
     ...Object.entries(settings.skills).map(
       ([name, role]) =>
         [
@@ -332,6 +675,21 @@ export function draftProblems(
       problems.push(`MCP 服务“${name}”需要填写命令`);
     if (server.transport !== "stdio" && !server.url?.trim())
       problems.push(`MCP 服务“${name}”需要填写服务地址`);
+    for (const [field, values] of [
+      ["请求头", server.headers],
+      ["环境变量", server.env],
+    ] as const)
+      for (const key of literalCredentials(values))
+        problems.push(
+          `MCP 服务“${name}”的${field}“${key}”：${LITERAL_CREDENTIAL}`,
+        );
+  }
+  for (const binding of mcpBindings(settings)) {
+    const allowedTools = servers[binding.server]?.allowed_tools;
+    if (allowedTools && !allowedTools.includes(binding.tool))
+      problems.push(
+        `${binding.label}使用的 MCP 工具“${binding.tool}”不在服务“${binding.server}”的工具白名单中：把它加入白名单，或改用白名单内的工具`,
+      );
   }
   const names = new Set<string>();
   const tools = new Set<string>();
@@ -381,6 +739,9 @@ export function draftProblems(
         !/^https?:\/\/[^/]/.test(provider.url ?? "")
       )
         problems.push(`${label}需要填写完整的接口地址`);
+      if (provider.type === "http")
+        for (const key of literalCredentials(provider.headers))
+          problems.push(`${label}的请求头“${key}”：${LITERAL_CREDENTIAL}`);
       if (
         ["searxng", "ragflow", "lightrag"].includes(provider.type) &&
         !provider.base_url?.trim()
@@ -391,16 +752,47 @@ export function draftProblems(
   for (const name of settings.source_fallback)
     if (!names.has(name)) problems.push(`默认顺序中的数据源“${name}”不存在`);
   if (view?.operator.runner === "deerflow") {
-    if (!settings.sources.length) problems.push("真实研究至少需要一个数据源");
-    const origins = new Set(settings.sources.map((source) => source.origin));
+    // A disabled source is never offered to research, so it counts for neither rule.
+    const active = activeSources(settings);
+    if (!active.length)
+      problems.push(
+        settings.sources.length
+          ? "真实研究至少需要一个启用的数据源"
+          : "真实研究至少需要一个数据源",
+      );
+    const origins = new Set(active.map((source) => source.origin));
     if (
+      active.length &&
       settings.require_dual_source &&
       !(origins.has("internal") && origins.has("external"))
     )
       problems.push(
-        "已要求内外部来源并存：需要同时配置内部和外部数据源，或在“数据源与搜索”中关闭这个要求",
+        "已要求内外部来源并存：启用的数据源需要同时覆盖内部和外部资料，或在“数据源与搜索”中关闭这个要求",
       );
   }
+  for (const [name, node] of Object.entries(settings.nodes ?? {})) {
+    const optional =
+      view?.catalog.nodes?.find((item) => item.name === name)?.optional ??
+      OPTIONAL_NODES.includes(name);
+    if (node?.enabled === false && !optional)
+      problems.push(
+        `节点“${NODE_LABELS[name as NodeName] ?? name}”不能关闭，只有请求改写和执行摘要可以关闭`,
+      );
+  }
+  if (settings.plan_min_units > settings.plan_max_units)
+    problems.push("计划的研究步骤数：最少步骤数不能大于最多步骤数");
+  const scale = settings.report_length_scale;
+  if (
+    scale != null &&
+    !(
+      Number.isFinite(scale) &&
+      scale >= REPORT_LENGTH_SCALE.min &&
+      scale <= REPORT_LENGTH_SCALE.max
+    )
+  )
+    problems.push(
+      `报告长度系数需要在 ${REPORT_LENGTH_SCALE.min}–${REPORT_LENGTH_SCALE.max} 之间`,
+    );
   if (
     settings.compaction.model &&
     models.size &&

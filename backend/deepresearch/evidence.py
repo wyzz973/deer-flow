@@ -7,7 +7,9 @@ import json
 import re
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from .contracts import BoundFinding, Evidence, ResearchResult, safe_http_url
+from pydantic import ValidationError
+
+from .contracts import BoundFinding, Evidence, RawEvidence, ResearchResult, safe_http_url
 
 TRACKING = {"gclid", "fbclid", "msclkid", "mc_cid", "mc_eid"}
 
@@ -25,12 +27,46 @@ def canonical_url(url: str | None) -> str | None:
     port = parts.port
     if port is not None and not (parts.scheme == "https" and port == 443 or parts.scheme == "http" and port == 80):
         host += f":{port}"
-    return urlunsplit((parts.scheme.lower(), host, parts.path or "/", urlencode(query), ""))
+    # "#section" is a position inside a page. "#/doc/5" and "#!/doc/5" are how a
+    # single-page application (many internal wikis) names the page itself.
+    route = parts.fragment if parts.fragment.startswith(("/", "!")) else ""
+    return urlunsplit((parts.scheme.lower(), host, parts.path or "/", urlencode(query), route))
 
 
 def digest(value) -> str:
     raw = value if isinstance(value, str) else json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def valid_result(body: dict) -> tuple[ResearchResult, list[dict]]:
+    """Validate a stored unit result, dropping only the evidence it cannot keep.
+
+    Evidence is derived from open-web payloads and from results written by an
+    earlier version of this schema, so a single record can be unusable: a
+    locator the contract refuses, text that arrived empty, a field a later rule
+    bounds. Failing the whole unit there would throw away a completed research
+    step, so the unusable records are dropped with the fields that rejected
+    them. Findings keep every reference that survived; one left without any
+    reference is dropped with them. Anything else still fails loudly.
+    """
+    records, dropped, kept = [], [], set()
+    for index, item in enumerate(body.get("raw_evidences") or []):
+        try:
+            evidence = RawEvidence.model_validate(item)
+        except ValidationError as error:
+            fields = sorted({str(detail["loc"][0]) for detail in error.errors(include_input=False, include_url=False) if detail.get("loc")})
+            dropped.append({"raw_id": str(item.get("raw_id", index))[:80], "fields": fields})
+            continue
+        records.append(evidence.model_dump(mode="json"))
+        kept.add(evidence.raw_id)
+    findings = []
+    for finding in body.get("findings") or []:
+        refs = [ref for ref in finding.get("raw_evidence_refs") or [] if ref in kept]
+        if refs:
+            findings.append({**finding, "raw_evidence_refs": refs})
+        elif not dropped:  # References were never about dropped evidence; let validation report it.
+            findings.append(finding)
+    return ResearchResult.model_validate({**body, "raw_evidences": records, "findings": findings}), dropped
 
 
 def merge_results(results: list[ResearchResult], pool: dict[str, dict] | None = None):
@@ -56,8 +92,11 @@ def merge_results(results: list[ResearchResult], pool: dict[str, dict] | None = 
                 evidences[eid] = candidate
                 index[identity] = eid
                 next_id += 1
-            elif result.unit_id not in evidences[eid].unit_ids:
-                evidences[eid].unit_ids.append(result.unit_id)
+            else:
+                if result.unit_id not in evidences[eid].unit_ids:
+                    evidences[eid].unit_ids.append(result.unit_id)
+                if raw.citable and not evidences[eid].citable:
+                    evidences[eid].citable = True  # citable for the step that could not open originals
             lineage[f"{result.unit_id}:{raw.raw_id}"] = eid
         for finding in result.findings:
             findings.append(
@@ -85,12 +124,15 @@ def ordered_sources(settings, strategy, request_names=()):
         provenance = "file"
     if not names:
         names, provenance = settings.source_fallback, "fallback"
-    configured = {source.name: source for source in settings.sources}
-    if not set(names).issubset(configured):
+    active = settings.active_sources() if hasattr(settings, "active_sources") else list(settings.sources)
+    known = {source.name for source in settings.sources}
+    if not set(names).issubset(known):
         raise ValueError("Source priority contains an unconfigured source")
+    # A source switched off on the settings page may still be named by a plan,
+    # a request or the fallback list; it simply is not offered.
     preferred = {name: i for i, name in enumerate(names)}
     ordered = sorted(
-        settings.sources,
+        active,
         key=lambda source: (
             0 if source.name in preferred else 1,
             preferred.get(source.name, 999),

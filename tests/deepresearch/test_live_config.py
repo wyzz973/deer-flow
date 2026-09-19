@@ -102,3 +102,45 @@ def test_resume_accepts_prices_added_to_the_private_config(tmp_path):
     assert yaml.safe_load(path.read_text(encoding="utf-8"))["pricing"]["flash"]["output_per_million"] == 2.0
     with pytest.raises(ValueError, match="configuration changed"):
         _write_yaml(path, {"model": "different"}, reuse=True, operator_keys=("pricing",))
+
+
+def test_a_setting_added_by_an_upgrade_does_not_block_resuming_at_its_default(tmp_path):
+    import pytest
+
+    from deepresearch.live import setting_defaults
+
+    path = tmp_path / "research.yaml"
+    _write_yaml(path, {"model": "configured"})
+    defaults = setting_defaults()
+    assert defaults["tool_receipt_ledger"] is False and defaults["nodes"] == {} and "coverage" in defaults["supplement_gap_codes"]
+    # The stored file predates the setting and already runs with its default.
+    _write_yaml(path, {"model": "configured", "tool_receipt_ledger": False, "nodes": {}, "supplement_gap_codes": defaults["supplement_gap_codes"]}, reuse=True, defaults=defaults)
+    # Any other value changes execution, as does a key without a known default.
+    for changed in ({"tool_receipt_ledger": True}, {"nodes": {"plan": {"temperature": 0}}}, {"unknown_setting": False}):
+        with pytest.raises(ValueError, match="configuration changed"):
+            _write_yaml(path, {"model": "configured", **changed}, reuse=True, defaults=defaults)
+
+
+def test_the_engine_admits_as_many_roles_at_once_as_research_runs(tmp_path):
+    """The engine queues native roles beyond ``subagent_runtime.max_running`` (3
+    in the host example). A research configured for six parallel steps then ran
+    three at a time: three steps waited 203-292 s of a ten-minute run, eight
+    seconds short of the engine's admission timeout, and no research metric
+    showed the queue."""
+    import pytest
+    import yaml
+
+    engine = build_config({"subagent_runtime": {"max_running": 3, "queue_timeout_seconds": 300}}, tmp_path, concurrency=8)
+    assert engine["subagent_runtime"] == {"max_running": 8, "queue_timeout_seconds": 300}
+    # A host that already allows more keeps its value; without a need nothing is touched.
+    assert build_config({"subagent_runtime": {"max_running": 16}}, tmp_path, concurrency=8)["subagent_runtime"]["max_running"] == 16
+    assert "subagent_runtime" not in build_config({}, tmp_path)
+
+    # An existing acceptance directory picks the capacity up on its next start:
+    # it changes how many roles run at once, not what a research run is.
+    path = tmp_path / "host.yaml"
+    _write_yaml(path, {"models": ["m"], "subagent_runtime": {"max_running": 3}})
+    _write_yaml(path, {"models": ["m"], "subagent_runtime": {"max_running": 8}}, reuse=True, refresh=("subagent_runtime",))
+    assert yaml.safe_load(path.read_text(encoding="utf-8")) == {"models": ["m"], "subagent_runtime": {"max_running": 8}}
+    with pytest.raises(ValueError, match="configuration changed"):
+        _write_yaml(path, {"models": ["other"], "subagent_runtime": {"max_running": 8}}, reuse=True, refresh=("subagent_runtime",))

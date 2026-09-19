@@ -76,6 +76,27 @@ history occupies the native sidebar history slot; do not add an in-page history
 list or a separate constraints form. The research stream projection is read-only;
 mutations use the authenticated research API, not invented SDK methods.
 
+The research page has its own cool-white palette, measured from ChatGPT deep
+research on 2026-09-19: `.deepresearch-surface` in `styles/globals.css` overrides
+the theme tokens (`--background #fcfcfc`, `--card #fff`, `--foreground #0d0d0d`,
+`--muted-foreground #5d5d5d`, plus `--dr-*` for the third text grey, hairlines,
+tracks, chips and the skeleton) inside that scope only, with a `.dark`
+counterpart. Never change the global tokens for research. Content portalled out
+of the page (hover cards, menus, the mobile Sheet pane) carries the class itself.
+Report tables, quotes and Mermaid blocks are styled by unlayered
+`.research-report` rules there, because they must win over Streamdown's utility
+classes. `prefers-reduced-motion` turns shimmer into plain text and drops every
+transition; only the step spinner keeps turning.
+
+Between a sent message and the next card, `waitingPhase` decides what the
+conversation shows: `ResearchPlanPending` renders shimmering “正在思考”, then (once
+the rewritten request exists, or after 6 s) a 24px-radius skeleton where the plan
+card will fade in. It is a synthetic, view-only message; a plan under revision
+keeps its own card instead. `planCardHidden` drops a plan's message from the
+conversation once its report exists (the stats line and the report card take its
+place), except while a follow-up is FAILED or CANCELLED: that card still renders
+the error, retry or “研究已停止” notice.
+
 The interaction follows ChatGPT deep research (see
 `docs/deepresearch/CHATGPT_BENCHMARK_2026-09-16.md`). The plan card shows the
 plan title and short step titles with a ring countdown and “编辑 / 取消 / 开始”.
@@ -99,14 +120,18 @@ the run is active; format numbers with `formatTokens`, `formatCost` and
 Unit citation counts show “—” until a report version exists. Runs with
 `metered: false` predate per-call metering: show their unmeasured fields as “—” or
 “未记录”, never as zero.
-Hovering an in-text citation or a cited source opens `CitationPreview`: site,
-title and the excerpt for that evidence (`excerptPreview` strips Markdown syntax),
-labeled as page text only for `fetched_document`. Touch devices keep click-to-locate.
+Hovering an in-text citation or a cited source opens `CitationPreview` (340 px,
+fade only through `research-fade`): site, a two-line title and a two-line excerpt
+for that evidence (`excerptPreview` strips Markdown syntax); several excerpts
+under one number switch with ← →. No URL, date or number there. A citation whose
+`basis` is `"search excerpt"` shows a small “摘录” note (“检索摘录，未读取原文”) in the
+card and in the source list; `"page"`, `"record"` and a missing field show
+nothing. Touch devices keep click-to-locate.
 Site icons render through `SiteIcon` from the gateway's `/api/deepresearch/favicon`
 (never a third-party favicon URL). A failed icon shows a letter badge and retries
 once after 4 s with `retry=1`, because a cold icon may still be fetching. The
-source list shows the title, a `sourceSummary` (repeated title removed) and the
-URL without scheme.
+source list shows the title (a link to the page) and a `sourceSummary` (repeated
+title removed), or the URL without scheme when there is no summary.
 Source labels go through `sourceTitle` (and `readLabel` in the activity tab): a
 missing, "Untitled" or URL-valued title shows the URL without scheme, including
 for immutable historical reports.
@@ -128,10 +153,64 @@ Historical report cards export their own version.
 On mobile, returning from a source to its citation closes the native Sheet before
 showing the report location; desktop retains the side-by-side source panel.
 
+`useResearchConversation` opens an event stream only for a run known to be live
+(never for a finished run, never before the first snapshot) and starts it at the
+snapshot's `last_event_seq`, so opening a running research does not replay its
+event history. A stream the browser
+gave up on (`readyState` CLOSED after a non-200) is rebuilt with `streamRetryDelay`
+(1 s doubling to 15 s, reset by an open or an event); while a live run has no
+healthy stream the run and activity queries poll every 5 s. Event-driven refreshes
+never cancel the request in flight (`cancelRefetch: false` plus one trailing
+refresh), or sustained events starve the view. Terminal status re-reads sources,
+activity, metrics and LLM calls once. A 4xx (`isRejection`) drops the message or
+creation idempotency key; transport failures and 5xx keep it. `commitUrl` rewrites
+the address without a route change, so the hook follows `usePathname()` back to
+the root path or to another run (`runIdFromPath`) and ignores a pathname that
+trails `window.location`.
+The composer (`ResearchComposer`) takes a message only when `composerAccepts`
+says the server would: FAILED and CANCELLED disable the textarea and say why, and
+the submit handler rejects (keeping the draft) because Enter reaches it even when
+no submit button is rendered. Every other button inside the form is
+`type="button"`. A failed or stopped follow-up no longer shows its plan (the
+report replaced it) but still renders its error, retry or “研究已停止” notice.
+Report Markdown never renders `<img>`; `components.img` keeps the alt text only,
+because a remote (including protocol-relative) image URL is an exfiltration
+channel for injected page text. The reader's table of contents is read from the
+rendered headings (h1–h3, not from Markdown lines), follows the scroll position
+with `activeHeadingIndex`, and opens from a focusable “目录” button; the open list
+replaces the tick rail (the button stays focusable underneath). The article is a
+624 px column; the rail shows only while the reader's own container (`@3xl`, not
+the viewport: the side panel narrows it) leaves a 64 px gutter, so it can never
+overlap the article. The reader fades in and out (300 ms), folds the sidebar
+while open without touching the stored sidebar preference, shows no title in
+its bar, and draws the bar's hairline only after the article scrolls
+(`onScrolledChange`, `ChatSurface.headerClassName`). The side panel opens 375 px
+wide through `ChatBox`'s `extensionPanel.defaultSize`; the panel library treats
+string sizes passed to `resize()` as percentages, so a pixel default is applied
+as a number and re-applied when the open animation ends. A selected source is
+only highlighted (rounded tinted block); every entry stays one title line plus
+a two-line `sourceSummary`, with the URL only when there is no summary, and the
+clicked in-text marker turns solid through a context, never through a new
+Markdown `components` map. “已扫描的来源” lists uncited pages in the open, grouped
+by site like the citations, deduped with `pageKey`, which mirrors the server's
+page identity. The activity tab has two row styles only: a dot with a hairline
+to the next entry for progress, and a globe with site pills (four, then “再显示
+N 个”) for searches and reads; consecutive reads fold into one entry.
+
 Fetch trace payloads on expansion with the forward cursor, and key the panel by
 run ID so responses from a previous selection cannot populate another run's trace.
 Keep export requests on the authenticated research API; do not put trace payloads
-in localStorage or send them to a telemetry service.
+in localStorage or send them to a telemetry service. One load pages through the
+trace (`limit=200`) until a short page or 5000 events, then shows “还有更多”; the
+timeline marks are `tabIndex={-1}` because the span list reaches every span.
+The metrics tab's “按节点” table reads `breakdown.by_node` (labels from
+`nodeLabel`), flags truncated / format-retry / error counts above zero, and lists
+`budget.earlier_tasks`, because budgets are per task and a follow-up opens a new one.
+Its “缓存命中 / 可复用” column pairs `cache_read_ratio` (what the provider served
+from its prompt cache) with `prefix_reuse_ratio` (the share of the prompt that
+repeated the previous request of its thread, i.e. the ceiling): a low ceiling
+blames request construction, a high ceiling with few hits blames the model
+service. Both are optional and render “—” for records that predate them.
 
 The inspector has two tabs: “LLM 调用” (`llm-calls-panel.tsx` + `llm-call-dialog.tsx`)
 and “Trace 时间线”. Audit calls group by execution (`groupCalls` in
@@ -152,7 +231,30 @@ never read one back, and show reference status from the server. Field components
 in `settings/fields.tsx` keep local text while it still describes the draft value
 (numbers typed as text, JSON, one-per-line lists) so typing is never reformatted
 mid-keystroke. Settings apply to research created afterwards; say that in the UI
-rather than implying a running study changes.
+rather than implying a running study changes. `report_length_scale` (0.2–3.0,
+`REPORT_LENGTH_SCALE`) is optional in the type because an older gateway omits
+it; the field shows 1.0 then and `draftProblems` checks the range.
+Conventions the settings page depends on:
+- `settings/nodes-section.tsx` renders one card per `catalog.nodes` entry, in
+  workflow order. A node has a key in `nodes` only while it differs from full
+  inheritance (`editNode` removes the key again); an older gateway without
+  `catalog.nodes` gets a notice instead of cards.
+- Renames and removals go through the pure helpers in `core/deepresearch/settings.ts`
+  (`renameModel`, `removeModel`, `renameSource`, `renameSourceTool`, `removeSource`,
+  `renameMcpServer`). They move every reference (default/rewrite/extraction/
+  compaction model, `nodes[*].model`, role models and tool allowlists,
+  `source_fallback`, MCP `server` bindings) and never take over another entry's
+  references while a name typed halfway collides with it.
+- Cards are keyed by `rowKey` (object identity carried across `edit()` clones),
+  never by array index, and the key never reaches the saved payload.
+- `NumberField` and `JsonField` report invalid text through the `InvalidFields`
+  context; it counts toward the save bar's problems, so a value the screen shows
+  but the draft does not hold cannot be saved around.
+- The secrets callbacks merge only `secrets` into the view (`mergeSecrets`);
+  restore and reset adopt the server's response and drop the draft.
+- Header and environment values whose name looks like a credential must be
+  references (`$ENV`, `secret:NAME`, or interpolated `${...}`); the backend
+  refuses literals as well.
 
 - **Imports**: Enforced ordering (builtin → external → internal → parent → sibling), alphabetized, newlines between groups. Use inline type imports: `import { type Foo }`.
 - **Unused variables**: Prefix with `_`.
@@ -229,7 +331,7 @@ DeepResearch report citations may share a display number across multiple recorde
 excerpts of the same page. Use `uniqueCitationIds` per paragraph/table cell, keep
 all citation `evidence_ids` aliases selectable, and choose the selected excerpt in
 the source panel. Comparison-table cells retain citation buttons. Discovered
-sources are collapsed separately from cited pages; read status is not a claim
+sources are listed separately from cited pages; read status is not a claim
 that an entire document or all its assertions have been verified.
 
 For evidence-bearing `RESEARCH_GAPS` failures, the existing research plan card

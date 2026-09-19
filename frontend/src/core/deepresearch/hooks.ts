@@ -1,27 +1,45 @@
 "use client";
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { usePathname } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { researchApi } from "./api";
-import { latestSnapshot, parseResearchEvent } from "./events";
-import { terminal, type ResearchEvent, type Run } from "./types";
+import {
+  isRejection,
+  latestSnapshot,
+  parseResearchEvent,
+  runIdFromPath,
+  streamRetryDelay,
+} from "./events";
+import { terminal, type Run } from "./types";
 
 type Ticket = { token: symbol; generation: number };
+
+// EventSource.CLOSED. A non-200 response ends the stream for good: the browser
+// only reconnects by itself while the state is CONNECTING.
+const STREAM_CLOSED = 2;
+/** Snapshot polling while a live run has no healthy event stream. */
+export const UNHEALTHY_POLL_MS = 5000;
 
 export function useResearchConversation(initialRunId?: string, apiBase = "") {
   const api = useMemo(() => researchApi(apiBase), [apiBase]);
   const client = useQueryClient();
+  const pathname = usePathname();
   const [runId, setRunId] = useState(initialRunId);
   const [epoch, setEpoch] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [events, setEvents] = useState<ResearchEvent[]>([]);
+  const [streaming, setStreaming] = useState(false);
   const selectedId = useRef(runId);
   selectedId.current = runId;
   const generation = useRef(0);
   const inflight = useRef<symbol | null>(null);
-  const cursor = useRef({ id: runId, seq: 0 });
+  const cursor = useRef<{ id?: string; seq: number }>({
+    id: undefined,
+    seq: 0,
+  });
+  const snapshotSeq = useRef(0);
   const creation = useRef<{ text: string; key: string } | null>(null);
   const submission = useRef<{
     id: string;
@@ -46,6 +64,17 @@ export function useResearchConversation(initialRunId?: string, apiBase = "") {
     queryFn: api.capabilities,
     retry: false,
   });
+  // A live run without a healthy stream (gateway restart, proxy 502) falls
+  // back to polling; a transport failure on the first load is retried too.
+  const unhealthyPoll = (state: {
+    data?: { status: string };
+    error: unknown;
+  }) =>
+    streaming
+      ? false
+      : state.data
+        ? !terminal.has(state.data.status) && UNHEALTHY_POLL_MS
+        : state.error != null && !isRejection(state.error) && UNHEALTHY_POLL_MS;
   const run = useQuery({
     queryKey: runKey,
     queryFn: async () => {
@@ -54,7 +83,11 @@ export function useResearchConversation(initialRunId?: string, apiBase = "") {
     },
     enabled: Boolean(runId),
     retry: false,
+    refetchInterval: (query) => unhealthyPoll(query.state),
   });
+  const status = run.data?.status;
+  snapshotSeq.current = run.data?.last_event_seq ?? 0;
+  const live = Boolean(status && !terminal.has(status));
   const sources = useQuery({
     queryKey: sourcesKey,
     queryFn: () => api.sources(runId!),
@@ -66,8 +99,8 @@ export function useResearchConversation(initialRunId?: string, apiBase = "") {
     queryFn: () => api.activity(runId!),
     enabled: Boolean(runId),
     retry: false,
+    refetchInterval: live && !streaming ? UNHEALTHY_POLL_MS : false,
   });
-  const status = run.data?.status;
 
   useEffect(
     () => () => {
@@ -78,58 +111,110 @@ export function useResearchConversation(initialRunId?: string, apiBase = "") {
   );
 
   useEffect(() => {
-    if (!runId || (status && terminal.has(status))) return;
-    if (cursor.current.id !== runId) {
-      cursor.current = { id: runId, seq: 0 };
-      setEvents([]);
-    }
-    const stream = new EventSource(
-      `${api.root}/${encodeURIComponent(runId)}/events?after=${cursor.current.seq}`,
-      { withCredentials: true },
-    );
+    // A finished run needs no stream, and an unknown status must not replay
+    // the whole event history of what may turn out to be a finished run.
+    if (!runId || !live) return;
+    // A run opened while it is running continues from its snapshot instead
+    // of replaying every event since the start.
+    if (cursor.current.id !== runId)
+      cursor.current = { id: runId, seq: snapshotSeq.current };
+    let stream: EventSource | undefined;
     let refresh: ReturnType<typeof setTimeout> | undefined;
+    let reconnect: ReturnType<typeof setTimeout> | undefined;
+    let failures = 0;
+    let disposed = false;
+    let syncing = false;
+    let stale = false;
     const reconcile = () => {
-      if (selectedId.current !== runId) return;
-      void client.invalidateQueries({ queryKey: runKey });
-      void client.invalidateQueries({ queryKey: sourcesKey });
-      void client.invalidateQueries({ queryKey: activityKey });
-    };
-    // A process restart can change durable status without emitting a new event.
-    // Reconcile on reconnect even when the replay cursor has no new frames.
-    stream.onopen = reconcile;
-    stream.onerror = reconcile;
-    stream.onmessage = (event: MessageEvent<string>) => {
-      const item = parseResearchEvent(event.data);
-      if (!item) {
-        reconcile();
+      if (disposed || selectedId.current !== runId) return;
+      // Cancelling the GET in flight on every event starves the view for as
+      // long as events keep arriving. Let it finish, then fetch once more for
+      // whatever arrived meanwhile.
+      if (syncing) {
+        stale = true;
         return;
       }
-      if (item.run_id !== selectedId.current || item.seq <= cursor.current.seq)
-        return;
-      cursor.current.seq = item.seq;
-      if (!item.type.startsWith("trace."))
-        setEvents((old) => [...old, item].slice(-300));
-      // Fixed throttle: sustained output must not postpone visible progress.
-      refresh ??= setTimeout(() => {
-        refresh = undefined;
+      syncing = true;
+      void Promise.all(
+        [runKey, sourcesKey, activityKey].map((queryKey) =>
+          client.invalidateQueries({ queryKey }, { cancelRefetch: false }),
+        ),
+      )
+        .catch(() => undefined)
+        .finally(() => {
+          syncing = false;
+          if (stale) {
+            stale = false;
+            reconcile();
+          }
+        });
+    };
+    const connect = () => {
+      reconnect = undefined;
+      const source = new EventSource(
+        `${api.root}/${encodeURIComponent(runId)}/events?after=${cursor.current.seq}`,
+        { withCredentials: true },
+      );
+      stream = source;
+      // A process restart can change durable status without emitting a new
+      // event. Reconcile on reconnect even when the cursor has no new frames.
+      source.onopen = () => {
+        failures = 0;
+        setStreaming(true);
         reconcile();
-      }, 150);
+      };
+      source.onerror = () => {
+        setStreaming(false);
+        reconcile();
+        if (source.readyState !== STREAM_CLOSED || disposed || reconnect)
+          return;
+        source.close();
+        reconnect = setTimeout(connect, streamRetryDelay(failures++));
+      };
+      source.onmessage = (event: MessageEvent<string>) => {
+        const item = parseResearchEvent(event.data);
+        if (!item) {
+          reconcile();
+          return;
+        }
+        if (
+          item.run_id !== selectedId.current ||
+          item.seq <= cursor.current.seq
+        )
+          return;
+        cursor.current.seq = item.seq;
+        failures = 0;
+        setStreaming(true);
+        // Fixed throttle: sustained output must not postpone visible progress.
+        refresh ??= setTimeout(() => {
+          refresh = undefined;
+          reconcile();
+        }, 150);
+      };
     };
+    connect();
     return () => {
-      stream.close();
+      disposed = true;
+      stream?.close();
       if (refresh) clearTimeout(refresh);
+      if (reconnect) clearTimeout(reconnect);
+      setStreaming(false);
     };
-  }, [api.root, client, epoch, runId, runKey, sourcesKey, activityKey, status]);
+  }, [api.root, client, epoch, runId, runKey, sourcesKey, activityKey, live]);
 
   useEffect(() => {
-    if (status && terminal.has(status)) {
-      void client.invalidateQueries({
-        queryKey: ["research-history", api.root],
-      });
-      // The stream closes on terminal status; fetch the final timeline once.
-      void client.invalidateQueries({ queryKey: activityKey });
-    }
-  }, [activityKey, api.root, client, runId, status]);
+    if (!runId || !status || !terminal.has(status)) return;
+    // The stream closes on terminal status; fetch the final state once. Panels
+    // stop polling at the same moment, so their last numbers need it as well.
+    for (const name of [
+      "research-sources",
+      "research-activity",
+      "research-metrics",
+      "research-llm-calls",
+    ])
+      void client.invalidateQueries({ queryKey: [name, api.root, runId] });
+    void client.invalidateQueries({ queryKey: ["research-history", api.root] });
+  }, [api.root, client, runId, status]);
 
   const commitUrl = useCallback(
     (id?: string) => {
@@ -156,6 +241,39 @@ export function useResearchConversation(initialRunId?: string, apiBase = "") {
       if (id) setRunId(id);
     }
   }, [initialRunId]);
+
+  const select = useCallback((id?: string) => {
+    // Old requests may still finish on the server and appear in history, but
+    // must never navigate back over a newly selected conversation or its draft.
+    generation.current++;
+    inflight.current = null;
+    creation.current = null;
+    submission.current = null;
+    cursor.current = { id: undefined, seq: 0 };
+    setBusy(false);
+    setError("");
+    selectedId.current = id;
+    setRunId(id);
+  }, []);
+
+  // `commitUrl` rewrites the address without a route change, so the page stays
+  // mounted when a sidebar link later leads back to a path this route already
+  // owns. Follow the address then; our own rewrites already match it.
+  const followed = useRef(pathname);
+  useEffect(() => {
+    if (apiBase || !pathname || followed.current === pathname) return;
+    followed.current = pathname;
+    const target = runIdFromPath(pathname);
+    // Native history updates reach `usePathname` late; act only on the
+    // address the browser is actually showing.
+    if (
+      target === null ||
+      target === selectedId.current ||
+      runIdFromPath(window.location.pathname) !== target
+    )
+      return;
+    select(target);
+  }, [apiBase, pathname, select]);
 
   const begin = useCallback((): Ticket => {
     if (inflight.current) throw new Error("请求正在处理，请稍候。");
@@ -256,6 +374,13 @@ export function useResearchConversation(initialRunId?: string, apiBase = "") {
         if (ticket.generation === generation.current)
           setEpoch((value) => value + 1);
       } catch (cause) {
+        // Only an uncertain outcome keeps its identity for the retry. A request
+        // the server refused was never accepted: resending its key would
+        // replay the same conflict for the same text forever.
+        if (isRejection(cause)) {
+          const pending = id ? submission : creation;
+          if (pending.current?.text === text) pending.current = null;
+        }
         if (ticket.generation === generation.current) {
           setError(cause instanceof Error ? cause.message : String(cause));
           if (id) void client.invalidateQueries({ queryKey: runKey });
@@ -285,19 +410,17 @@ export function useResearchConversation(initialRunId?: string, apiBase = "") {
     ],
   );
 
+  /** Re-read the snapshot, e.g. when a server-owned deadline has passed. */
+  const refresh = useCallback(() => {
+    if (!runId) return;
+    for (const queryKey of [runKey, activityKey])
+      void client.invalidateQueries({ queryKey }, { cancelRefetch: false });
+  }, [activityKey, client, runId, runKey]);
+
   const newResearch = useCallback(() => {
-    // Old requests may still finish on the server and appear in history, but
-    // must never navigate back over a newly selected conversation or its draft.
-    generation.current++;
-    inflight.current = null;
-    creation.current = null;
-    submission.current = null;
-    cursor.current = { id: undefined, seq: 0 };
-    setEvents([]);
-    setBusy(false);
-    setError("");
+    select(undefined);
     commitUrl(undefined);
-  }, [commitUrl]);
+  }, [commitUrl, select]);
 
   return {
     api,
@@ -306,11 +429,11 @@ export function useResearchConversation(initialRunId?: string, apiBase = "") {
     cap: cap.data,
     sources: sources.data,
     activity: activity.data,
-    events,
     loading: Boolean(runId && run.isPending),
     busy,
     action,
     send,
+    refresh,
     error: error || ((cap.error ?? run.error)?.message ?? ""),
     newResearch,
   };

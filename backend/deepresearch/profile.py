@@ -12,10 +12,11 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import re
 
 from pydantic import ValidationError
 
-from .config import Settings
+from .config import McpServerSpec, Settings
 from .evidence import digest
 
 logger = logging.getLogger("deepresearch.audit")
@@ -39,11 +40,21 @@ EDITABLE = (
     "max_concurrency",
     "plan_countdown_seconds",
     "max_output_tokens",
+    "max_searches_per_unit",
+    "max_seconds_per_unit",
+    "max_findings_per_unit",
+    "report_time_reserve_seconds",
+    "plan_min_units",
+    "plan_max_units",
+    "supplement_gap_codes",
+    "writer_concurrency",
+    "nodes",
     "output_retries",
     "allow_limited_report",
     "cite_search_results",
     "max_synthesis_repairs",
     "max_report_sections",
+    "report_length_scale",
     "trace_capture_content",
     "llm_audit",
     "pricing",
@@ -68,9 +79,29 @@ OPERATOR_ONLY = (
 )
 # Fields added after run fingerprints existed. Removing them at their defaults
 # keeps the fingerprint of an unchanged operator file identical across upgrades.
-LATER_FIELDS = {"prompts", "models", "default_model", "rewrite_model", "llm_audit", "mcp_servers", "engine_tools", "compaction"}
+LATER_FIELDS = {
+    "prompts",
+    "models",
+    "default_model",
+    "rewrite_model",
+    "llm_audit",
+    "mcp_servers",
+    "engine_tools",
+    "compaction",
+    "max_searches_per_unit",
+    "max_seconds_per_unit",
+    "max_findings_per_unit",
+    "report_time_reserve_seconds",
+    "plan_min_units",
+    "plan_max_units",
+    "supplement_gap_codes",
+    "writer_concurrency",
+    "report_length_scale",
+    "nodes",
+    "tool_receipt_ledger",
+}
 LATER_SKILL_DEFAULTS = {"methodology": None, "name": "", "tools": None, "enabled": True}
-LATER_SOURCE_DEFAULTS = {"description": "", "providers": [], "mcp_tool": None}
+LATER_SOURCE_DEFAULTS = {"description": "", "providers": [], "mcp_tool": None, "enabled": True}
 
 
 def fingerprint(settings: Settings, bodies: dict[str, str]) -> str:
@@ -128,8 +159,82 @@ def validated(body: dict) -> Settings:
         return Settings.model_validate(candidate)
 
 
+SENSITIVE_NAME = re.compile(r"authorization|cookie|token|secret|password|passwd|api[_-]?key|(^|[_-])key($|[_-])|credential|session", re.I)
+HIDDEN = "[hidden]"
+
+
+def _is_reference(value) -> bool:
+    return isinstance(value, str) and ("$" in value or "secret:" in value)
+
+
+def _credential_fields(body: dict):
+    """(path, mapping, key) of every header, environment or URL value that can carry a credential."""
+    for name, server in (body.get("mcp_servers") or {}).items():
+        if isinstance(server, dict):
+            for field in ("headers", "env"):
+                for key in server.get(field) or {}:
+                    yield f"mcp_servers.{name}.{field}.{key}", server[field], key
+    for source in body.get("sources") or []:
+        for provider in (source.get("providers") or []) if isinstance(source, dict) else []:
+            for key in provider.get("headers") or {}:
+                yield f"sources.{source.get('name')}.providers.{provider.get('id')}.headers.{key}", provider["headers"], key
+
+
+def guard(operator: Settings, overrides: dict | None) -> None:
+    """What the settings page may never introduce, whoever is signed in.
+
+    The operator's file is trusted: it can point a role at any Skill file,
+    start a local MCP process or name any model class. The settings API is a
+    web form. It must not read files of the host (a role ``path`` is read and
+    then shown to every signed-in user), start processes (a stdio MCP server
+    runs its command as the Gateway, and the host screens such commands on its
+    own MCP page), import classes, or store a pasted credential where the
+    settings view shows it again.
+    """
+    overrides = overrides or {}
+    base = operator.model_dump(mode="json")
+    problems = []
+    for name, spec in (overrides.get("skills") or {}).items():
+        allowed = (base["skills"].get(name) or {}).get("path")
+        if isinstance(spec, dict) and spec.get("path") and spec["path"] != allowed:
+            problems.append(f"skills.{name}.path: roles edited on the settings page carry their methodology as text; a Skill file path belongs in the operator configuration")
+    for name, server in (overrides.get("mcp_servers") or {}).items():
+        if isinstance(server, dict) and server.get("transport") == "stdio" and McpServerSpec.model_validate(server).model_dump(mode="json") != base["mcp_servers"].get(name):
+            problems.append(f"mcp_servers.{name}: a stdio MCP server starts a process on the Gateway host and can only be defined in the operator configuration; use an http or sse server here")
+    known_classes = {model.get("use") for model in base["models"]}
+    for model in overrides.get("models") or []:
+        if isinstance(model, dict) and model.get("provider") == "custom" and model.get("use") not in known_classes:
+            problems.append(f"models.{model.get('name')}.use: a custom model class can only be introduced in the operator configuration")
+    operator_values = {path: mapping.get(key) for path, mapping, key in _credential_fields(base)}
+    for path, mapping, key in _credential_fields(overrides):
+        value = mapping.get(key)
+        if SENSITIVE_NAME.search(key) and value and not _is_reference(value) and operator_values.get(path) != value:
+            problems.append(f"{path}: reference the credential ($ENV_NAME, secret:NAME, or inside a value: Bearer ${{ENV_NAME}}, sid=${{secret:NAME}}) instead of saving its value")
+    if problems:
+        raise ValueError("; ".join(problems[:10]))
+
+
+def masked(body: dict) -> dict:
+    """The settings view for a user who cannot edit: no literal credential values.
+
+    References stay readable (they name a variable, not its value). A literal
+    in the operator's own file is that operator's choice, but it is not shown
+    to every signed-in user.
+    """
+    body = copy.deepcopy(body)
+    for _, mapping, key in _credential_fields(body):
+        if SENSITIVE_NAME.search(key) and mapping.get(key) and not _is_reference(mapping[key]):
+            mapping[key] = HIDDEN
+    for source in body.get("sources") or []:
+        for provider in source.get("providers") or []:
+            if provider.get("url") and "?" in provider["url"] and not _is_reference(provider["url"].split("?", 1)[1]):
+                provider["url"] = provider["url"].split("?", 1)[0] + "?" + HIDDEN
+    return body
+
+
 def effective(operator: Settings, overrides: dict | None) -> Settings:
     """Operator settings with the stored overrides applied and validated."""
+    guard(operator, overrides)
     base = operator.model_dump(mode="json")
     merged = copy.deepcopy(base)
     for key, value in (overrides or {}).items():

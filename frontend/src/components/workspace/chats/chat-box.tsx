@@ -82,6 +82,9 @@ const ChatBox: React.FC<{
     title: string;
     content: React.ReactNode;
     onClose: () => void;
+    /** Width the panel first opens at, e.g. "375px"; dragging still resizes
+     * it. Defaults to the shared right-panel share of the group. */
+    defaultSize?: string;
   };
 }> = ({ children, threadId, browserEnabled = true, extensionPanel }) => {
   const { thread } = useThread();
@@ -177,7 +180,16 @@ const ChatBox: React.FC<{
 
   const sidePanelRef = usePanelRef();
   // Width the panel reopens at: the last size the user dragged it to.
-  const openSizeRef = useRef(RIGHT_PANEL_DEFAULT_SIZE);
+  const defaultOpenSize =
+    extensionPanel?.defaultSize ?? RIGHT_PANEL_DEFAULT_SIZE;
+  const openSizeRef = useRef(defaultOpenSize);
+  // A pixel default (an extension panel's `defaultSize`) holds until the user
+  // resizes the panel. The library lays panels out in percentages, so the
+  // width is re-applied whenever the group changes width (a sidebar folding as
+  // the panel opens, a window resize).
+  const openPixelsRef = useRef<number | null>(
+    defaultOpenSize.endsWith("px") ? Number.parseFloat(defaultOpenSize) : null,
+  );
   // While the panel width animates, the content is held at its final width and
   // clipped instead of reflowing every frame — a reflowing message list keeps
   // re-running its scroll-to-bottom (pinned by the sidecar scroll regression
@@ -194,7 +206,7 @@ const ChatBox: React.FC<{
   // Read once: `defaultSize` only applies on mount, the effect below owns every
   // later open/close.
   const [initialRightPanelSize] = useState(() =>
-    rightPanelOpen ? RIGHT_PANEL_DEFAULT_SIZE : "0%",
+    rightPanelOpen ? defaultOpenSize : "0%",
   );
 
   const handleSidePanelResize = useCallback((size: PanelSize) => {
@@ -252,15 +264,21 @@ const ChatBox: React.FC<{
       }
     }
 
+    const openPixels = openPixelsRef.current;
     const openPercentage = Number.parseFloat(openSizeRef.current);
     setPinnedContentWidth(
-      Number.isFinite(openPercentage) ? `${openPercentage}cqw` : null,
+      openPixels !== null
+        ? `${openPixels}px`
+        : Number.isFinite(openPercentage)
+          ? `${openPercentage}cqw`
+          : null,
     );
 
     // resize() rather than expand(): the library expands to `minSize` until it
     // has recorded a size of its own, which would reopen narrower than before.
+    // A number is pixels to the library; a string is always a percentage.
     if (rightPanelOpen) {
-      sidePanelRef.current?.resize(openSizeRef.current);
+      sidePanelRef.current?.resize(openPixels ?? openSizeRef.current);
     } else {
       sidePanelRef.current?.collapse();
     }
@@ -274,6 +292,23 @@ const ChatBox: React.FC<{
       window.clearTimeout(timeout);
     };
   }, [rightPanelOpen, sidePanelRef]);
+
+  useEffect(() => {
+    if (!rightPanelOpen || openPixelsRef.current === null) {
+      return;
+    }
+    const group = document.getElementById(`${resizableIdBase}-group`);
+    if (!group || typeof ResizeObserver === "undefined") {
+      return;
+    }
+    const observer = new ResizeObserver(() => {
+      if (openPixelsRef.current !== null) {
+        sidePanelRef.current?.resize(openPixelsRef.current);
+      }
+    });
+    observer.observe(group);
+    return () => observer.disconnect();
+  }, [rightPanelOpen, resizableIdBase, sidePanelRef]);
 
   useEffect(() => {
     if (activeRightPanel) {
@@ -441,6 +476,9 @@ const ChatBox: React.FC<{
         id={`${resizableIdBase}-separator`}
         withHandle
         disabled={!rightPanelOpen}
+        // From here on the width is the user's, not the pixel default.
+        onPointerDown={() => (openPixelsRef.current = null)}
+        onKeyDown={() => (openPixelsRef.current = null)}
         className={cn(
           "opacity-33 transition-opacity duration-200 ease-out hover:opacity-100 motion-reduce:transition-none",
           !rightPanelOpen && "pointer-events-none opacity-0",

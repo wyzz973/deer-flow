@@ -37,18 +37,25 @@ async def test_native_tools_unchanged_and_execution_cached(settings, plan, tmp_p
     original_tools = [OriginalTool(source) for source in settings.sources]
 
     @asynccontextmanager
-    async def source_tools(run, sources):
+    async def source_tools(run, sources, budget=None):
         assert invoked == []  # no hardcoded search before the model runs
         yield {s.name: tool for s, tool in zip(sources, original_tools, strict=True)}
 
     async def agent_config(skill):
         return settings.skills[skill], types.SimpleNamespace(tools=None, disallowed_tools=[])
 
-    async def native(settings, store, run, name, payload, tools, agent, context):
+    async def native(settings, store, run, name, payload, tools, agent, context, **kwargs):
         assert tools == original_tools
         # Updates sent while research runs reach units that start afterwards.
         assert payload["user_updates"] == ["只看官方文档"]
+        # The step knows what it may spend before it starts searching.
+        assert payload["search_budget"] == {"max_searches_this_step": settings.max_searches_per_unit, "shared_tool_calls_left": 10}
         assert "read tool" in payload["instructions"] and "never be cited" in payload["instructions"]
+        # A prompt cache reuses a prefix: what every step shares leads, the
+        # step itself follows, and counters that change between steps end it.
+        order = list(payload)
+        assert order[0] == "instructions" and order[-2:] == ["search_budget", "shared_run_budget"]
+        assert order.index("research_brief") < order.index("sources") < order.index("unit") < order.index("dependencies")
         messages, receipts = [], []
         for index, tool in enumerate(tools):
             response = await tool.ainvoke({"term": "research", "options": {"count": 3}})
@@ -65,6 +72,7 @@ async def test_native_tools_unchanged_and_execution_cached(settings, plan, tmp_p
 
     async def convert(runner, run, name, payload, schema, answer, context, **kwargs):
         assert answer == "Research notes [r1] [r2]"
+        assert list(payload)[0] == "instructions" and list(payload).index("unit") < list(payload).index("observed_calls")
         assert all("excerpt" not in call for call in payload["observed_calls"])
         refs = [e["raw_id"] for e in payload["observed_calls"]]
         return ResearchAnalysis(findings=[Finding(claim="claim", raw_evidence_refs=refs, confidence=0.8)], confidence=0.8)
@@ -100,13 +108,13 @@ async def test_discovery_volume_never_fails_a_long_research_unit(settings, plan,
     source = settings.sources[0]
 
     @asynccontextmanager
-    async def source_tools(run, sources):
+    async def source_tools(run, sources, budget=None):
         yield {}
 
     async def agent_config(skill):
         return settings.skills[skill], types.SimpleNamespace(tools=None, disallowed_tools=[])
 
-    async def native(settings, store, run, name, payload, tools, agent, context):
+    async def native(settings, store, run, name, payload, tools, agent, context, **kwargs):
         messages, receipts = [], []
         for call in range(7):  # 7 records, each mentioning 100 distinct links
             links = "\n".join(f"- [Result {call}-{index}](https://example{call}-{index}.com/page)" for index in range(100))
@@ -191,9 +199,12 @@ async def test_writer_outlines_then_writes_sections_from_citable_evidence_only(s
         assert [(section.heading, section.unit_ids) for section in repaired.sections] == [("并发写入", ["R1"])]
         return value
 
-    async def markdown(_run, payload, allowed, *, task_id, heading=None, whole_document=False):
+    async def markdown(_run, payload, allowed, *, task_id, heading=None, whole_document=False, limit=None):
         drafts.append((task_id, payload, set(allowed)))
         if payload["task"] == "write_section":
+            # Sections written from the same steps share their evidence as a prefix;
+            # the length budget ends the task with the instructions that enforce it.
+            assert list(payload)[-5:] == ["findings", "evidence", "section", "length", "instructions"]
             return "**判断**。事实。[[E001]] 补充。[[E003]]", {"repairs": 0}
         if payload["task"] == "write_summary":
             return "核心结论。[[E001]]", {"repairs": 0}
@@ -222,6 +233,10 @@ async def test_writer_outlines_then_writes_sections_from_citable_evidence_only(s
     task, request, allowed = drafts[-1]
     assert task == "report-revision" and request["previous_report"] == draft["document"] and allowed == {"E001", "E003"}
     assert request["user_request"] == "缩短第一章"
+    # Findings and evidence lead a revision; the report, then the request, end it:
+    # a second revision request reuses the first one's prompt up to its own words.
+    order = list(request)
+    assert order.index("findings") < order.index("evidence") < order.index("previous_report") < order.index("user_request") < order.index("instructions")
     assert revised["title"] == "修订后的报告" and revised["limitations"] == ["公开基准有限"]
 
 
@@ -287,3 +302,17 @@ def test_native_file_receipts_are_citable_without_claiming_mcp_origin(settings):
     assert evidence[0].origin == "runtime"
     assert evidence[0].source_uri.startswith("tool-result://")
     assert catalog[0]["tool_call_id"] == "file-call"
+
+
+def test_a_step_stopped_by_the_engine_explains_itself_in_the_report_language():
+    """A capped step is a disclosed limitation a reader can understand.
+
+    Budget shares make the native token cap common, so the engine's English
+    stop code must not land in a Chinese report as-is.
+    """
+    from deepresearch.runner import stop_limitation
+
+    zh = stop_limitation("token_capped", "zh")
+    assert "研究额度" in zh and "token_capped" not in zh
+    assert "research budget" in stop_limitation("token_capped", "en")
+    assert "something_new" in stop_limitation("something_new", "zh")

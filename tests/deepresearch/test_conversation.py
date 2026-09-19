@@ -173,12 +173,16 @@ async def test_followups_preserve_reports_and_do_not_repeat_search_for_rewrites(
         original_report = first["report"]
         await service.message(run_id, "Explain the report", "answer-1")
         answer = await settled(service, run_id)
-        assert answer["usage"]["tool_calls"] == 4
+        # A follow-up is a new task with its own budget: nothing was searched
+        # again, and what the research spent stays on record.
+        assert answer["usage"]["tool_calls"] == 0
+        assert answer["usage_history"][0]["tool_calls"] == 4
         assert answer["report"] == original_report
         assert answer["conversation"][-1]["kind"] == "text"
         await service.message(run_id, "改写报告，保留现有证据", "rewrite-1")
         revised = await settled(service, run_id)
-        assert revised["usage"]["tool_calls"] == 4
+        assert revised["usage"]["tool_calls"] == 0
+        assert [item["tool_calls"] for item in revised["usage_history"]] == [4, 0]
         assert revised["report"]["version"] == original_report["version"] + 1
         reports = [m["report"] for m in revised["conversation"] if m["kind"] == "report"]
         assert reports[0] == original_report
@@ -200,12 +204,14 @@ async def test_followups_preserve_reports_and_do_not_repeat_search_for_rewrites(
         await service.message(run_id, "补充研究新的部署场景", "research-1")
         new_plan = await wait_status(service, run_id, {"AWAITING_PLAN_CONFIRMATION", "FAILED"})
         assert new_plan["status"] == "AWAITING_PLAN_CONFIRMATION", new_plan.get("error")
-        assert new_plan["usage"]["tool_calls"] == 4
+        assert new_plan["usage"]["tool_calls"] == 0
         assert new_plan["cycle"] == 1
         assert new_plan["plan"]["plan_version"] > 1
         await service.decision(run_id, new_plan["plan"]["plan_version"], "approve")
         new_report = await settled(service, run_id)
-        assert new_report["usage"]["tool_calls"] == 8
+        # The new research cycle searched again, on a budget of its own.
+        assert new_report["usage"]["tool_calls"] == 4
+        assert [item["tool_calls"] for item in new_report["usage_history"]] == [4, 0, 0]
         assert new_report["report"]["version"] == 3
     finally:
         await service.stop()
@@ -226,5 +232,38 @@ async def test_duplicate_approval_and_stale_edits_cannot_restart_execution(setti
         assert sum(isinstance(result, dict) for result in decisions) == 1
         completed = await settled(service, run_id)
         assert completed["usage"]["tool_calls"] == 4
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_follow_up_leaves_a_conversation_that_can_go_on(settings):
+    """Stopping a follow-up used to end the conversation: every later message was RUN_BUSY."""
+    from deepresearch.contracts import ResearchError
+
+    service = ResearchService(settings)
+    await service.start()
+    try:
+        run = await service.create("local-demo", CreateResearch(query="Compare databases"), "stopped-follow-up")
+        run_id = run["run_id"]
+        await wait_status(service, run_id, {"AWAITING_PLAN_CONFIRMATION"})
+        await service.decision(run_id, 1, "approve")
+        report = (await settled(service, run_id))["report"]
+        await service.message(run_id, "Explain the report", "answer-1")
+        await service.cancel(run_id)
+        stopped = await service.store.get(run_id)
+        assert stopped["status"] == "CANCELLED" and stopped["report"] == report
+        await service.message(run_id, "Explain it again", "answer-2")
+        answered = await settled(service, run_id)
+        assert answered["status"] == "COMPLETED" and not answered.get("cancel_requested")
+        assert answered["conversation"][-1]["role"] == "assistant" and answered["report"] == report
+
+        # A run stopped before any report has nothing to follow up on, and says so.
+        other = await service.create("local-demo", CreateResearch(query="Compare caches"), "stopped-early")
+        await wait_status(service, other["run_id"], {"AWAITING_PLAN_CONFIRMATION"})
+        await service.cancel(other["run_id"])
+        with pytest.raises(ResearchError) as refused:
+            await service.message(other["run_id"], "continue", "after-stop")
+        assert refused.value.code == "RUN_STOPPED"
     finally:
         await service.stop()

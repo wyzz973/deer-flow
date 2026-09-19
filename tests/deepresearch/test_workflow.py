@@ -240,6 +240,34 @@ async def test_research_without_citable_evidence_fails_instead_of_writing(settin
 
 
 @pytest.mark.asyncio
+async def test_research_starved_by_its_budget_says_so_instead_of_blaming_the_tools(settings):
+    """A real run created without a budget got 2.5k tokens per step, less than a
+    researcher's first request: the engine removed every tool call, no step found
+    anything, and the error sent its owner to check search tools that were fine."""
+    from deepresearch.contracts import ResearchError
+
+    service = ResearchService(settings)
+
+    class Starved(DemoRunner):
+        async def research(self, run, unit, dependencies):
+            raise ResearchError("RESEARCH_BUDGET_SPENT", "研究预算已用尽，剩余额度留给报告写作", recoverable=False)
+
+    service.runner = Starved(settings, service.store)
+    await service.start()
+    try:
+        run = await service.create("u", CreateResearch(query="预算太小的研究"), "k-starved")
+        run = await settle(service, run["run_id"])
+        await service.decision(run["run_id"], 1, "approve")
+        run = await settle(service, run["run_id"])
+        assert run["status"] == "FAILED" and run["error"]["code"] == "NO_EVIDENCE"
+        assert "预算" in run["error"]["message"] and "检索/读取工具" not in run["error"]["message"]
+        # A retry keeps the same budget and the same spent balance: it cannot succeed.
+        assert run["error"]["recoverable"] is False
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
 async def test_final_validation_retry_does_not_reuse_rejected_draft(settings):
     service = ResearchService(settings)
 
@@ -292,5 +320,77 @@ async def test_published_report_is_markdown_with_toc_citations_and_stats(setting
         assert report["stats"]["citations"] == len(report["citations"]) == 4
         assert report["stats"]["elapsed_seconds"] is not None
         assert run["conversation"][-1] == {**run["conversation"][-1], "kind": "report", "text": report["title"]}
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_spent_research_budget_writes_the_report_instead_of_failing(settings):
+    """Running out of budget must end in a report with disclosed limits.
+
+    Steps that can no longer reserve research tokens degrade, supplementation
+    stops, and the reserve kept back for the writer produces the report.
+    """
+    service = ResearchService(settings)
+
+    class Broke(DemoRunner):
+        supplements = []
+
+        async def research(self, run, unit, dependencies):
+            if unit.id.startswith("S"):
+                self.supplements.append(unit.id)
+            if unit.id in {"R2", "R3"}:
+                raise ResearchError("RESEARCH_BUDGET_SPENT", "研究预算已用尽，剩余额度留给报告写作", recoverable=False)
+            return await super().research(run, unit, dependencies)
+
+    runner = Broke(settings, service.store)
+    service.runner = runner
+    await service.start()
+    try:
+        run = await service.create("u", CreateResearch(query="预算用尽也要有报告"), "k")
+        run = await settle(service, run["run_id"])
+        await service.decision(run["run_id"], 1, "approve")
+        run = await settle(service, run["run_id"])
+        assert run["status"] == "COMPLETED", run["error"]
+        assert run["unit_failures"] == {"R2": "RESEARCH_BUDGET_SPENT"}
+        assert any("未能完成（RESEARCH_BUDGET_SPENT）" in text for text in run["report"]["audit"]["limitations"])
+        # A step that could not afford a turn means supplements cannot either.
+        assert runner.supplements == []
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_every_step_losing_its_budget_still_ends_in_a_report(settings):
+    """A whole batch winding down on budget is not a broken run.
+
+    Only a batch that failed for other reasons is fatal, so the evidence a run
+    already gathered still becomes a report with the limits disclosed.
+    """
+    service = ResearchService(settings)
+
+    class Spent(DemoRunner):
+        cycles = []
+
+        async def research(self, run, unit, dependencies):
+            self.cycles.append(unit.id)
+            if unit.id.startswith("S"):  # every supplement runs out of budget
+                raise ResearchError("RESEARCH_BUDGET_SPENT", "研究预算已用尽，剩余额度留给报告写作", recoverable=False)
+            if unit.id == "R2":
+                raise RuntimeError("step did not finish")
+            return await super().research(run, unit, dependencies)
+
+    runner = Spent(settings, service.store)
+    service.runner = runner
+    await service.start()
+    try:
+        run = await service.create("u", CreateResearch(query="补研阶段预算用尽"), "k")
+        run = await settle(service, run["run_id"])
+        await service.decision(run["run_id"], 1, "approve")
+        run = await settle(service, run["run_id"])
+        assert run["status"] == "COMPLETED", run["error"]
+        assert any(uid.startswith("S") for uid in runner.cycles)
+        assert any(code == "RESEARCH_BUDGET_SPENT" for code in run["unit_failures"].values())
+        assert run["report"]["citations"]
     finally:
         await service.stop()

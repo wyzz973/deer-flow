@@ -3,6 +3,7 @@
 Explicit options make the only outbound calls: ``--probe-model NAME`` sends two
 short requests to that model (a plain reply and a tool call) and
 ``--probe-sources`` sends one small request to every enabled provider.
+``--probe-mcp`` connects to every enabled MCP server and lists its tools.
 """
 
 import argparse
@@ -65,10 +66,33 @@ async def probe_model(name, timeout=PROBE_TIMEOUT_SECONDS, settings=None):
     usage = usage_details(called)
     tools = [call["name"] for call in called.tool_calls]
     warnings = []
+    # Plans, outlines and findings are JSON requested in plain prompt text (no
+    # JSON mode), so check that the model returns a parseable object that way.
+    contract = {"ok": False, "seconds": None}
+    try:
+        from pydantic import BaseModel
+
+        from .output import parse_contract
+
+        class Probe(BaseModel):
+            status: str
+            items: list[int]
+
+        answer, contract["seconds"] = await timed(model, 'Return only a JSON object with the fields "status" (the string "ready") and "items" (the list [1, 2, 3]). No explanation.')
+        parsed = parse_contract(str(answer.content), Probe)
+        contract["ok"] = parsed.status == "ready" and parsed.items == [1, 2, 3]
+        speed = usage_details(answer)
+        if speed["output_tokens"] and contract["seconds"]:
+            contract["output_tokens_per_second"] = round(speed["output_tokens"] / contract["seconds"], 1)
+    except Exception as exc:
+        contract["error"] = type(exc).__name__
+
     if not tools:
         warnings.append("No tool call: researchers cannot search or read without tool calling; enable it on the model server.")
     if usage["total_tokens"] is None:
-        warnings.append("No usage reported: token and cost metrics stay empty for this model.")
+        warnings.append("No usage reported: token and cost metrics stay empty for this model. Check that the gateway supports stream_options.include_usage (models.<name>.stream_usage).")
+    if not contract["ok"]:
+        warnings.append("The model did not return the requested JSON object: lower nodes.plan/outline/conversion temperature to 0, raise output_retries, or choose another model for those nodes.")
     window = report["context_window"]
     if window is None:
         warnings.append("context_window is not set: context display and fraction-based summarization are unavailable.")
@@ -79,6 +103,7 @@ async def probe_model(name, timeout=PROBE_TIMEOUT_SECONDS, settings=None):
         "ok": bool(tools),
         "plain_reply": {"seconds": plain_seconds, "text": str(plain.content)[:120]},
         "tool_call": {"seconds": tool_seconds, "tools": tools},
+        "json_contract": contract,
         "usage": usage,
         "warnings": warnings,
     }
@@ -96,6 +121,59 @@ def load_saved_secrets(settings):
         pass
 
 
+def retrieval_status(settings):
+    """What researchers can search, open and cite with the enabled sources."""
+    from .report_policy import results_citable
+
+    active = settings.active_sources()
+    by_role = {role: [source.name for source in active if source.role == role] for role in ("search", "read", "data")}
+    citable = results_citable(settings)
+    notes = []
+    if not by_role["read"]:
+        notes.append("No enabled source opens a full page: search results and records are cited as evidence, and researchers use the research_records prompt.")
+    if not by_role["read"] and not by_role["data"] and by_role["search"] and not settings.cite_search_results:
+        notes.append("Reports will cite excerpts only; declare a knowledge tool as role: data when it returns complete records.")
+    opaque = [source.name for source in active if source.kind == "mcp"]
+    if opaque:
+        notes.append(
+            "kind: mcp sources ("
+            + ", ".join(opaque)
+            + ") hand the MCP tool to the researcher unchanged and are cited as one whole output per call. "
+            + "For a citation per record with its own title and link, configure a provider-based source instead: providers: [{type: mcp, server: ..., tool: ...}]."
+        )
+    return {**by_role, "search_results_citable": citable, "notes": notes}
+
+
+def node_status(settings):
+    """The model and parameters each workflow node really runs with."""
+    from .config import NODE_NAMES
+    from .models import model_for, node_output_cap
+
+    roles = {"rewrite": "deepresearch", "plan": "deepresearch", "follow_up": "deepresearch", "outline": "report-synthesis", "section": "report-synthesis", "summary": "report-synthesis", "revision": "report-synthesis"}
+    status = {}
+    for name in NODE_NAMES:
+        tuning = settings.node(name)
+        if name == "research":
+            model = {role: model_for(settings, spec, None, "research") for role, spec in settings.researchers().items()}
+        elif name == "conversion":
+            model = tuning.model or settings.extraction_model or "the researcher's model"
+        elif name == "rewrite":
+            model = tuning.model or settings.rewrite_model or model_for(settings, settings.skills["deepresearch"])
+        else:
+            model = model_for(settings, settings.skills[roles[name]], None, name)
+        status[name] = {
+            "enabled": tuning.enabled,
+            "model": model,
+            "temperature": tuning.temperature,
+            "top_p": tuning.top_p,
+            "max_tokens": node_output_cap(settings, name),
+            "timeout_seconds": tuning.timeout_seconds,
+            "output_retries": tuning.output_retries if tuning.output_retries is not None else settings.output_retries,
+            "json_mode": tuning.json_mode,
+        }
+    return status
+
+
 def configuration_status(settings):
     """Everything checkable offline, including missing credentials."""
     for name in settings.skills:
@@ -111,11 +189,17 @@ def configuration_status(settings):
                 "tool": source.tool,
                 "kind": source.kind,
                 "role": source.role,
+                "enabled": source.enabled,
                 "providers": [{"id": item.id, "type": item.type, "enabled": item.enabled, "api_key": SECRETS.status(item.api_key)} for item in source.providers],
             }
             for source in settings.sources
         ],
-        "mcp_servers": {name: {"transport": server.transport, "enabled": server.enabled} for name, server in settings.mcp_servers.items()},
+        "mcp_servers": {
+            name: {"transport": server.transport, "enabled": server.enabled, "allowed_tools": server.allowed_tools, "used_tools": sorted({tool for _, bound, tool in settings.mcp_bindings() if bound == name})}
+            for name, server in settings.mcp_servers.items()
+        },
+        "retrieval": retrieval_status(settings),
+        "nodes": node_status(settings),
         "langgraph_installed": importlib.util.find_spec("langgraph") is not None,
         "local_credentials_present": {key: bool(os.getenv(env)) for key, env in settings.local_secret_env.items()},
     }
@@ -137,6 +221,38 @@ def configuration_status(settings):
     return status
 
 
+async def probe_mcp(settings):
+    """Connect to every enabled MCP server and compare its tools with the configuration."""
+    from .mcp import MANAGER, connection_failure
+
+    results = {}
+    for name, server in settings.mcp_servers.items():
+        if not server.enabled:
+            results[name] = {"ok": None, "skipped": "disabled"}
+            continue
+        wanted = sorted({tool for _, bound, tool in settings.mcp_bindings() if bound == name})
+        started = time.monotonic()
+        try:
+            tools = await MANAGER.tools(name, server, refresh=True)
+        except BaseException as exc:
+            if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                raise
+            failure = connection_failure(name, TimeoutError() if isinstance(exc, TimeoutError) else exc)
+            results[name] = {"ok": False, "kind": failure.kind, "error": str(failure), "seconds": round(time.monotonic() - started, 1)}
+            continue
+        offered = sorted(tool.name for tool in tools)
+        missing = [tool for tool in wanted if tool not in offered]
+        results[name] = {
+            "ok": not missing,
+            "seconds": round(time.monotonic() - started, 1),
+            "offered_tools": offered,
+            "used_tools": wanted,
+            "missing_tools": missing,
+            "not_allowed": [tool for tool in offered if server.allowed_tools is not None and tool not in server.allowed_tools],
+        }
+    return results
+
+
 async def probe_sources(settings):
     from .channels import test_provider
 
@@ -148,11 +264,33 @@ async def probe_sources(settings):
     return results
 
 
+def engine_capacity(settings, app_config):
+    """Whether the engine admits as many native roles at once as research runs.
+
+    The engine queues roles beyond ``subagent_runtime.max_running`` and fails one
+    that waits longer than its admission timeout. Research cannot raise the
+    limit (it is read once, for the whole process), so a smaller value silently
+    caps ``max_concurrency`` and ``writer_concurrency``.
+    """
+    needed = max(settings.max_concurrency, settings.writer_concurrency or settings.max_concurrency)
+    runtime = getattr(app_config, "subagent_runtime", None)
+    limit = getattr(runtime, "max_running", None)
+    if not isinstance(limit, int) or limit >= needed:
+        return {"needed": needed, "max_running": limit, "ok": True}
+    timeout = getattr(runtime, "queue_timeout_seconds", None)
+    warning = (
+        f"The engine runs {limit} native roles at once but research is configured for {needed}: the rest queue inside the engine (a wait no research metric shows) and fail after {timeout} s. "
+        f"Set subagent_runtime.max_running to at least {needed} in the engine configuration and restart, or lower max_concurrency / writer_concurrency to {limit}."
+    )
+    return {"needed": needed, "max_running": limit, "ok": False, "warning": warning}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--config")
     parser.add_argument("--probe-model", metavar="NAME", help="Also call this research model twice to check a reply, tool calling and usage")
     parser.add_argument("--probe-sources", action="store_true", help="Also send one small request to every enabled source provider")
+    parser.add_argument("--probe-mcp", action="store_true", help="Also connect to every enabled MCP server, list its tools and check the tools research uses")
     args = parser.parse_args(argv)
     settings = load_settings(args.config)
     load_saved_secrets(settings)
@@ -169,11 +307,22 @@ def main(argv=None):
         if not all(status["legacy_agents"].values()):
             print(json.dumps(status, ensure_ascii=False, indent=2))
             raise SystemExit("One or more roles are bound to host subagents that are not configured")
+    if settings.runner == "deerflow":
+        try:
+            from deerflow.config import get_app_config
+
+            status["engine_capacity"] = engine_capacity(settings, get_app_config())
+        except Exception as error:  # noqa: BLE001 - the host configuration may be absent where doctor runs
+            status["engine_capacity"] = {"ok": None, "error": type(error).__name__}
     if args.probe_model:
         status["model_probe"] = asyncio.run(probe_model(args.probe_model, settings=settings))
     if args.probe_sources:
         status["source_probe"] = asyncio.run(probe_sources(settings))
+    if args.probe_mcp:
+        status["mcp_probe"] = asyncio.run(probe_mcp(settings))
     print(json.dumps(status, ensure_ascii=False, indent=2))
+    if args.probe_mcp and any(item.get("ok") is False for item in status["mcp_probe"].values()):
+        raise SystemExit("MCP probe failed: a server is unreachable, rejected its credentials, or lacks a tool research uses")
     if args.probe_model and not status["model_probe"]["ok"]:
         raise SystemExit("Model probe failed: DeepResearch needs a reachable model with tool calling")
     if not status["langgraph_installed"]:

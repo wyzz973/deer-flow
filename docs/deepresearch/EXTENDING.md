@@ -63,5 +63,5 @@ sources:
 `AgentRunner` 仍提供 `rewrite`/`plan`/`research`/`synthesize`，供显式的领域扩展使用。
 自定义实现必须保持原生授权与请求级凭据边界、预算、真实调用可追溯性、取消清理，以及失败不回退演示的约定。
 
-优先复用 `native.py` / `structured.py` / `observations.py` / `channels.py`。只有公司宿主接口不同才适配宿主 API；
+优先复用 `native.py` / `structured.py` / `observations.py` / `channels.py`。只有目标宿主的接口不同才适配宿主 API；
 不要另建 Agent loop、身份系统或 Skill loader。未实现的日期/语义证明必须作为限制公开。

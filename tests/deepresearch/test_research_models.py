@@ -111,6 +111,36 @@ def test_role_execution_config_carries_the_research_compaction_policy(settings):
     assert config.summarization.keep.value == 60000 and config.summarization.enabled
 
 
+def test_a_conversation_id_reaches_the_gateway_only_where_the_model_names_it(settings):
+    """Prefix caches live on one replica; a gateway needs the conversation's id to route by it."""
+    from pydantic import ValidationError
+
+    from deepresearch.models import session_overrides
+
+    settings.models = [
+        ModelSpec(name="gateway", model="qwen", base_url="https://gateway.example/v1", session_param="user", session_header="x-session-affinity", extra={"extra_body": {"enable_thinking": False}, "default_headers": {"x-team": "research"}}),
+        ModelSpec(name="strict", model="qwen", base_url="https://strict.example/v1"),
+        ModelSpec(name="official", model="gpt-5"),
+        ModelSpec(name="claude", provider="anthropic", model="claude-sonnet-5", session_param="user", session_header="x-session-id"),
+    ]
+    settings.default_model = "gateway"
+    config, _ = model_budget_config(engine_config(host(), settings), Role(model="gateway"), 4096, settings=settings, overrides={"extra_body": {"repetition_penalty": 1.05}}, session="dr-thread-1")
+    extras = config.get_model_config("gateway").model_extra
+    # The id joins the profile's and the node's own request fields.
+    assert extras["extra_body"] == {"enable_thinking": False, "repetition_penalty": 1.05, "user": "dr-thread-1"}
+    assert extras["default_headers"] == {"x-team": "research", "x-session-affinity": "dr-thread-1"}
+    # A gateway that was not asked gets nothing new; OpenAI's endpoint gets its cache key.
+    assert session_overrides(settings, "strict", "dr-thread-1") == {}
+    assert session_overrides(settings, "official", "dr-thread-1") == {"extra_body": {"prompt_cache_key": "dr-thread-1"}}
+    # A client without extra_body support only gets the header.
+    assert session_overrides(settings, "claude", "dr-thread-1") == {"default_headers": {"x-session-id": "dr-thread-1"}}
+    assert session_overrides(settings, "gateway", None) == {}
+    # The id can never stand in for a credential or a field research sends itself.
+    for bad in ({"session_header": "Authorization"}, {"session_header": "cookie"}, {"session_param": "messages"}, {"session_header": "x bad"}):
+        with pytest.raises(ValidationError):
+            ModelSpec(name="bad", model="m", **bad)
+
+
 @pytest.mark.asyncio
 async def test_direct_calls_consume_the_stream_and_a_tool_call_counts_as_an_answer():
     """Streaming-only servers return an empty message for a plain request.

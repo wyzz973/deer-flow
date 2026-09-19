@@ -90,9 +90,10 @@ flowchart TB
 | `app/workspace/deepresearch/page.tsx`、`[run_id]/page.tsx` | 新研究与研究会话路由 |
 | `components/deepresearch/research-conversation.tsx` | 复用原生 `ChatSurface`、`MessageList`、`PromptInput`、`ChatBox`，接线所有研究交互 |
 | `components/deepresearch/plan-card.tsx` | 计划卡、倒计时环、编辑/取消/开始、进度卡、更新、失败与重试 |
+| `components/deepresearch/plan-pending.tsx` | 提交后到计划卡出现之间的等待态：“正在思考” shimmer 与计划卡占位骨架（`waitingPhase` 决定何时显示） |
 | `components/deepresearch/report-view.tsx` / `report-reader.tsx` | 报告卡、正文渲染与引用编号、导出菜单、全屏阅读器与悬停目录 |
 | `components/deepresearch/sources-panel.tsx` | “来源”（按域名分组的引用）与“活动”（研究时间线）页签 |
-| `components/deepresearch/citation-preview.tsx` | 引用悬浮卡（原文片段）与网站图标 `SiteIcon` |
+| `components/deepresearch/citation-preview.tsx` | 引用悬浮卡（站点、两行标题、两行摘录，多摘录 ← → 切换，`basis` 为检索摘录时标“摘录”）与网站图标 `SiteIcon` |
 | `components/deepresearch/metrics-panel.tsx` | “指标”页签：耗时、Token、费用、调用、子 Agent 与效率 |
 | `components/deepresearch/trace-panel.tsx` | 本地 Trace 浏览与导出 |
 | `components/deepresearch/llm-calls-panel.tsx` / `llm-call-dialog.tsx` | “LLM 调用”审计：按阶段与轮次分组、逐次查看提示词/返回/工具定义/参数/原始 JSON |
@@ -185,12 +186,12 @@ flowchart LR
 
 | 节点 | 状态 | 做什么 | 关键事件 | 持久化与缓存 |
 | --- | --- | --- | --- | --- |
-| `rewrite` | `PLANNING` | 把整段对话改写成一条完整的研究请求 `ResearchRequest`（`user_query`、可选 `acknowledgement`、至多 3 个澄清问题），对标 ChatGPT 调用 Deep Research App 时的 `user_query`。修改计划或追问触发新研究时，从上一版请求出发合并本次修改并写确认话术。模型未按契约输出时退化为纯文本请求并发 `research.request.prose` | `research.request.rewritten` | 写入 `request`；追加 `request-N` 对话消息（`kind: rewrite`） |
-| `planner` | `PLANNING` | 调用 `deepresearch` 角色把改写后的请求变成 `ResearchPlan`：研究简报 `brief`（即改写后的请求）、短标题、3–6 个带短标题的单元、前提假设、报告风格、来源策略；对话修改时写 `acknowledgement` 并设置 `auto_start`；`require_dual_source: false` 时由 `Settings.fit_origins` 去掉没有来源可用的 `required_origins` | `plan.created` / `plan.updated` | 缓存键 `plan:`；写入 `plan` 与 `units`；追加 `ack-N` 与 `plan-N` 对话消息 |
+| `rewrite` | `PLANNING` | 把整段对话改写成一条完整的研究请求 `ResearchRequest`（`user_query`、可选 `acknowledgement`、至多 3 个澄清问题），对标 ChatGPT 调用 Deep Research App 时的 `user_query`。修改计划或追问触发新研究时，从上一版请求出发合并本次修改并写确认话术。模型未按契约输出时退化为纯文本请求并发 `research.request.prose`（回复是残缺 JSON 时只取其中的 `user_query`）。`nodes.rewrite.enabled: false` 时不调用模型：直接用用户原话，修改计划时把改动追加到上一版请求 | `research.request.rewritten` | 写入 `request`；追加 `request-N` 对话消息（`kind: rewrite`） |
+| `planner` | `PLANNING` | 调用 `deepresearch` 角色把改写后的请求变成 `ResearchPlan`：研究简报 `brief`（即改写后的请求）、短标题、`plan_min_units`–`plan_max_units` 个带短标题的单元（只规划 `available_sources` 能回答的内容）、前提假设、报告风格、来源策略；计划不合规（未知角色、未知或已停用的数据源、超出单元上限）时带原因重试，最后一次由 `runner.fit_plan` 修正而不是失败；对话修改时写 `acknowledgement` 并设置 `auto_start`；`require_dual_source: false` 时由 `Settings.fit_origins` 去掉没有来源可用的 `required_origins` | `plan.created` / `plan.updated` | 缓存键 `plan:`；写入 `plan` 与 `units`；追加 `ack-N` 与 `plan-N` 对话消息 |
 | `plan_review` | 等待确认 | `auto_start` 时记录 `plan.auto_started`（`source=revision`）并直接批准；否则 `interrupt` 等待决策 | `plan.waiting_confirmation`（由服务写入）、`plan.auto_started` | 中断前无副作用，恢复时节点重跑 |
 | `dispatch` | `RESEARCHING` | 按依赖分批并行（`max_concurrency`）运行研究单元；已提交结果直接复用；非致命失败降级为占位结果；致命错误或整批失败使运行失败 | `research.unit.started` / `completed` / `failed` | `research_unit` 结果；`unit_statuses`、`unit_failures` |
 | `evidence_merge` | — | `merge_results` 按计划顺序把原始证据合并为稳定的 `E###`，生成 `BoundFinding` 与 lineage | `evidence.pool.updated` | `research_evidence`；`evidence_count` |
-| `validator` | `VALIDATING` | 计算可引用证据集合与缺口；无缺口则完成；补研预算耗尽或结果饱和时：无可引用证据报 `NO_EVIDENCE`，否则默认带局限继续 | `validator.passed` / `validator.gap_found` / `report.limitations.auto` | `research_gap`；`gaps`、`limitations` |
+| `validator` | `VALIDATING` | 计算可引用证据集合与缺口；无缺口则完成；只有 `supplement_gap_codes` 里的缺口类型会触发补研；补研预算（轮数、单元数、研究 Token、研究时间）耗尽或结果饱和时：没有任何发现引用到可引用证据则报 `NO_EVIDENCE`，否则默认带局限继续。饱和与 `NO_EVIDENCE` 都按“被发现引用的可引用证据数”判断，不看证据池大小 | `validator.passed` / `validator.gap_found` / `report.limitations.auto` | `research_gap`；`gaps`、`limitations` |
 | `supplement` | — | 按缺口严重度生成补研单元（`S<iter>-<hash>`，依赖原单元）；截断的缺口发出事件 | `research.supplement.deferred` | `units`、`iteration` |
 | `synthesis` | `SYNTHESIZING` | 新报告调用 `write_report`；报告追问的改写调用 `revise_report` | `report.synthesizing`、`report.outline.ready`、`report.section.*`、`report.draft.repair` | 缓存键 `synthesis:…:retry-N` 及大纲/章节/摘要各自的缓存 |
 | `citation_binder` | `CITATION_BINDING` | `report.bind` 把标记映射为页面编号 | `citation.bound` | 状态内 `citation_map` |
@@ -204,6 +205,9 @@ flowchart LR
 `MODEL_NOT_CONFIGURED`、`BUDGET_EXHAUSTED`、`TIME_BUDGET`、`RUN_CANCELLED`、`AGENT_NOT_CONFIGURED`、
 `SKILL_DENIED`、`TOOL_DENIED`、`NATIVE_TOOL_MISSING`、`MCP_TOOL_MISSING`、`DEPENDENCY_EVIDENCE`、
 `UNIT_MISMATCH`。非 `Exception`、`OSError` 与 `sqlite3.Error` 也视为致命。
+
+收尾类错误 `RESEARCH_BUDGET_SPENT`（研究 Token 用尽）与 `RESEARCH_TIME_SPENT`（研究时间用尽）不是故障：
+该单元降级，整批都是这类错误时运行继续并写报告。整批因其他非致命原因失败时，只有此前已有任何发现才继续，否则运行失败。
 
 其他错误（例如 `NATIVE_AGENT_TIMEOUT`、`RESULT_CONTRACT`）只让该单元失败：保存置信度为 0、
 写明“研究步骤未能完成”的占位结果，记录 `unit_failures` 与 `research.unit.failed`，依赖它的单元照常调度，
@@ -272,12 +276,18 @@ sequenceDiagram
 
 执行与转换：
 
+0. 能力判断：本单元可用的数据源里没有 `role: read` 时进入“无原文”模式——任务说明用 `prompts.research_records`、
+   整理用 `prompts.conversion_records` 和不含 `source_annotations` 的契约 `ResearchFindings`，检索结果逐条成为证据。
+   时间：`store.research_seconds_left` 给出本单元的工具停止时间与硬超时（事件 `research.unit.deadline`），
+   剩余不足 20 秒时直接以 `RESEARCH_TIME_SPENT` 降级。
 1. 缓存键 `native-unit:` + digest(cycle、单元、依赖)。成功的原生执行先缓存，格式修复不会重跑研究。
 2. `research_observations` 把消息与 receipts 投影为 `RawEvidence` 和观察目录。
 3. 补研单元只导入父单元已保存发现所引用的证据，并核对依赖发现与保存结果一致。
-4. 计算可引用 ID：未被取代、满足来源策略、`citable` 为真。
+4. 计算可引用 ID：未被取代、满足来源策略、`citable` 为真；结论写回证据（`RawEvidence.citable`），
+   缺口判断、写作和终检沿用这个结论而不再按部署级设置重新判断。
 5. `convert_answer` 把笔记转为 `ResearchAnalysis`：校验器拒绝未知 ID 并给出精确反馈；最后一次尝试时删除无法验证的引用
-   （`research.output.pruned`），不猜测替换。
+   （`research.output.pruned`），不猜测替换。发现条数受 `max_findings_per_unit` 约束（提示词要求 + 超出截断）；
+   回复被输出上限截断时，重试消息要求“缩短”，而不是原样重试。
 6. 注解引文必须在原始工具输出中出现（`ground_source_annotations`）。
 7. `bound_evidences` 把结果控制在 500 条原始证据内：保留被引用的证据、已读取页面和工具记录，先裁掉多余的发现链接，
    再裁已被取代的运行时副本（`research.evidence.trimmed`）。
@@ -309,7 +319,9 @@ sequenceDiagram
 （`assumptions_needed`）只成为报告假设，不算缺口；单一站点支持的高风险结论只要求写作时加限定（`single_source`）。
 
 补研单元按缺口严重度排序并受 `max_units` 限制，被截断的缺口发出 `research.supplement.deferred`。
-达到 `max_iterations`、单元上限，或缺口签名不变且证据池不再增长时停止补研：
+补研单元按 `depends_on[0]` 归属原单元；`open-questions` 每个原单元只触发一轮补研（研究员总能再想出一个问题，
+否则补研永远跑满轮数）；`supplement_gap_codes` 决定哪些缺口类型值得补研，其余直接成为局限。
+达到 `max_iterations`、单元上限、研究 Token 或研究时间用尽，或缺口签名不变且被引用的可引用证据不再增加时停止补研：
 有可引用证据时默认写带局限的报告（`allow_limited_report: true`，事件 `report.limitations.auto`）；
 严格部署需 owner 通过重试同意；没有可引用证据时失败为 `NO_EVIDENCE`。
 
@@ -318,6 +330,12 @@ sequenceDiagram
 - `SourceSpec.role`（`search` / `read` / `data`）由运营方声明，`report_policy.citable` 据此判断。
 - `SourcePolicy` 来自用户计划：`allowed_domains`、`excluded_url_prefixes`、`require_original`（只允许读取过的原文）。
 - `eligible_evidence(pool, policy, settings)` 同时约束研究转换、缺口判断、写作输入和终检。
+- 检索结果能否引用只有一条规则（`report_policy.results_citable`）：运营方打开 `cite_search_results`，或者没有任何启用的
+  `role: read` 数据源（拿不到原文时，摘录就是证据）。研究单元没有读取工具时同样成立，并写入 `RawEvidence.citable`。
+  这类引用在参考资料里标注“检索摘录，未读取原文”（`citations[].basis`：`page` / `record` / `search excerpt`），
+  写作模型收到的证据目录也带这个 `kind`。此时 `require_original` 无法满足，改为在局限里说明而不是 `NO_EVIDENCE`。
+- 页面身份保留单页应用的路由片段（`#/doc/5`、`#!/x`），普通锚点仍然忽略；没有 URL 的记录按
+  `(来源, document_hash)` 归并，参考资料里显示来源名而不是内部的 `tool-result://`。
 - 发现链接、读取原文、报告引用是三件不同的事，界面和计数都分开，不把发现当成“已核实”。
 
 ## 9. 报告生成
@@ -339,16 +357,27 @@ flowchart LR
 1. **大纲**：输入研究简报、原单元、单元摘要、编号发现（含 `high_risk`、`single_source`）、前提假设、原始局限、章节数量范围。
    校验要求每个原单元都被覆盖、章节数不超过 `max_report_sections`，且不得规划执行摘要、研究范围与局限、参考来源这类由系统组装的章节；
    最后一次尝试由 `tidy` 删除这类章节并把单元覆盖并入其他章节。标题去掉“一、”“1.”等编号。缓存键 `report-outline:`。
-2. **章节**：按 `max_concurrency` 并行，每节只拿到本节单元（补研映射回原单元）的发现与证据目录，使用独立原生任务 ID，
+2. **章节**：按 `writer_concurrency`（未设置时为 `max_concurrency`）并行，每节只拿到本节单元（补研映射回原单元）的发现与证据目录，使用独立原生任务 ID，
    缓存键 `report-section:`。写作要求：先给判断、跨来源综合、事实句紧跟 `[[E012]]` 标记、保留状态与日期、
    区分厂商宣称与独立证据、需要时使用表格或 Mermaid。
 3. **摘要**：基于章节草稿写执行摘要，只复制草稿中已有的标记。缓存键 `report-summary:`。
+   `nodes.summary.enabled: false` 或摘要为空时，用大纲的关键结论作为摘要。
 4. **修复与清理**（`_markdown`）：先用精确反馈修复一次（`report.draft.repair`），再 `sanitize`：删除含未知或不合格标记的句子、
    列表项或表格单元格内容，去掉链接、裸 URL 与数字引用，并在 `audit` 中计数。`clean_answer` 去掉包裹代码块、重复标题、
-   首行写作元话语和描述生成过程的段落（例如“未新增证据 ID”）。
+   首行写作元话语和描述生成过程的段落（例如“未新增证据 ID”；带有效标记的段落视为正文保留）。校验前先归一化：
+   只有闭合标签 `</think>` 的推理内容、写法接近的标记（`[[e001]]`、`[[E001 E002]]`、`【E001、E002】`、`（E001）` 改写为标准形式，
+   `[[E12]]` 这类没有三位编号的算畸形标记并报错）、被输出上限截断而未闭合的代码围栏（Mermaid 丢弃，其他补齐，
+   `audit.cut_off_answers` 计数）、控制字符，以及任何不指向文档内部的链接和图片（包括 `//host/x.png`、引用式链接定义、`mailto:`）。
+   删除句子时不按分号切分（分号前半句共用同一个引用），并配平被拆开的 `**`。
 5. **组装**：`# 标题`、`## 执行摘要`、各章节、`## 研究范围与局限`（前提假设与最多 5 条合并局限）。长度只是目标，不因超长失败。
+   大纲模型写的标题、关键结论、假设与局限在组装前用 `plain_text` 去掉链接、URL、数字引用和标记
+   （否则一句“未能打开 https://…”就会让终检失败并整份重写）。局限由 `runner.reader_caveats` 保证非空：
+   大纲没给局限时回退到原始局限；单元失败、提前收尾这类系统记录的局限始终保留；修复后仍为空的章节不进入报告并写成一条局限，
+   全部章节都为空时报 `REPORT_EMPTY`。
 
 对话式改写调用 `revise_report`，在现有文档上最小修改，标记同样校验与清理；不会为改写重新搜索。
+整篇重写可能被输出上限截断：改写结果丢失两个以上二级章节且长度不足原文六成（而用户并没有要求删减）时，
+拒绝发布并保留原报告（`REPORT_REVISION_TRUNCATED`，事件 `report.revision.rejected`）。
 
 ### 9.2 绑定、终检与导出（`report.py`）
 
@@ -490,14 +519,21 @@ workflow、节点、原生 Agent、模型调用、工具调用、结构化转换
 - `tokens` 与 `cost`：输入、输出、缓存命中、推理、合计、未上报调用；按 `pricing` 估算费用（缓存命中按缓存单价，未配置则按普通输入价），
   列出未定价模型；多币种时只给分币种合计。
 - `model_calls`：次数、错误码、finish reason、延迟 p50/p95、最大上下文。
-- `tools`：次数、错误率与错误类型、延迟、返回字符、搜索次数、读取页面数、按工具明细；重复调用（同一工具同一参数、在一次成功之后，
+- `breakdown.by_node`：按可调节点（`rewrite`、`plan`、`research`、`conversion`、`outline`、`section`、`summary`、`revision`、
+  `follow_up`，外加引擎的 `compaction`）汇总：使用的模型、调用数、错误、未上报用量的调用、各类 Token、最大输入、平均输出、
+  `truncated`（`finish_reason=length`，该调大这个节点的 `max_tokens`）、`retries`（契约或引用修复次数，该降温度或换模型）、
+  累计耗时与 P50/P95/最大延迟、费用。各节点合计与总调用数、总 Token 一致。模型调用记录带 `config_node` 与 `engine_node`；
+  早于这两个字段的历史记录按 `purpose`、角色和写作任务 ID 归类。
+- `tools`：次数、错误率与错误类型、延迟、返回字符、搜索次数（`search` 与 `data` 两类查询；被预算拒绝的调用记为 `budget_stops`，不算搜索）、读取页面数、按工具明细；重复调用（同一工具同一参数、在一次成功之后，
   区分同一子 Agent 内与跨 Agent；分页与失败重试不算）；读取失败最多的 10 个站点；
   `failovers` 与 `by_provider`（每个数据源供应商的尝试、应答、空结果、错误、冷却跳过、缓存命中、错误类别与延迟）。
 - `agents`：完成/失败/取消、失败码、最大并行数、按角色汇总、每次执行明细与费用。
 - `units`：按计划顺序列出每个研究单元（含补研）的耗时、模型调用、Token、费用、工具调用、搜索、读取页面、原始证据、
   被引用页面数（报告引用的 `unit_ids`）与每条引用 Token，用来找出高消耗、低产出的单元。
 - `budget`：Token、工具调用、时长上限与已用比例；上限为空表示不限。时长按已结算用量与运行中 workflow span 取大，
-  因此运行中的任务也能看到时间预算消耗。
+  因此运行中的任务也能看到时间预算消耗。预算按任务计：报告完成后的追问会把当前用量归档到 `usage_history` 并从零开始，
+  `budget.earlier_tasks` 列出同一会话里已结束的任务。
+- 没有任何调用上报用量时，Token 合计与由它推导的比率为 `null`（未知），不显示 0；`estimated_unreported` 保留账本估算。
 - `metered`：早于逐次调用计量的任务（有预算账本但没有调用记录）为 `false`，未测量的字段一律为 `null`，不以 0 充数。
 - `research`、`report`、`cache`：计划与补研单元、失败单元、原始证据、裁剪与剪除引用、转换重试；报告字符、章节、表格、图、引用、域名、修复与删句；缓存复用。
 - `efficiency`：每条引用 Token/费用/计算时长、读取页面与引用的比例、每个研究单元（含补研）搜索次数、重复工具调用占比、每报告字符 Token、格式转换 Token 占比、失败子 Agent Token 占比、缓存命中率。
@@ -548,7 +584,7 @@ workflow、节点、原生 Agent、模型调用、工具调用、结构化转换
 | “研究完成情况：用时 · 引用 · 搜索”与报告卡 | `reportSummaryLine`、`ResearchReportCard` |
 | 全屏阅读器、悬停目录、滚动高亮 | `report-reader.tsx` |
 | 来源按域名分组（网站图标）、活动时间线（网站标签） | `sources-panel.tsx`、`SiteIcon` |
-| 正文上标引用与来源卡片 | `report-view.tsx` 引用编号与 `CitationPreview` 悬浮卡（原文片段） |
+| 正文上标引用与来源卡片 | `report-view.tsx` 引用编号（选中变实心）与 `CitationPreview` 悬浮卡（两行摘录） |
 | 空白页“推荐”“报告” | `research-gallery.tsx` |
 
 研究页向原生 `MessageList` 传 `runDurationEnabled={false}`（单条消息耗时不是研究用时）。报告渲染使用 GFM，不启用数学公式。
@@ -569,16 +605,20 @@ Gateway 依次尝试主机与上级站点的 `/favicon.ico`、首页声明的最
 | --- | --- | --- |
 | `runner` / `runner_factory` | `demo` / 无 | `deerflow` 为真实执行；工厂由管理员指定 |
 | `data_dir` | `.deerflow/deepresearch` | 数据库、检查点、日志 |
-| `models` / `default_model` / `rewrite_model` / `extraction_model` | `[]` / 无 | 研究自己的模型；注入私有 AppConfig 副本，宿主 `models` 不受影响 |
+| `models` / `default_model` / `rewrite_model` / `extraction_model` | `[]` / 无 | 研究自己的模型；注入私有 AppConfig 副本，宿主 `models` 不受影响。`stream_usage`、`max_tokens_param` 适配只支持 Chat Completions 的模型网关 |
+| `nodes` | `{}` | 按节点（rewrite / plan / research / conversion / outline / section / summary / revision / follow_up）指定模型、温度、top_p、输出上限、超时、修复次数、JSON 模式与 `extra_body`；`rewrite`、`summary` 可关闭 |
 | `skills` | 必填 | 必须包含 `deepresearch` 与 `report-synthesis`；`methodology` 或 `path`、`model`、`system_prompt`、`tools`、`enabled`、`max_turns`、`timeout_seconds`（`agent` 是旧版绑定） |
-| `sources` | `[]` | `name`、`tool`、`role`（search / read / data）、`origin`、`level`、`providers`（按序故障切换）；`kind: mcp` 直接暴露 MCP 工具，`kind: native` 是旧版宿主工具绑定 |
-| `mcp_servers` / `engine_tools` | `{}` / `[read_file]` | 研究自己的 MCP 服务；研究员可用的引擎工具（不继承宿主工具表） |
-| `prompts` | 默认见 `prompts.py` | 17 条指令全部可覆盖，含 `rewrite` 与 `compaction` |
+| `sources` | `[]` | `name`、`tool`、`role`（search / read / data）、`origin`、`level`、`enabled`、`providers`（按序故障切换）；`kind: mcp` 直接暴露 MCP 工具，`kind: native` 是旧版宿主工具绑定 |
+| `mcp_servers` / `engine_tools` | `{}` / `[read_file]` | 研究自己的 MCP 服务（`allowed_tools` 白名单、请求头/环境变量支持 `${ENV}` 与 `${secret:NAME}` 插值）；研究员可用的引擎工具（不继承宿主工具表） |
+| `prompts` | 默认见 `prompts.py` | 20 条指令全部可覆盖，含 `rewrite`、`compaction` 以及无原文时使用的 `research_records` / `conversion_records` |
 | `compaction` | 见 `CompactionSpec` | 上下文压缩：按角色模型上下文比例触发、按 token 保留、研究自己的摘要提示词 |
 | `llm_audit` | `true` | 是否保存每次模型调用的完整提示词与返回 |
-| `max_concurrency` / `max_active_runs` | 3 / 8 | 单运行并行度与全局容量 |
+| `max_concurrency` / `writer_concurrency` / `max_active_runs` | 3 / 无 / 8 | 研究并行度、章节写作并行度与全局容量 |
+| `plan_min_units` / `plan_max_units` | 3 / 6 | 计划的研究步骤数范围 |
+| `max_searches_per_unit` / `max_seconds_per_unit` / `max_findings_per_unit` | 30 / 无 / 12 | 每个研究单元的检索次数、软时限与交给写作的发现条数 |
+| `supplement_gap_codes` / `report_time_reserve_seconds` | 全部 / 无 | 哪些缺口触发补研；时间预算里留给写报告的秒数 |
 | `plan_countdown_seconds` | 45 | 计划倒计时 |
-| `max_output_tokens` / `output_retries` / `extraction_model` | 4096 / 2 / 无 | 单次输出上限与转换修复 |
+| `max_output_tokens` / `output_retries` / `extraction_model` | 8192 / 2 / 无 | 单次输出上限与转换修复（节点可各自覆盖） |
 | `native_tools` | 无 | 宿主工具候选上限 |
 | `allow_limited_report` / `cite_search_results` | true / false | 带局限写报告；搜索结果是否可引用 |
 | `max_synthesis_repairs` / `max_report_sections` | 1 / 8 | 终检重写次数、章节上限 |
@@ -595,8 +635,10 @@ Gateway 依次尝试主机与上级站点的 `/favicon.ico`、首页声明的最
 离线模板在 `examples/deepresearch/offline/`（本地模型、内网知识库、`LocalSandboxProvider`），由 `test_offline_config.py` 校验。
 逐字段说明见 [RESEARCH_CONFIGURATION.md](RESEARCH_CONFIGURATION.md)，模型与宿主配置见
 [MODEL_CONFIGURATION.md](MODEL_CONFIGURATION.md)、[DEERFLOW_CONFIGURATION.md](DEERFLOW_CONFIGURATION.md)。
-`python -m deepresearch.doctor --config <研究配置> [--probe-model <模型名>]` 检查配置与研究角色；加 `--probe-model` 时
-对该模型发一次普通请求和一次工具调用，报告工具调用、用量与上下文告警，失败时退出码为 1。
+`python -m deepresearch.doctor --config <研究配置> [--probe-model <模型名>] [--probe-mcp] [--probe-sources]` 检查配置与研究角色，
+并输出每个节点实际生效的模型与参数（`nodes`）、检索能力判定（`retrieval`：有没有读取工具、检索结果是否可引用）；
+`--probe-model` 对该模型发一次普通请求、一次工具调用和一次“只返回 JSON”的请求，报告工具调用、JSON 契约、输出速度、
+用量与上下文告警；`--probe-mcp` 连接每个 MCP 服务、列出工具并核对研究用到的工具与白名单。失败时退出码为 1。
 
 ### 15.1.1 设置页与运行快照
 
@@ -636,7 +678,10 @@ Gateway 依次尝试主机与上级站点的 `/favicon.ico`、首页声明的最
 | `PROCESS_INTERRUPTED` | 进程重启或停止 | 是 | 页面重试，从检查点继续 |
 | `NATIVE_AGENT_TIMEOUT` / `MODEL_TIMEOUT` / `MODEL_RATE_LIMIT` / `MODEL_UNAVAILABLE` | 超时或上游问题 | 是 | 单元级降级；整体失败时重试 |
 | `MODEL_AUTH_REQUIRED` / `MODEL_ACCESS_DENIED` / `MODEL_BILLING_REQUIRED` | 提供方认证、权限或计费 | 是（运行整体失败，不做单元降级） | 修正凭据或账户后从检查点重试 |
-| `NO_EVIDENCE` | 没有任何可引用证据 | 是 | 检查搜索/读取工具后重试 |
+| `NO_EVIDENCE` | 没有任何发现引用到可引用证据 | 是 | 检查搜索/读取工具与整理模型输出后重试 |
+| `RESEARCH_BUDGET_SPENT` / `RESEARCH_TIME_SPENT` | 研究 Token / 研究时间用尽，余量留给报告 | 单元级 | 该单元降级、停止补研，报告照常生成 |
+| `REPORT_EMPTY` / `REPORT_REVISION_TRUNCATED` | 章节全部为空；改写结果丢失多个章节 | 是 / 否 | 调大写作节点的 `max_tokens`、超时后重试；改写被拒绝时原报告保留 |
+| `TIMEOUT` | 超过“时间上限 + 一份报告预留”仍未完成 | 是 | 调大 `max_elapsed_seconds` 或 `report_time_reserve_seconds` |
 | `RESEARCH_GAPS` | 严格部署下缺口未闭合 | 否（owner 可同意带局限） | 重试并传 `allow_limited_report: true` |
 | `FINAL_VALIDATION` | 报告多次未通过引用校验 | 是 | 重试获得新的有限重写机会 |
 | `EVIDENCE_REFERENCE` / `RESULT_CONTRACT` | 单元结果引用或容量问题 | 单元级 | 该单元降级，局限进入报告 |
@@ -647,8 +692,9 @@ Gateway 依次尝试主机与上级站点的 `/favicon.ico`、首页声明的最
 ## 18. 扩展点
 
 - 新研究角度：新增 Skill 与 Agent，在配置中登记，planner 可选用（详见 [EXTENDING.md](EXTENDING.md)）。
-- 新来源：先让工具在普通 DeerFlow 中可用，再在 `sources` 声明 `kind`、`origin`、`level` 和正确的 `role`。
-  不为 MCP 写返回字段映射，不创建旁路 MCP 客户端。
+- 新来源：在研究配置的 `sources` 里声明 `origin`、`level` 和正确的 `role`，背后挂供应商：内置预设、`http`（自定义接口模板）
+  或 `mcp`（`mcp_servers` 里某个服务的工具，建议配 `allowed_tools`）。不为 MCP 写返回字段映射：`extract.py` 按通用结构识别记录。
+  `kind: mcp` 把 MCP 工具原样暴露给研究员，每次调用整体作为一条证据。
 - 自定义 Runner：`runner_factory` 指向管理员控制的工厂，需实现 `AgentRunner` 协议。
 - 企业访问控制：`access_policy` 指向 `callable(request, run) -> bool`。
 

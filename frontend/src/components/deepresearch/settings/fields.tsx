@@ -1,6 +1,6 @@
 "use client";
 
-import { useId, useState } from "react";
+import { createContext, useContext, useEffect, useId, useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
@@ -16,6 +16,39 @@ import { Textarea } from "@/components/ui/textarea";
 import { referenceProblem, sameValue } from "@/core/deepresearch/settings";
 import type { SecretStatus } from "@/core/deepresearch/types";
 import { cn } from "@/lib/utils";
+
+/** Input that exists only on screen. A number or JSON field keeps text the
+ * draft cannot hold (out of range, not yet valid JSON); the draft then still
+ * has the previous value, so saving would silently store something other than
+ * what the field shows. Fields report such text here and the page refuses to
+ * save until it is fixed. Outside a provider nothing is reported. */
+export const InvalidFields = createContext<
+  (id: string, problem: string | null) => void
+>(() => undefined);
+
+/** Names the card a field sits in ("模型 flash"), so a reported problem can be found. */
+export const FieldScope = createContext("");
+
+function useInvalidReport(label: string, problem: string) {
+  const id = useId();
+  const report = useContext(InvalidFields);
+  const scope = useContext(FieldScope);
+  useEffect(() => {
+    if (!problem) return;
+    report(id, `${scope ? `${scope} · ` : ""}${label}：${problem}`);
+    return () => report(id, null);
+  }, [id, label, problem, report, scope]);
+}
+
+/** Where a header or environment value may take a credential from. */
+export const CREDENTIAL_HINT = (
+  <>
+    值可以是 <code>$ENV_NAME</code>、<code>secret:NAME</code>
+    ，也可以在字符串里插值：<code>{"Bearer ${ENV_NAME}"}</code>、
+    <code>{"sid=${secret:kb-cookie}; lang=zh"}</code>
+    。不要直接粘贴明文凭据，保存时会被拒绝。
+  </>
+);
 
 export function Field({
   label,
@@ -77,7 +110,8 @@ export function TextField({
   );
 }
 
-/** A number typed as text, so partial input such as "0." survives; the draft only receives valid values. */
+/** A number typed as text, so partial input such as "0." survives; the draft only
+ * receives valid values. Pass `step={1}` for an integer setting. */
 export function NumberField({
   label,
   hint,
@@ -88,6 +122,7 @@ export function NumberField({
   max,
   step,
   nullable,
+  placeholder,
   className,
 }: {
   label: string;
@@ -99,6 +134,8 @@ export function NumberField({
   max?: number;
   step?: number;
   nullable?: boolean;
+  /** What an empty nullable field means, e.g. "继承". */
+  placeholder?: string;
   className?: string;
 }) {
   const id = useId();
@@ -126,6 +163,7 @@ export function NumberField({
               !Number.isInteger(parsed)
             ? "请填写整数"
             : "";
+  useInvalidReport(label, own ? problem : "");
   return (
     <Field
       label={label}
@@ -147,9 +185,13 @@ export function NumberField({
         }
         value={text}
         disabled={disabled}
-        placeholder={nullable ? "不限 / 默认" : undefined}
+        placeholder={nullable ? (placeholder ?? "不限 / 默认") : undefined}
         aria-invalid={Boolean(own && problem)}
-        onBlur={() => setLocal(null)}
+        // Valid text is normalized on blur; invalid text stays until it is
+        // fixed, because it is what blocks the save.
+        onBlur={() => {
+          if (!problem) setLocal(null);
+        }}
         onChange={(event) => {
           const next = event.target.value;
           const number = next.trim() === "" ? null : Number(next);
@@ -424,6 +466,7 @@ export function JsonField({
       ? ""
       : JSON.stringify(value, null, 2);
   const error = own ? local.error : "";
+  useInvalidReport(label, error);
   return (
     <Field
       label={label}

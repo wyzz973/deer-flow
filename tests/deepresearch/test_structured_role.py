@@ -60,12 +60,29 @@ async def test_reference_validation_retries_conversion_with_precise_feedback(set
         if value.evidence_id != "known":
             raise ValueError("Unknown evidence ID: " + value.evidence_id)
 
-    monkeypatch.setattr("deerflow.models.create_chat_model", lambda **kwargs: Model())
+    created = []
+
+    def create(**kwargs):
+        created.append(kwargs)
+        return Model()
+
+    from deepresearch.config import ModelSpec
+
+    settings.models = [ModelSpec(name="local", model="qwen", base_url="https://gateway.example/v1", session_param="user", extra={"extra_body": {"enable_thinking": False}})]
+    settings.default_model = "local"
+    monkeypatch.setattr("deerflow.models.create_chat_model", create)
     runner = SimpleNamespace(settings=settings, store=store, _agent_config=agent_config)
-    result = await convert_answer(runner, {"run_id": "r"}, "technical-route", {}, Answer, "ordinary notes", {}, validator=validate)
+    result = await convert_answer(runner, {"run_id": "r"}, "technical-route", {"unit": {"id": "R1"}}, Answer, "ordinary notes", {}, validator=validate)
     assert result.evidence_id == "known"
     assert len(captured) == 2
     assert "Unknown evidence ID: invented" in captured[1][-1]["content"]
+    # The task leads and the answer ends the request, and the retry keeps both:
+    # what conversions of one run share stays a reusable prompt prefix.
+    assert captured[0][1]["content"].startswith('{"task"') and captured[1][:2] == captured[0][:2]
+    # The call and its retry are one conversation for a gateway that routes by
+    # id; the id joins the profile's request fields instead of replacing them.
+    body = created[0]["model_overrides"]["extra_body"]
+    assert body["enable_thinking"] is False and body["user"].startswith("dr-") and len(body["user"]) <= 64
 
 
 @pytest.mark.asyncio

@@ -22,7 +22,13 @@ import type {
   SettingsView,
 } from "@/core/deepresearch/types";
 
-import { LongTextField, NumberField, SelectField, TextField } from "./fields";
+import {
+  FieldScope,
+  LongTextField,
+  NumberField,
+  SelectField,
+  TextField,
+} from "./fields";
 
 function RoleCard({
   name,
@@ -55,190 +61,204 @@ function RoleCard({
     })),
   ];
   return (
-    <section
-      className="space-y-4 rounded-xl border p-4"
-      aria-label={`研究角色 ${ROLE_TITLES[name] ?? firstText(role.name, name)}`}
+    <FieldScope.Provider
+      value={`角色 ${ROLE_TITLES[name] ?? firstText(role.name, name)}`}
     >
-      <header className="flex flex-wrap items-center gap-2">
-        <h3 className="font-medium">
-          {ROLE_TITLES[name] ?? firstText(role.name, name)}
-        </h3>
-        <code className="text-muted-foreground text-xs">{name}</code>
-        {fixed ? (
-          <Badge variant="secondary">固定角色</Badge>
-        ) : (
-          <Badge variant="outline">研究员</Badge>
-        )}
-        {role.agent && (
-          <Badge variant="outline">绑定 DeerFlow 子 Agent：{role.agent}</Badge>
-        )}
-        <div className="ml-auto flex items-center gap-3">
-          {!fixed && (
-            <label className="flex items-center gap-2 text-xs">
-              启用
-              <Switch
-                checked={role.enabled !== false}
+      <section
+        className="space-y-4 rounded-xl border p-4"
+        aria-label={`研究角色 ${ROLE_TITLES[name] ?? firstText(role.name, name)}`}
+      >
+        <header className="flex flex-wrap items-center gap-2">
+          <h3 className="font-medium">
+            {ROLE_TITLES[name] ?? firstText(role.name, name)}
+          </h3>
+          <code className="text-muted-foreground text-xs">{name}</code>
+          {fixed ? (
+            <Badge variant="secondary">固定角色</Badge>
+          ) : (
+            <Badge variant="outline">研究员</Badge>
+          )}
+          {role.agent && (
+            <Badge variant="outline">
+              绑定 DeerFlow 子 Agent：{role.agent}
+            </Badge>
+          )}
+          <div className="ml-auto flex items-center gap-3">
+            {!fixed && (
+              <label className="flex items-center gap-2 text-xs">
+                启用
+                <Switch
+                  checked={role.enabled !== false}
+                  disabled={disabled}
+                  onCheckedChange={(value) =>
+                    update((target) => (target.enabled = value))
+                  }
+                  aria-label={`启用 ${firstText(role.name, name)}`}
+                />
+              </label>
+            )}
+            {!fixed && (
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                aria-label={`删除角色 ${firstText(role.name, name)}`}
                 disabled={disabled}
-                onCheckedChange={(value) =>
-                  update((target) => (target.enabled = value))
+                onClick={() =>
+                  onChange(edit(draft, (next) => delete next.skills[name]))
                 }
-                aria-label={`启用 ${firstText(role.name, name)}`}
-              />
-            </label>
-          )}
-          {!fixed && (
+              >
+                <Trash2 className="size-4" />
+              </Button>
+            )}
+          </div>
+        </header>
+        {role.agent && (
+          <div className="flex items-center gap-2 rounded-lg border border-amber-500/40 bg-amber-500/5 p-2 text-xs">
+            这个角色来自旧配置，基础提示词、工具和模型取自 DeerFlow 子 Agent “
+            {role.agent}”。
             <Button
-              variant="ghost"
-              size="icon-sm"
-              aria-label={`删除角色 ${firstText(role.name, name)}`}
+              variant="outline"
+              size="sm"
+              className="ml-auto h-7"
               disabled={disabled}
-              onClick={() =>
-                onChange(edit(draft, (next) => delete next.skills[name]))
-              }
+              onClick={() => update((target) => (target.agent = null))}
             >
-              <Trash2 className="size-4" />
+              改为独立角色
             </Button>
-          )}
-        </div>
-      </header>
-      {role.agent && (
-        <div className="flex items-center gap-2 rounded-lg border border-amber-500/40 bg-amber-500/5 p-2 text-xs">
-          这个角色来自旧配置，基础提示词、工具和模型取自 DeerFlow 子 Agent “
-          {role.agent}”。
-          <Button
-            variant="outline"
-            size="sm"
-            className="ml-auto h-7"
-            disabled={disabled}
-            onClick={() => update((target) => (target.agent = null))}
-          >
-            改为独立角色
-          </Button>
-        </div>
-      )}
-      <div className="grid gap-4 md:grid-cols-2">
-        {!fixed && (
-          <TextField
-            label="显示名称"
-            value={role.name}
-            disabled={disabled}
-            onChange={(value) => update((target) => (target.name = value))}
-          />
-        )}
-        <SelectField
-          label="模型"
-          value={role.model ?? "__default"}
-          options={models}
-          disabled={disabled}
-          onChange={(value) =>
-            update(
-              (target) => (target.model = value === "__default" ? null : value),
-            )
-          }
-        />
-        <TextField
-          label="角色说明"
-          className="md:col-span-2"
-          hint={
-            fixed
-              ? "描述这个固定角色的职责"
-              : "规划模型根据这段说明决定把哪些研究单元分给这个角色"
-          }
-          value={role.description}
-          disabled={disabled}
-          onChange={(value) => update((target) => (target.description = value))}
-        />
-        <NumberField
-          label="单次执行超时（秒）"
-          value={role.timeout_seconds}
-          min={5}
-          max={1800}
-          disabled={disabled}
-          onChange={(value) =>
-            update((target) => (target.timeout_seconds = value ?? 600))
-          }
-        />
-        <NumberField
-          label="最大步数（max_turns）"
-          hint="引擎图递归步数，含中间件节点；留空使用引擎默认"
-          value={role.max_turns}
-          min={1}
-          max={1000}
-          nullable
-          disabled={disabled}
-          onChange={(value) => update((target) => (target.max_turns = value))}
-        />
-      </div>
-      <LongTextField
-        label="角色系统提示"
-        hint="放在系统提示最前面，定义角色身份与边界"
-        value={role.system_prompt}
-        minRows={3}
-        disabled={disabled}
-        onChange={(value) => update((target) => (target.system_prompt = value))}
-      />
-      <LongTextField
-        label="方法论（Skill）"
-        hint="注入系统提示的研究方法、步骤与输出要求。保存后以内联文本保存，不再读取 Skill 文件"
-        value={role.methodology}
-        minRows={8}
-        disabled={disabled}
-        onChange={(value) => update((target) => (target.methodology = value))}
-      />
-      <div className="space-y-2">
-        <div className="flex flex-wrap items-center gap-3 text-sm">
-          <span className="font-medium">可用工具</span>
-          <label className="flex items-center gap-1.5 text-xs">
-            <input
-              type="radio"
-              name={`tools-${name}`}
-              checked={!restricted}
-              disabled={disabled}
-              onChange={() => update((target) => (target.tools = null))}
-            />
-            {fixed ? "不使用工具（推荐）" : "全部数据源与默认引擎工具"}
-          </label>
-          <label className="flex items-center gap-1.5 text-xs">
-            <input
-              type="radio"
-              name={`tools-${name}`}
-              checked={restricted}
-              disabled={disabled}
-              onChange={() => update((target) => (target.tools = []))}
-            />
-            只允许下面选中的工具
-          </label>
-        </div>
-        {restricted && (
-          <div className="flex flex-wrap gap-2">
-            {choices.map((choice) => {
-              const checked = role.tools?.includes(choice.name) ?? false;
-              return (
-                <label
-                  key={choice.name}
-                  className="flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs"
-                >
-                  <input
-                    type="checkbox"
-                    checked={checked}
-                    disabled={disabled}
-                    onChange={() =>
-                      update((target) => {
-                        const tools = new Set(target.tools ?? []);
-                        if (checked) tools.delete(choice.name);
-                        else tools.add(choice.name);
-                        target.tools = [...tools];
-                      })
-                    }
-                  />
-                  {choice.label}
-                </label>
-              );
-            })}
           </div>
         )}
-      </div>
-    </section>
+        <div className="grid gap-4 md:grid-cols-2">
+          {!fixed && (
+            <TextField
+              label="显示名称"
+              value={role.name}
+              disabled={disabled}
+              onChange={(value) => update((target) => (target.name = value))}
+            />
+          )}
+          <SelectField
+            label="模型"
+            value={role.model ?? "__default"}
+            options={models}
+            disabled={disabled}
+            onChange={(value) =>
+              update(
+                (target) =>
+                  (target.model = value === "__default" ? null : value),
+              )
+            }
+          />
+          <TextField
+            label="角色说明"
+            className="md:col-span-2"
+            hint={
+              fixed
+                ? "描述这个固定角色的职责"
+                : "规划模型根据这段说明决定把哪些研究单元分给这个角色"
+            }
+            value={role.description}
+            disabled={disabled}
+            onChange={(value) =>
+              update((target) => (target.description = value))
+            }
+          />
+          <NumberField
+            label="单次执行超时（秒）"
+            hint="5–14400；一个研究步骤要读很多页面，本地或较慢的模型需要更长时间。节点可以在“节点调参”里单独设置"
+            value={role.timeout_seconds}
+            min={5}
+            max={14400}
+            step={1}
+            disabled={disabled}
+            onChange={(value) =>
+              update((target) => (target.timeout_seconds = value ?? 600))
+            }
+          />
+          <NumberField
+            label="最大步数（max_turns）"
+            hint="引擎图递归步数，含中间件节点；留空使用引擎默认"
+            value={role.max_turns}
+            min={1}
+            max={1000}
+            step={1}
+            nullable
+            disabled={disabled}
+            onChange={(value) => update((target) => (target.max_turns = value))}
+          />
+        </div>
+        <LongTextField
+          label="角色系统提示"
+          hint="放在系统提示最前面，定义角色身份与边界"
+          value={role.system_prompt}
+          minRows={3}
+          disabled={disabled}
+          onChange={(value) =>
+            update((target) => (target.system_prompt = value))
+          }
+        />
+        <LongTextField
+          label="方法论（Skill）"
+          hint="注入系统提示的研究方法、步骤与输出要求。保存后以内联文本保存，不再读取 Skill 文件"
+          value={role.methodology}
+          minRows={8}
+          disabled={disabled}
+          onChange={(value) => update((target) => (target.methodology = value))}
+        />
+        <div className="space-y-2">
+          <div className="flex flex-wrap items-center gap-3 text-sm">
+            <span className="font-medium">可用工具</span>
+            <label className="flex items-center gap-1.5 text-xs">
+              <input
+                type="radio"
+                name={`tools-${name}`}
+                checked={!restricted}
+                disabled={disabled}
+                onChange={() => update((target) => (target.tools = null))}
+              />
+              {fixed ? "不使用工具（推荐）" : "全部数据源与默认引擎工具"}
+            </label>
+            <label className="flex items-center gap-1.5 text-xs">
+              <input
+                type="radio"
+                name={`tools-${name}`}
+                checked={restricted}
+                disabled={disabled}
+                onChange={() => update((target) => (target.tools = []))}
+              />
+              只允许下面选中的工具
+            </label>
+          </div>
+          {restricted && (
+            <div className="flex flex-wrap gap-2">
+              {choices.map((choice) => {
+                const checked = role.tools?.includes(choice.name) ?? false;
+                return (
+                  <label
+                    key={choice.name}
+                    className="flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      disabled={disabled}
+                      onChange={() =>
+                        update((target) => {
+                          const tools = new Set(target.tools ?? []);
+                          if (checked) tools.delete(choice.name);
+                          else tools.add(choice.name);
+                          target.tools = [...tools];
+                        })
+                      }
+                    />
+                    {choice.label}
+                  </label>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </section>
+    </FieldScope.Provider>
   );
 }
 

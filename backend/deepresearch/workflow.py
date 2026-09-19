@@ -15,9 +15,10 @@ from . import activity
 from . import report as documents
 from .config import active_settings
 from .contracts import FollowupResult, ResearchError, ResearchPlan, ResearchRequest, ResearchResult, ResearchUnit, utcnow
-from .evidence import digest, merge_results
-from .report_policy import eligible_evidence
+from .evidence import digest, merge_results, valid_result
+from .report_policy import eligible_evidence, source_roles
 from .secrets import trace_secrets
+from .store import research_spent, research_time_spent
 from .trace import LocalTrace, metric_scope
 from .validators import research_gaps, supplemental_units
 
@@ -40,6 +41,11 @@ FATAL_UNIT_ERRORS = {
     "DEPENDENCY_EVIDENCE",
     "UNIT_MISMATCH",
 }
+
+
+# A step that could not start because research has no tokens or no time left.
+# The run is winding down, not broken: what was gathered still becomes a report.
+WIND_DOWN_ERRORS = {"RESEARCH_BUDGET_SPENT", "RESEARCH_TIME_SPENT"}
 
 
 class ResearchState(TypedDict, total=False):
@@ -263,7 +269,13 @@ def build_workflow(settings, store, runner, checkpointer):
                     return isinstance(error, ResearchError) and error.code in FATAL_UNIT_ERRORS
 
                 fatal = next((error for error in errors if fatal_error(error)), None)
-                if fatal is not None or len(failures) == len(ready):
+                # Losing every step to a spent research budget is a wind-down,
+                # not a broken run: earlier evidence still becomes a report.
+                spent = all(isinstance(error, ResearchError) and error.code in WIND_DOWN_ERRORS for error in errors)
+                # A whole batch timing out in a later round must not discard the
+                # findings earlier steps already committed.
+                gathered = any(result.get("findings") for result in results.values())
+                if fatal is not None or (len(failures) == len(ready) and not spent and not gathered):
                     # All successful siblings are already durable; retry dispatch reuses them.
                     raise fatal or errors[0]
                 cycle = run.get("cycle", 0)
@@ -286,7 +298,20 @@ def build_workflow(settings, store, runner, checkpointer):
         return {"results": [results[u.id] for u in units], "status": "RESEARCHING"}
 
     async def merge(s):
-        results = [ResearchResult.model_validate(r) for r in s["results"]]
+        results = []
+        for body in s["results"]:
+            result, dropped = valid_result(body)
+            results.append(result)
+            if dropped:
+                # A record the contract cannot keep (an unusable locator, empty
+                # text, a field a later rule bounds) must not discard a whole
+                # completed research step.
+                await store.event(
+                    s["run"]["run_id"],
+                    "research.evidence.dropped",
+                    {"unit_id": result.unit_id, "count": len(dropped), "records": dropped[:20], "cycle": s["run"].get("cycle", 0)},
+                    key=f"evidence-dropped-{s['run'].get('cycle', 0)}-{result.unit_id}",
+                )
         pool, findings, lineage = await asyncio.to_thread(merge_results, results, s.get("evidence_pool"))
         await store.save_pool(s["run"]["run_id"], pool, [])
         await store.patch(s["run"]["run_id"], evidence_count=len(pool))
@@ -308,12 +333,37 @@ def build_workflow(settings, store, runner, checkpointer):
             await store.patch(run_id, limitations=known_limits)
             await stage(s, "RESEARCH_COMPLETE", "validator.passed")
             return {"gaps": [], "limitations": known_limits, "status": "RESEARCH_COMPLETE"}
-        exhausted = s.get("iteration", 0) >= s["run"]["budget"]["max_iterations"] or len(s["units"]) >= s["run"]["budget"]["max_units"]
+        current_run = await store.get(run_id) or s["run"]
+        # Only the gap kinds the deployment wants to chase start another round
+        # (supplement_gap_codes); the others go straight into the limitations.
+        actionable = [gap for gap in gaps if gap["code"] in settings.supplement_gap_codes]
+        exhausted = (
+            not actionable
+            or s.get("iteration", 0) >= s["run"]["budget"]["max_iterations"]
+            or len(s["units"]) >= s["run"]["budget"]["max_units"]
+            # Supplementing on a spent research budget only repeats the failure.
+            or research_spent(current_run)
+            # Time is a budget too: keep what is left for writing the report.
+            or research_time_spent(current_run, settings)
+        )
         signature = digest([(g["unit_id"], g["code"]) for g in gaps])
-        saturated = signature == s.get("previous_gap_signature") and len(pool) <= s.get("previous_pool_size", -1)
+        # What the report can actually stand on: citable evidence that a finding
+        # refers to. The pool also holds discovery links and uncited records; it
+        # keeps growing while research goes nowhere, and a pool with citable
+        # evidence that no finding uses cannot be written up either (that case
+        # used to supplement to the limit, write the report twice and then fail
+        # final validation).
+        cited = {eid for finding in s["findings"] for eid in finding["evidence_ids"] if eid in eligible}
+        saturated = signature == s.get("previous_gap_signature") and len(cited) <= s.get("previous_pool_size", -1)
         if exhausted or saturated:
-            if not eligible:
-                raise ResearchError("NO_EVIDENCE", "研究没有取得可引用的原文证据，无法生成报告；请检查搜索与网页读取工具后从检查点重试")
+            if not cited:
+                if research_spent(current_run) and not (current_run.get("usage") or {}).get("tool_calls"):
+                    # A budget smaller than a researcher's first request makes the
+                    # engine remove every tool call: nothing was searched, and the
+                    # tools are not at fault. A retry keeps the budget and the spent
+                    # balance, so it would only fail again.
+                    raise ResearchError("NO_EVIDENCE", "研究步骤还没有开始检索就用完了分到的 Token 预算（工具调用 0 次），与检索工具无关；重试不会改变预算，请调大 max_model_tokens（或不限）后新建研究", recoverable=False)
+                raise ResearchError("NO_EVIDENCE", "研究没有取得任何有可引用证据支持的发现，无法生成报告；请检查检索/读取工具与模型输出后从检查点重试")
             current = await store.get(run_id)
             if not (settings.allow_limited_report or current.get("allow_limited_report", False)):
                 raise ResearchError("RESEARCH_GAPS", "研究仍有缺口且达到补研停止条件；未生成伪完整报告", recoverable=False)
@@ -323,15 +373,16 @@ def build_workflow(settings, store, runner, checkpointer):
             await store.event(run_id, "report.limitations.auto", {"gaps": [g["gap_id"] for g in gaps], "consent": consent}, key=f"limited-{s['run'].get('cycle', 0)}-{signature[:24]}")
             return {"gaps": gaps, "limitations": limitations, "status": "RESEARCH_COMPLETE"}
         await stage(s, "GAP_FOUND", "validator.gap_found", {"gaps": gaps})
-        return {"gaps": gaps, "previous_gap_signature": signature, "previous_pool_size": len(pool), "status": "GAP_FOUND"}
+        return {"gaps": gaps, "previous_gap_signature": signature, "previous_pool_size": len(cited), "status": "GAP_FOUND"}
 
     async def supplement(s):
         iteration = s.get("iteration", 0) + 1
         remaining = s["run"]["budget"]["max_units"] - len(s["units"])
-        extra = supplemental_units(ResearchPlan.model_validate(s["plan"]), s["gaps"], iteration, remaining)
+        chased = [gap for gap in s["gaps"] if gap["code"] in run_settings().supplement_gap_codes]
+        extra = supplemental_units(ResearchPlan.model_validate(s["plan"]), chased, iteration, remaining)
         if not extra:
             raise ResearchError("UNIT_BUDGET", "没有可用的补研单元预算", recoverable=False)
-        deferred = sorted({g["unit_id"] for g in s["gaps"]} - {unit["depends_on"][0] for unit in extra})
+        deferred = sorted({g["unit_id"] for g in chased} - {unit["depends_on"][0] for unit in extra})
         if deferred:
             # Remaining gaps surface again at validation and become stated
             # limitations; the truncation itself is never silent.
@@ -391,7 +442,8 @@ def build_workflow(settings, store, runner, checkpointer):
         settings = run_settings()
         demo = settings.runner == "demo"
         document = draft["document"]
-        citations = documents.citations(mapping, pool)
+        roles = source_roles(settings)
+        citations = documents.citations(mapping, pool, roles)
         timeline = activity.build(current, await store.activity_events(run_id), await store.calls(run_id), activity.tool_roles(settings))
         body = {
             "format": "markdown-v2",
@@ -399,8 +451,8 @@ def build_workflow(settings, store, runner, checkpointer):
             "report": {"title": draft["title"]},
             "document": document,
             "display_markdown": documents.display_markdown(document, mapping),
-            "markdown": documents.export_markdown(document, mapping, pool, lang, demo),
-            "html": documents.html_document(document, mapping, pool, lang, demo),
+            "markdown": documents.export_markdown(document, mapping, pool, lang, demo, roles),
+            "html": documents.html_document(document, mapping, pool, lang, demo, roles),
             "toc": documents.toc(document),
             "citations": citations,
             "citation_map": mapping,

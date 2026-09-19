@@ -133,6 +133,96 @@ def _group(model_calls, tool_calls, key, pricing, order=None):
     return sorted(rows, key=lambda row: (rank.get(row["key"], len(rank)), -row["total_tokens"], row["key"]))
 
 
+# The nodes research settings tune (``nodes:``), in workflow order, plus the
+# engine's context compaction, which runs inside a node's agent loop.
+NODE_ORDER = ["rewrite", "plan", "research", "conversion", "outline", "section", "summary", "revision", "follow_up", "compaction"]
+
+
+def call_node(call):
+    """The tunable node a model call belongs to.
+
+    New records carry ``config_node``. Earlier ones are placed from what they
+    did record (purpose, role and the writer's task id), so old runs compare
+    with new ones.
+    """
+    if "ummariz" in str(call.get("engine_node") or ""):
+        return "compaction"
+    if call.get("config_node"):
+        return call["config_node"]
+    purpose, skill, task = call.get("purpose"), call.get("skill"), str(call.get("unit_id") or "")
+    if purpose in {"rewrite", "conversion"}:
+        return purpose
+    if skill == "report-synthesis":
+        return next((node for prefix, node in (("report-outline", "outline"), ("report-section", "section"), ("report-summary", "summary"), ("report-revision", "revision")) if task.startswith(prefix)), "section")
+    if skill == "deepresearch":
+        return "follow_up" if call.get("phase") == "follow_up" else "plan"
+    return "research" if skill or purpose == "agent" else "unknown"
+
+
+def _prefix_reuse(calls):
+    """Share of the prompt text that repeated the previous request of its thread.
+
+    It is the ceiling of what a provider's prefix cache could have served
+    within agent loops and retries. Read it next to ``cache_read_ratio``: a low
+    ceiling means our requests change early (something rewrites the head of the
+    conversation); a high ceiling with few cached tokens means the provider or
+    gateway is not caching, or sends a conversation to a different replica each
+    turn. Calls recorded before this measure existed carry no prompt size for it.
+    """
+    measured = [call for call in calls if call.get("prompt_chars")]
+    if not any("prefix_chars" in call for call in measured):
+        return None
+    return _ratio(sum(call.get("prefix_chars") or 0 for call in measured), sum(call["prompt_chars"] for call in measured))
+
+
+def _nodes(model_calls, by_type, pricing):
+    """What each tunable node cost and how it behaved: the numbers tuning needs.
+
+    ``truncated`` counts answers cut off by the output cap (raise the node's
+    max_tokens), ``retries`` contract answers that had to be repaired (lower
+    its temperature or choose a model that follows formats), and the latency
+    percentiles show which node a slow model spends its time in.
+    """
+    groups = {}
+    for call in model_calls:
+        group = groups.setdefault(call_node(call), {"calls": [], "models": set()})
+        group["calls"].append(call)
+        if call.get("model"):
+            group["models"].add(call["model"])
+    retries = defaultdict(int)
+    for event in by_type["research.output.retry"]:
+        retries["rewrite" if (event.get("data") or {}).get("contract") == "ResearchRequest" else "conversion"] += 1
+    for event in by_type["report.draft.repair"]:
+        task = str((event.get("data") or {}).get("task") or "")
+        retries["summary" if task.startswith("report-summary") else "revision" if task.startswith("report-revision") else "section"] += 1
+    rows = []
+    for name, group in groups.items():
+        calls = group["calls"]
+        cost = [item[1] for item in (call_cost(call, pricing) for call in calls) if item]
+        outputs = [call["output_tokens"] for call in calls if isinstance(call.get("output_tokens"), int)]
+        rows.append(
+            {
+                "node": name,
+                "models": sorted(group["models"]),
+                "model_calls": len(calls),
+                "model_errors": sum(call.get("status") not in {"ok", "running"} for call in calls),
+                "unreported_usage": sum(call.get("status") == "ok" and call.get("usage_reported") is False for call in calls),
+                **{field: sum(call.get(field) or 0 for call in calls) for field in TOKEN_FIELDS},
+                "max_input_tokens": max((call.get("input_tokens") or 0 for call in calls), default=0) or None,
+                "avg_output_tokens": round(sum(outputs) / len(outputs)) if outputs else None,
+                "truncated": sum(call.get("finish_reason") == "length" for call in calls),
+                "retries": retries.get(name, 0),
+                "model_ms": sum(call.get("duration_ms") or 0 for call in calls),
+                "latency_ms": percentiles(call.get("duration_ms") for call in calls if call.get("status") == "ok"),
+                "cost": _round(sum(cost), 6) if cost else None,
+                "cache_read_ratio": _ratio(sum(call.get("cache_read_tokens") or 0 for call in calls), sum(call.get("input_tokens") or 0 for call in calls)),
+                "prefix_reuse_ratio": _prefix_reuse(calls),
+            }
+        )
+    rank = {name: index for index, name in enumerate(NODE_ORDER)}
+    return sorted(rows, key=lambda row: (rank.get(row["node"], len(rank)), row["node"]))
+
+
 def _max_parallel(runs):
     edges = []
     for run in runs:
@@ -203,7 +293,14 @@ def summarize(run, *, model_calls=(), tool_calls=(), agent_runs=(), events=(), s
         unreported_calls=len(unreported),
         estimated_unreported=sum(call.get("estimated_tokens") or 0 for call in unreported),
         cache_read_ratio=_ratio(tokens["cache_read"], tokens["input"]),
+        prefix_reuse_ratio=_prefix_reuse(model_calls),
     )
+    finished = [call for call in model_calls if call.get("status") != "running"]
+    if finished and len(unreported) == len(finished):
+        # No call reported usage (a server without usage, or a gateway that drops
+        # stream_options): the totals are unknown, not zero. Ratios built on
+        # them follow; estimated_unreported keeps the ledger's estimate.
+        tokens.update(dict.fromkeys([field.removesuffix("_tokens") for field in TOKEN_FIELDS]), cache_read_ratio=None)
     cost = _cost_totals(model_calls, pricing)
     model_summary = {
         "count": len(model_calls),
@@ -264,18 +361,18 @@ def summarize(run, *, model_calls=(), tool_calls=(), agent_runs=(), events=(), s
         for attempt in call.get("attempts") or []:
             entry = per_provider[(call.get("tool_name") or "tool", attempt.get("provider") or "provider")]
             entry["type"] = entry["type"] or attempt.get("type")
-            status = attempt.get("status")
-            if status == "skipped":
+            outcome = attempt.get("status")
+            if outcome == "skipped":
                 entry["skipped"] += 1
                 entry["error_kinds"][attempt.get("kind") or "cooldown"] += 1
-            elif status == "cache":
+            elif outcome == "cache":
                 entry["cached"] += 1
             else:
                 entry["attempts"] += 1
                 entry["durations"].append(attempt.get("ms"))
-                if status == "ok":
+                if outcome == "ok":
                     entry["answered"] += 1
-                elif status == "empty":
+                elif outcome == "empty":
                     entry["empty"] += 1
                 else:
                     entry["errors"] += 1
@@ -287,7 +384,9 @@ def summarize(run, *, model_calls=(), tool_calls=(), agent_runs=(), events=(), s
         "error_types": dict(error_types.most_common()),
         "latency_ms": percentiles(call.get("duration_ms") for call in tool_calls),
         "output_chars": sum(call.get("output_chars") or 0 for call in tool_calls),
-        "searches": sum(call.get("role") == "search" for call in tool_calls),
+        "searches": sum(call.get("role") in {"search", "data"} and not call.get("budget_stop") for call in tool_calls),
+        # Calls a source tool refused because an allowance was used up.
+        "budget_stops": sum(bool(call.get("budget_stop")) for call in tool_calls),
         "reads": len(reads),
         "read_errors": sum(call.get("status") == "error" for call in reads),
         "pages_read": len(pages_read),
@@ -412,9 +511,11 @@ def summarize(run, *, model_calls=(), tool_calls=(), agent_runs=(), events=(), s
         evidence_by_unit[result.get("unit_id") or str(item.get("id", "")).rpartition(":")[2]] += len(result.get("raw_evidences") or [])
     for item in citations:
         cited_by_unit.update(set(item.get("unit_ids") or []))
+    # Units whose model calls reported usage at all; for the others tokens are unknown, not zero.
+    reported_units = {call.get("unit_id") for call in model_calls if call.get("usage_reported")}
     pages_by_unit, seconds_by_unit = defaultdict(set), defaultdict(float)
     for call in tool_calls:
-        searches_by_unit[call.get("unit_id")] += call.get("role") == "search"
+        searches_by_unit[call.get("unit_id")] += call.get("role") in {"search", "data"} and not call.get("budget_stop")
         if call.get("role") == "read" and call.get("status") == "success":
             pages_by_unit[call.get("unit_id")].add(call.get("url") or call["id"])
     for agent in agent_runs:
@@ -432,14 +533,14 @@ def summarize(run, *, model_calls=(), tool_calls=(), agent_runs=(), events=(), s
                 "failed": unit_id in failures,
                 "seconds": _round(seconds_by_unit.get(unit_id)) if metered else None,
                 "model_calls": usage.get("model_calls", 0) if metered else None,
-                "total_tokens": usage.get("total_tokens", 0) if metered else None,
+                "total_tokens": usage.get("total_tokens", 0) if metered and unit_id in reported_units else None,
                 "cost": usage.get("cost"),
                 "tool_calls": usage.get("tool_calls", 0),
                 "searches": searches_by_unit[unit_id],
                 "pages_read": len(pages_by_unit[unit_id]),
                 "evidence": evidence_by_unit[unit_id],
                 "citations": cited_by_unit[unit_id],
-                "tokens_per_citation": _ratio(usage.get("total_tokens", 0), cited_by_unit[unit_id], 0) if metered else None,
+                "tokens_per_citation": _ratio(usage.get("total_tokens", 0), cited_by_unit[unit_id], 0) if metered and unit_id in reported_units else None,
             }
         )
 
@@ -452,7 +553,10 @@ def summarize(run, *, model_calls=(), tool_calls=(), agent_runs=(), events=(), s
         "tool_calls_used": _ratio(usage.get("tool_calls"), limits.get("max_tool_calls")),
         "max_elapsed_seconds": limits.get("max_elapsed_seconds"),
         # usage.elapsed_seconds is settled when a drive ends; a live run also has its open span.
-        "elapsed_used": _ratio(max(usage.get("elapsed_seconds") or 0, active), limits.get("max_elapsed_seconds")),
+        "elapsed_used": _ratio(max(usage.get("elapsed_seconds") or 0, active) if not run.get("usage_history") else usage.get("elapsed_seconds") or 0, limits.get("max_elapsed_seconds")),
+        # Budgets are per task: a follow-up after the report starts a new one.
+        # These are the tasks already closed in this conversation.
+        "earlier_tasks": [{key: item.get(key) for key in ("cycle", "closed_at", "model_tokens", "tool_calls", "elapsed_seconds")} for item in run.get("usage_history") or []],
     }
 
     conversion_tokens = sum(call.get("total_tokens") or 0 for call in model_calls if call.get("purpose") == "conversion")
@@ -495,6 +599,7 @@ def summarize(run, *, model_calls=(), tool_calls=(), agent_runs=(), events=(), s
         "cache": {"hits": sum(cache.values()), "by_kind": dict(cache)},
         "efficiency": efficiency,
         "breakdown": {
+            "by_node": _nodes(model_calls, by_type, pricing),
             "by_phase": _group(model_calls, tool_calls, "phase", pricing, order),
             "by_purpose": _group(model_calls, [], "purpose", pricing),
             "by_skill": _group(model_calls, tool_calls, "skill", pricing),
@@ -548,6 +653,7 @@ TABLE_COLUMNS = [
     ("input_k", lambda s: _ratio(s["tokens"]["input"], 1000, 1)),
     ("output_k", lambda s: _ratio(s["tokens"]["output"], 1000, 1)),
     ("cache_%", lambda s: _percent(s["tokens"]["cache_read_ratio"])),
+    ("prefix_%", lambda s: _percent(s["tokens"].get("prefix_reuse_ratio"))),
     ("cost", lambda s: s["cost"]["total"]),
     ("currency", lambda s: s["cost"]["currency"]),
     ("tool_calls", lambda s: s["tools"]["count"]),

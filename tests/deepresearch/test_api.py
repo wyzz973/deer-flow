@@ -39,7 +39,11 @@ async def test_owner_authorization_and_demo_origin(settings, monkeypatch):
         assert not retry_calls
         assert (await client.post("/api/deepresearch/private-run/retry", json={"allow_limited_report": True}, headers={"x-test-user": "alice"})).status_code == 202
         assert retry_calls == [("private-run", True)]
+        assert response.json()["last_event_seq"] == 0
         await service.store.event("private-run", "trace.started", {"span_id": "s", "name": "private"})
+        # The snapshot names the newest event, so a page opened on a running
+        # research streams from there instead of replaying everything.
+        assert (await client.get("/api/deepresearch/private-run", headers={"x-test-user": "alice"})).json()["last_event_seq"] == 1
         assert (await client.get("/api/deepresearch/private-run/trace", headers={"x-test-user": "bob"})).status_code == 404
         assert (await client.get("/api/deepresearch/private-run/trace/export", headers={"x-test-user": "bob"})).status_code == 404
         trace = await client.get("/api/deepresearch/private-run/trace", headers={"x-test-user": "alice"})

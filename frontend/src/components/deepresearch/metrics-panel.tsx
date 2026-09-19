@@ -11,9 +11,11 @@ import {
   formatDuration,
   formatPercent,
   formatTokens,
+  nodeLabel,
   phaseLabel,
 } from "@/core/deepresearch/presentation";
 import type { ResearchMetrics } from "@/core/deepresearch/types";
+import { cn } from "@/lib/utils";
 
 type MetricsApi = Pick<
   ReturnType<typeof researchApi>,
@@ -53,6 +55,25 @@ function Failures(props: { count: number; causes: Record<string, number> }) {
         <div className="text-muted-foreground">{causes}</div>
       )}
     </div>
+  );
+}
+
+/** A count that signals a tuning problem whenever it is above zero. */
+function Flag(props: { value: number; tone?: "warn" | "error" }) {
+  const raised = props.value > 0;
+  return (
+    <span
+      data-flagged={raised || undefined}
+      className={cn(
+        raised && "rounded px-1 py-0.5 font-medium",
+        raised &&
+          (props.tone === "error"
+            ? "bg-destructive/10 text-destructive"
+            : "bg-amber-500/15 text-amber-700 dark:text-amber-300"),
+      )}
+    >
+      {props.value}
+    </span>
   );
 }
 
@@ -262,6 +283,10 @@ function Efficiency({ metrics }: { metrics: ResearchMetrics }) {
         : `${metrics.tools.repeat_calls} 次（${formatPercent(value.repeat_tool_call_ratio)}）· 同一 Agent ${metrics.tools.repeat_calls_same_agent}`,
     ],
     ["输入 Token 缓存命中", formatPercent(value.cache_read_ratio)],
+    [
+      "可复用前缀（缓存命中上限）",
+      formatPercent(metrics.tokens.prefix_reuse_ratio),
+    ],
     ["格式转换 Token 占比", formatPercent(value.conversion_token_share)],
     ["失败子 Agent Token 占比", formatPercent(value.failed_agent_token_share)],
     ["缓存复用", `${metrics.cache.hits} 次`],
@@ -283,6 +308,100 @@ function Efficiency({ metrics }: { metrics: ResearchMetrics }) {
         </div>
       ))}
     </dl>
+  );
+}
+
+/** Model work per graph node: where output is cut off or fails validation. */
+function Nodes({ metrics }: { metrics: ResearchMetrics }) {
+  const currency = metrics.cost.currency;
+  return (
+    <>
+      <Table
+        head={[
+          "节点",
+          "模型",
+          "调用",
+          "错误",
+          "Token",
+          "缓存命中 / 可复用",
+          "平均输出",
+          "被截断",
+          "格式重试",
+          "P50 / P95 延迟",
+          "耗时",
+          "费用",
+        ]}
+        rows={(metrics.breakdown.by_node ?? []).map((node) => [
+          <span key="node" className="whitespace-nowrap">
+            {nodeLabel(node.node)}
+          </span>,
+          node.models.length ? node.models.join("、") : "—",
+          node.model_calls,
+          <Flag key="errors" value={node.model_errors} tone="error" />,
+          <div
+            key="tokens"
+            title={`输入 ${formatTokens(node.input_tokens)} · 输出 ${formatTokens(node.output_tokens)} · 缓存命中 ${formatTokens(node.cache_read_tokens)} · 最大上下文 ${formatTokens(node.max_input_tokens)}`}
+          >
+            <div>{formatTokens(node.total_tokens)}</div>
+            {node.unreported_usage > 0 && (
+              <div className="text-muted-foreground whitespace-nowrap">
+                {node.unreported_usage} 次未上报用量
+              </div>
+            )}
+          </div>,
+          <span
+            key="cache"
+            className="whitespace-nowrap"
+            title="缓存命中：提供方上报的已缓存输入占比。可复用：同一会话里与上一次请求从头相同的提示词占比，是前缀缓存能命中的上限；它低说明请求开头被改写，它高而命中低说明模型服务没有缓存或没有会话粘性。"
+          >
+            {formatPercent(node.cache_read_ratio)} /{" "}
+            {formatPercent(node.prefix_reuse_ratio)}
+          </span>,
+          formatTokens(node.avg_output_tokens),
+          <Flag key="truncated" value={node.truncated} />,
+          <Flag key="retries" value={node.retries} />,
+          <span key="latency" className="whitespace-nowrap">
+            {milliseconds(node.latency_ms.p50)} /{" "}
+            {milliseconds(node.latency_ms.p95)}
+          </span>,
+          milliseconds(node.model_ms),
+          formatCost(node.cost, currency),
+        ])}
+      />
+      <p className="text-muted-foreground text-[11px] leading-4">
+        被截断：输出碰到上限，调大该节点
+        max_tokens；格式重试：JSON/引用未通过校验，降低该节点温度或换模型
+      </p>
+    </>
+  );
+}
+
+/** Tasks that already ended in this conversation. Budgets are per task. */
+function EarlierTasks({ metrics }: { metrics: ResearchMetrics }) {
+  return (
+    <>
+      <Table
+        head={["任务", "结束时间", "Token", "工具调用", "用时"]}
+        rows={(metrics.budget.earlier_tasks ?? []).map((task) => [
+          task.cycle == null ? "—" : `第 ${task.cycle + 1} 个`,
+          task.closed_at
+            ? new Date(task.closed_at).toLocaleString("zh-CN", {
+                month: "2-digit",
+                day: "2-digit",
+                hour: "2-digit",
+                minute: "2-digit",
+                hour12: false,
+              })
+            : "—",
+          formatTokens(task.model_tokens),
+          task.tool_calls ?? "—",
+          measuredSeconds(task.elapsed_seconds),
+        ])}
+      />
+      <p className="text-muted-foreground text-[11px] leading-4">
+        预算按任务计：报告完成后的追问会开启新预算，上方“预算使用”只统计当前任务。
+      </p>
+    </>
   );
 }
 
@@ -331,9 +450,19 @@ export function ResearchMetricsPanel({
       <Section title="各阶段耗时与 Token">
         <Phases metrics={metrics} />
       </Section>
+      {(metrics.breakdown.by_node?.length ?? 0) > 0 && (
+        <Section title="按节点">
+          <Nodes metrics={metrics} />
+        </Section>
+      )}
       <Section title="效率">
         <Efficiency metrics={metrics} />
       </Section>
+      {(metrics.budget.earlier_tasks?.length ?? 0) > 0 && (
+        <Section title="此前任务用量">
+          <EarlierTasks metrics={metrics} />
+        </Section>
+      )}
       {metrics.units.length > 0 && (
         <Section title="研究单元产出">
           <Table
@@ -374,8 +503,9 @@ export function ResearchMetricsPanel({
               <div className="text-muted-foreground">{run.unit_id}</div>
             </div>,
             `${STATUS[run.status] ?? run.status}${run.error_code ? ` · ${run.error_code}` : ""}`,
-            seconds(run.seconds),
-            `${run.model_calls ?? 0} / ${run.tool_calls ?? 0}`,
+            measuredSeconds(run.seconds),
+            // Unmetered is unknown, not zero.
+            `${run.model_calls ?? "—"} / ${run.tool_calls ?? "—"}`,
             formatTokens(run.total_tokens),
             formatCost(run.cost, currency),
           ])}

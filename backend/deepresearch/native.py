@@ -15,11 +15,12 @@ from uuid import uuid4
 from .config import ENGINE_TOOLS, FIXED_ROLES
 from .contracts import ResearchError, utcnow
 from .evidence import digest
-from .models import compaction_config, engine_config, model_for, private_config
-from .observations import NativeExecution
+from .models import compaction_config, engine_config, model_for, node_output_cap, node_overrides, private_config, session_overrides, with_node
+from .observations import NativeExecution, derived_receipts
 from .prompts import PromptSet
 from .secrets import trace_secrets
-from .trace import METRIC_KEYS, LocalTrace, metric_scope, model_callbacks, redact
+from .store import RESEARCH_TURN_OUTPUT, research_tokens_left
+from .trace import METRIC_KEYS, LocalTrace, metric_scope, model_callbacks, redact, redact_content
 
 
 def native_thread_id(run, skill_name, unit_id):
@@ -30,7 +31,7 @@ def native_thread_id(run, skill_name, unit_id):
     return validate_thread_id("dr-" + digest(identity)[:48])
 
 
-def model_budget_config(app_config, role, max_output_tokens, *, run=None, researcher=False, settings=None):
+def model_budget_config(app_config, role, max_output_tokens, *, run=None, researcher=False, settings=None, concurrency=None, overrides=None, session=None):
     """Apply the research output ceiling and compaction policy to a private config.
 
     The native executor still creates the provider through its normal factory.
@@ -53,39 +54,52 @@ def model_budget_config(app_config, role, max_output_tokens, *, run=None, resear
             limit = min(limit, disabled[key])
         disabled[key] = limit
         updates["when_thinking_disabled"] = disabled
-    bounded = profile.model_copy(update=updates)
+    # The node's sampling parameters live on the same private profile, so the
+    # engine's own factory applies them and metrics keep the model's real name.
+    bounded = with_node(profile.model_copy(update=updates), overrides, session_overrides(settings, name, session) if settings is not None else None)
     config_updates = {"models": [bounded if item.name == name else item for item in app_config.models]}
     if settings is not None:
         # Research owns when a role's context is compacted and what the summary keeps.
         config_updates["summarization"] = compaction_config(app_config, settings, name)
+        verification = getattr(app_config, "verification", None)
+        if verification is not None and not settings.tool_receipt_ledger:
+            # The engine renders the receipt ledger right after the system
+            # prompt and rewrites it on every turn, which leaves no reusable
+            # prompt prefix in an agent loop. Its switch covers stamping too,
+            # so the receipts evidence refers to are derived from the same
+            # tool messages once the execution ends (derived_receipts).
+            config_updates["verification"] = verification.model_copy(update={"receipts_enabled": False})
     if researcher and run and run.get("budget") and run["budget"].get("max_model_tokens") is not None:
-        # Reuse the native middleware's soft wrap-up warning. The shared run
-        # cap is still enforced separately; a warning is not a per-unit quota.
-        # Reserve room for siblings, conversion, and report synthesis.
+        # A step's share of what research may still spend, enforced by the
+        # native middleware: a warning at half tells the model to wrap up, and
+        # the stop strips tool calls so the step ends with its notes. Without
+        # it the shared ledger refused a turn mid-step and the step failed,
+        # losing everything it had read. The ledger stays the backstop.
         from deerflow.config.subagents_config import SubagentOverrideConfig
 
         compaction = config_updates.get("summarization") or app_config.summarization
         policy = app_config.subagents.get_token_budget_for(role.name, summarization_enabled=getattr(compaction, "enabled", False))
-        if not policy.enabled:
-            return private_config(app_config, **config_updates), name
-        lead_policy = app_config.token_budget
-        total = run["budget"]["max_model_tokens"]
-        remaining = max(0, total - run.get("usage", {}).get("model_tokens", 0))
-        units = max(1, len(run.get("units") or []))
-        ceiling = max(1000, min(total, policy.max_tokens, lead_policy.max_tokens if lead_policy.enabled else total))
-        warning_at = (remaining / (units + 2)) * 0.5
-        settings = {
+        # The run's budget belongs to research, so its share applies even where
+        # the host turned its own backstop off for research roles; host caps
+        # that are on can only tighten it.
+        host = [item for item in (policy, app_config.token_budget) if item.enabled]
+        statuses = run.get("unit_statuses") or {}
+        unfinished = [unit for unit in run.get("units") or [] if statuses.get(unit.get("id") if isinstance(unit, dict) else unit) not in {"COMPLETED", "FAILED"}]
+        sharing = max(1, min(concurrency or len(unfinished), len(unfinished)))
+        # The margin pays for converting the notes into findings.
+        share = max(1000, (research_tokens_left(run) or 0) // sharing - 2 * RESEARCH_TURN_OUTPUT)
+        limits = {
             "enabled": True,
-            "max_tokens": ceiling,
-            "warn_threshold": min(policy.warn_threshold, lead_policy.warn_threshold if lead_policy.enabled else 1.0, warning_at / ceiling),
-            "hard_stop_threshold": min(policy.hard_stop_threshold, lead_policy.hard_stop_threshold if lead_policy.enabled else 1.0),
+            "max_tokens": min([share, *(item.max_tokens for item in host)]),
+            "warn_threshold": min([0.5, *(item.warn_threshold for item in host)]),
+            "hard_stop_threshold": min([1.0, *(item.hard_stop_threshold for item in host)]),
         }
         for field in ("max_input_tokens", "max_output_tokens"):
-            caps = [getattr(item, field) for item in (policy, lead_policy) if item.enabled and getattr(item, field) is not None]
-            settings[field] = min(caps) if caps else None
-        settings["warn_threshold"] = min(settings["warn_threshold"], settings["hard_stop_threshold"])
+            caps = [getattr(item, field) for item in host if getattr(item, field) is not None]
+            limits[field] = min(caps) if caps else None
+        limits["warn_threshold"] = min(limits["warn_threshold"], limits["hard_stop_threshold"])
         override = app_config.subagents.agents.get(role.name) or SubagentOverrideConfig()
-        overrides = {**app_config.subagents.agents, role.name: override.model_copy(update={"token_budget": policy.model_copy(update=settings)})}
+        overrides = {**app_config.subagents.agents, role.name: override.model_copy(update={"token_budget": policy.model_copy(update=limits)})}
         config_updates["subagents"] = app_config.subagents.model_copy(update={"agents": overrides})
     return private_config(app_config, **config_updates), name
 
@@ -109,9 +123,20 @@ def output_instruction(skill_name, payload, prompts=None):
     return prompts.researcher_output.replace("{language}", language)
 
 
-async def execute_role(settings, store, run, skill_name, payload, tools, agent, context, *, task_id=None):
+def node_of(skill_name, payload):
+    """The workflow node an execution belongs to, from its role and task."""
+    if skill_name == "report-synthesis":
+        return {"outline": "outline", "write_section": "section", "write_summary": "summary", "revise_report": "revision"}.get(payload.get("task"), "section")
+    if skill_name == "deepresearch":
+        return "follow_up" if "message" in payload and "research_request" not in payload else "plan"
+    return "research"
+
+
+async def execute_role(settings, store, run, skill_name, payload, tools, agent, context, *, task_id=None, node=None, timeout_seconds=None):
     from deerflow.config import get_app_config
 
+    node = node or node_of(skill_name, payload)
+    tuning = settings.node(node)
     spec = settings.skills[skill_name]
     prompts = settings.prompts
     # The engine configuration with the research models in front of host models.
@@ -153,28 +178,35 @@ async def execute_role(settings, store, run, skill_name, payload, tools, agent, 
             )
         ),
         skills=native_skills,
-        model=model_for(settings, spec, agent) or agent.model,
+        model=model_for(settings, spec, agent, node) or agent.model,
         max_turns=min(spec.max_turns, agent.max_turns) if spec.max_turns is not None else agent.max_turns,
-        timeout_seconds=min(spec.timeout_seconds, agent.timeout_seconds),
+        # The node's timeout replaces the role's; a caller's deadline (what is
+        # left of the run's research time) can only shorten it.
+        timeout_seconds=max(5, min(filter(None, [tuning.timeout_seconds or min(spec.timeout_seconds, agent.timeout_seconds), timeout_seconds]))),
     )
     current_run = await store.get(run["run_id"])
-    app_config, model_name = model_budget_config(
-        app_config,
-        role,
-        settings.max_output_tokens,
-        run=current_run,
-        researcher=skill_name not in {"deepresearch", "report-synthesis"},
-        settings=settings,
-    )
+    output_cap = node_output_cap(settings, node)
     # Parallel writer tasks need distinct native threads; research units keep
     # their unit identity.
     unit_id = task_id or payload.get("unit", {}).get("id", skill_name)
     child_thread = native_thread_id(run, skill_name, unit_id)
+    app_config, model_name = model_budget_config(
+        app_config,
+        role,
+        output_cap,
+        run=current_run,
+        researcher=skill_name not in {"deepresearch", "report-synthesis"},
+        settings=settings,
+        concurrency=settings.max_concurrency,
+        overrides=node_overrides(settings, node),
+        # The native thread is the conversation a gateway may pin to one replica.
+        session=child_thread,
+    )
     trace = LocalTrace(store, run["run_id"], settings, trace_secrets(settings, context))
-    scope = {"cycle": run.get("cycle", 0), **(metric_scope.get() or {}), "unit_id": unit_id, "agent_name": role.name, "skill": skill_name, "purpose": "agent"}
+    scope = {"cycle": run.get("cycle", 0), **(metric_scope.get() or {}), "unit_id": unit_id, "agent_name": role.name, "skill": skill_name, "purpose": "agent", "config_node": node}
     metrics = {"started_at": utcnow(), "started": time.monotonic(), "status": "failed"}
     try:
-        return await _execute(settings, store, run, role, payload, candidates, context, trace, scope, metrics, model_name, child_thread, app_config)
+        return await _execute(settings, store, run, role, payload, candidates, context, trace, scope, metrics, model_name, child_thread, app_config, output_cap)
     except asyncio.CancelledError:
         metrics["status"] = "cancelled"
         raise
@@ -207,7 +239,7 @@ async def _record_agent_run(store, run, scope, metrics, model_name, thread_id):
         logging.getLogger("deepresearch.audit").warning(json.dumps({"event": "agent_metrics_failed", "error": type(exc).__name__}))
 
 
-async def _execute(settings, store, run, role, payload, candidates, context, trace, scope, metrics, model_name, child_thread, app_config):
+async def _execute(settings, store, run, role, payload, candidates, context, trace, scope, metrics, model_name, child_thread, app_config, output_cap=None):
     from deerflow.subagents.executor import (
         SubagentExecutor,
         SubagentStatus,
@@ -218,7 +250,7 @@ async def _execute(settings, store, run, role, payload, candidates, context, tra
 
     unit_id = scope["unit_id"]
     async with trace.span(role.name, "agent", {"unit_id": unit_id, "thread_id": child_thread, "task": payload, "tools": list(candidates)}) as output:
-        callbacks = model_callbacks(trace, metered_tools=list(candidates.values()), model_name=model_name, scope=scope)
+        callbacks = model_callbacks(trace, metered_tools=list(candidates.values()), model_name=model_name, scope=scope, output_cap=output_cap)
         metrics["callbacks"] = callbacks
         executor = SubagentExecutor(
             config=role,
@@ -258,8 +290,7 @@ async def _execute(settings, store, run, role, payload, candidates, context, tra
                 if getattr(result.status, "value", None) == "timed_out":
                     raise ResearchError("NATIVE_AGENT_TIMEOUT", "原生 Agent 执行超时，可从检查点重试")
                 raise ResearchError("NATIVE_AGENT_FAILED", "Native agent failed; inspect the local trace")
-            output.update(execution_id=execution_id, result=result.result, stop_reason=result.stop_reason, tool_receipts=result.snapshot_tool_receipts())
-            metrics.update(status="completed", stop_reason=result.stop_reason, receipts=len(result.snapshot_tool_receipts() or []))
+            output.update(execution_id=execution_id, result=result.result, stop_reason=result.stop_reason)
             # Capture host envelopes only after the native model/tool loop has
             # finished. Redaction/bounding affects archival copies, never the
             # ToolMessage delivered to the researcher.
@@ -268,9 +299,18 @@ async def _execute(settings, store, run, role, payload, candidates, context, tra
                 # Keep only message-envelope fields needed for research
                 # provenance. Provider response metadata may contain headers.
                 safe = {key: message[key] for key in ("type", "id", "name", "tool_call_id", "status", "content", "tool_calls", "additional_kwargs", "artifact") if key in message}
-                for key in ("content", "additional_kwargs", "artifact"):
-                    if key in safe:
-                        safe[key] = redact(safe[key], trace.secrets, 20000)
+                if "content" in safe:
+                    safe["content"] = redact_content(safe["content"], trace.secrets, 20000)
+                if "additional_kwargs" in safe:
+                    safe["additional_kwargs"] = redact(safe["additional_kwargs"], trace.secrets, 20000)
+                if "artifact" in safe:
+                    # Source artifacts carry the records evidence is derived from
+                    # (up to 30 records of 4,000 characters). Past the bound they
+                    # would turn into a preview object and lose every record.
+                    artifact = safe["artifact"]
+                    if isinstance(artifact, dict):
+                        artifact = {key: value for key, value in artifact.items() if key != "raw_preview"}
+                    safe["artifact"] = redact(artifact, trace.secrets, 400000)
                 if "tool_calls" in safe:
                     safe["tool_calls"] = [{**call, "args": redact(call.get("args"), trace.secrets, 20000)} for call in safe["tool_calls"]]
                 messages.append(safe)
@@ -280,7 +320,10 @@ async def _execute(settings, store, run, role, payload, candidates, context, tra
             archived_answer = redact(answer, trace.secrets, max(20000, len(answer) * 8 + 256))
             if not isinstance(archived_answer, str):
                 archived_answer = json.dumps(archived_answer, ensure_ascii=False)
-            return NativeExecution(answer=archived_answer, execution_id=execution_id, messages=messages, receipts=result.snapshot_tool_receipts() or [], stop_reason=result.stop_reason)
+            receipts = result.snapshot_tool_receipts() or derived_receipts(messages)
+            output["tool_receipts"] = receipts
+            metrics.update(status="completed", stop_reason=result.stop_reason, receipts=len(receipts))
+            return NativeExecution(answer=archived_answer, execution_id=execution_id, messages=messages, receipts=receipts, stop_reason=result.stop_reason)
         finally:
             result = get_background_task_result(execution_id)
             if result is not None and not result.status.is_terminal:

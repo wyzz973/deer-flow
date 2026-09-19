@@ -18,14 +18,15 @@ from contextvars import ContextVar
 from logging.handlers import RotatingFileHandler
 from uuid import uuid4
 
-from .audit import audit_request, audit_response, request_summary, response_summary
+from .audit import audit_request, audit_response, request_summary, response_summary, shared_prefix
 from .output import visible_text
+from .store import REPORT_CALL_OUTPUT, RESEARCH_TURN_OUTPUT
 
 _parent: ContextVar[str | None] = ContextVar("research_span", default=None)
 # Workflow phase and cycle for metrics. Callbacks copy it when they are built,
 # because native subagents invoke them on another event loop.
 metric_scope: ContextVar[dict | None] = ContextVar("research_metric_scope", default=None)
-METRIC_KEYS = ("cycle", "phase", "purpose", "skill", "agent_name", "unit_id", "execution_id", "contract")
+METRIC_KEYS = ("cycle", "phase", "config_node", "purpose", "skill", "agent_name", "unit_id", "execution_id", "contract")
 logger = logging.getLogger("deepresearch.audit")
 _sensitive = re.compile(r"authorization|cookie|csrf|password|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|reasoning|thinking", re.I)
 
@@ -65,6 +66,30 @@ def redact(value, secrets=(), max_chars=16000):
     cleaned = clean(value)
     encoded = json.dumps(cleaned, ensure_ascii=False)
     return cleaned if len(encoded) <= max_chars else {"preview": encoded[:max_chars], "truncated": True}
+
+
+def redact_content(content, secrets=(), max_chars=20000):
+    """Redact a message body without changing what kind of value it is.
+
+    ``redact`` answers an over-long value with a ``{"preview", "truncated"}``
+    object, which suits a trace payload. A tool message that later becomes
+    evidence must stay text: the object used to be stringified into the excerpt
+    of every page longer than the limit.
+    """
+    if isinstance(content, str):
+        cleaned = redact(content, secrets, max(len(content) * 8 + 256, max_chars))
+        return cleaned[:max_chars] if isinstance(cleaned, str) else content[:max_chars]
+    if isinstance(content, list):
+        blocks = []
+        for block in content[:200]:
+            if isinstance(block, str):
+                blocks.append(redact_content(block, secrets, max_chars))
+            elif isinstance(block, dict) and isinstance(block.get("text"), str):
+                blocks.append({**block, "text": redact_content(block["text"], secrets, max_chars)})
+            else:
+                blocks.append(redact(block, secrets, max_chars))
+        return blocks
+    return redact(content, secrets, max_chars)
 
 
 def install_log(data_dir):
@@ -170,6 +195,12 @@ def _count(value):
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
+def _fingerprint(message):
+    """Identity of one request message: a change anywhere in it ends the reusable prefix."""
+    body = [getattr(message, "type", None), getattr(message, "content", None), getattr(message, "tool_calls", None) or None, getattr(message, "tool_call_id", None)]
+    return hashlib.sha256(json.dumps(body, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
 def _first(*values):
     return next((value for value in map(_count, values) if value is not None), None)
 
@@ -212,11 +243,11 @@ def tool_detail(role, inputs):
         try:
             inputs = json.loads(inputs)
         except ValueError:
-            inputs = {"query": inputs} if role == "search" else {}
+            inputs = {"query": inputs} if role in {"search", "data"} else {}
     if not isinstance(inputs, dict):
         return {}
-    if role == "search":
-        value = next((inputs[key] for key in ("query", "q", "keywords", "search_query", "question") if isinstance(inputs.get(key), str)), None)
+    if role in {"search", "data"}:
+        value = next((inputs[key] for key in ("query", "q", "keyword", "keywords", "search_query", "question", "text") if isinstance(inputs.get(key), str)), None)
         return {"query": " ".join(value.split())[:300]} if value else {}
     if role == "read":
         value = next((inputs[key] for key in ("url", "uri", "link") if isinstance(inputs.get(key), str)), None)
@@ -253,7 +284,7 @@ def returned_error_type(content):
     return "EmptyContent" if EMPTY_RESULT.search(text) else "ToolReturnedError"
 
 
-def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
+def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None, output_cap=None):
     """Build lazily so demo/API imports need no model SDK installation."""
     from langchain_core.callbacks import AsyncCallbackHandler
 
@@ -266,6 +297,10 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
     for key, value in (metric_scope.get() or {}).items():
         scope.setdefault(key, value)
     roles = {**NATIVE_ROLES, **{source.tool: source.role for source in trace.settings.sources}}
+    # Source tools DeepResearch builds itself account for their own calls and
+    # answer with a stop instruction when the budget runs out (channels.SearchBudget),
+    # so reserving here too would both double-count and reintroduce the fatal error.
+    self_metered = {source.tool for source in trace.settings.sources if source.kind == "channel" or (source.kind == "mcp" and source.server in trace.settings.mcp_servers)}
     # Full request/response audit follows the same content-capture switch.
     audited = trace.settings.trace_capture_content and getattr(trace.settings, "llm_audit", True)
     counters = ("model_calls", "model_errors", "unreported_model_calls", "tool_calls", "tool_errors", "input_tokens", "output_tokens", "total_tokens", "cache_read_tokens", "reasoning_tokens", "max_input_tokens")
@@ -296,6 +331,9 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
         def __init__(self):
             self.active = {}
             self.reservations = {}
+            # Output tokens a research turn did not reserve; charged if the
+            # provider never reports usage, so unknown spend stays conservative.
+            self.shortfall = {}
             self.parent_id = _parent.get()
             self.budget_error = None
             self.provider_error = None
@@ -303,6 +341,9 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
             # Calls of one agent loop share its execution ID; a conversion's
             # bounded retries share this handler instead.
             self.group = "calls-" + uuid4().hex
+            # Message fingerprints of the previous request per engine node (the
+            # agent's model node and the compaction node are separate threads).
+            self.previous = {}
 
         def elapsed_ms(self, run_id):
             entry = self.active.get(str(run_id))
@@ -356,14 +397,29 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
             await self.begin(run_id, name, "model", body)
             self.totals["model_calls"] += 1
             started_at = utcnow()
+            engine_node = (kwargs.get("metadata") or {}).get("langgraph_node")
+            # How much of this request repeats the previous one of the same
+            # thread from its first message on. A provider can only reuse that
+            # prefix, so a low share names our request as the reason for cache
+            # misses, and a high share with few cached tokens names the provider.
+            sent = messages[0] if messages else []
+            marks = [_fingerprint(m) for m in sent]
+            before = self.previous.get(engine_node)
+            self.previous[engine_node] = marks
+            shared = shared_prefix(before, marks) if before is not None else None
             await record_model(
                 str(run_id),
                 {
                     "model": name,
                     "status": "running",
                     "started_at": started_at,
+                    # The engine graph node making the call: the agent's model
+                    # node, or the summarization middleware compacting its context.
+                    **({"engine_node": engine_node} if isinstance(engine_node, str) else {}),
                     "prompt_messages": sum(len(batch) for batch in body),
                     "prompt_chars": sum(len(message["content"] or "") for batch in body for message in batch),
+                    # None on the first request of a thread: nothing precedes it.
+                    **({"prefix_messages": shared, "prefix_chars": sum(len(message["content"] or "") for message in body[0][:shared])} if shared is not None else {}),
                 },
             )
             if audited:
@@ -395,9 +451,23 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
                 # Escaped Unicode gives multilingual text a conservative weight.
                 # No tokenizer download or provider request occurs here.
                 payload = json.dumps({"messages": body, "tools": [t.args for t in metered_tools]}, ensure_ascii=True)
-                size = count_tokens_approximately([("user", payload)]) + trace.settings.max_output_tokens
-                await trace.store.reserve(trace.run_id, model_tokens=size)
+                # Research keeps a reserve for the report; writing may use it, and
+                # so may converting a finished step's notes, whose research is
+                # already paid for and would otherwise be lost.
+                writing = scope.get("phase") in {"synthesis", "follow_up"}
+                purpose = "report" if writing or scope.get("purpose") == "conversion" else "research"
+                # Reserve what a call realistically writes. Reserving the whole
+                # output cap made budgets run out at a fraction of real spend, and
+                # parallel report sections could not fit a small budget at all;
+                # settlement replaces the estimate with reported usage.
+                # The node's own output cap when it has one (nodes.<name>.max_tokens).
+                cap = output_cap or trace.settings.max_output_tokens
+                output = min(cap, REPORT_CALL_OUTPUT if writing else RESEARCH_TURN_OUTPUT)
+                size = count_tokens_approximately([("user", payload)]) + output
+                await trace.store.reserve(trace.run_id, model_tokens=size, purpose=purpose)
                 self.reservations[str(run_id)] = size
+                if cap > output:
+                    self.shortfall[str(run_id)] = cap - output
                 await trace.store.event(trace.run_id, "usage.reserved", {"model_call_id": str(run_id), "estimated_tokens": size})
             except Exception as exc:
                 self.budget_error = exc
@@ -436,6 +506,15 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
                         known_usage = True
                         usage += reported["total_tokens"]
             reserved = self.reservations.pop(str(run_id), None)
+            shortfall = self.shortfall.pop(str(run_id), 0)
+            if not known_usage and reserved is not None and shortfall:
+                # Unknown usage keeps the conservative charge the full cap implies.
+
+                def conservative(run):
+                    run["usage"]["model_tokens"] += shortfall
+
+                await trace.store.mutate(trace.run_id, conservative)
+                reserved += shortfall
             for field, value in details.items():
                 self.totals[field] += value or 0
             self.totals["max_input_tokens"] = max(self.totals["max_input_tokens"], details["input_tokens"] or 0)
@@ -483,6 +562,7 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
         async def on_llm_error(self, error, *, run_id, **kwargs):
             self.provider_error = provider_failure(error)
             reserved = self.reservations.pop(str(run_id), None)
+            self.shortfall.pop(str(run_id), None)
             self.totals["model_errors"] += 1
             code = self.provider_error.code if self.provider_error else type(error).__name__
             await record_model(str(run_id), {"status": "error", "ended_at": utcnow(), "duration_ms": self.elapsed_ms(run_id), "error_code": code, "estimated_tokens": reserved})
@@ -502,8 +582,10 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
             await trace.store.record_call(trace.run_id, str(run_id), {**details, "started_at": utcnow(), "status": "running", "span_id": str(run_id), "request_key": request})
             self.totals["tool_calls"] += 1
             await trace.store.event(trace.run_id, "activity.tool.started", {**details, "call_id": str(run_id)})
-            # All tools now use the native call path with their original
-            # schemas. Reserve here; there is no separate search wrapper.
+            # Host and engine tools are reserved here; research sources reserve
+            # their own call so an exhausted budget ends the step gracefully.
+            if name in self_metered:
+                return
             try:
                 await trace.store.reserve(trace.run_id, tool_calls=1)
             except Exception as exc:
@@ -530,6 +612,11 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None):
             if fetched:
                 found = [source for source in found if source["id"] != fetched["id"]] + [fetched]
             page = {"url": fetched["url"], "title": fetched["title"]} if fetched else {}
+            if isinstance(artifact, dict) and artifact.get("schema") == "deepresearch.budget_stop.v1":
+                # The tool refused: the step's allowance, the run's ceiling or
+                # its time is used up. Nothing was searched, so it must not be
+                # counted as a search anywhere a reader or an operator looks.
+                page["budget_stop"] = artifact.get("reason") or "step"
             # Provider-based sources say which backend answered and what failed first.
             if isinstance(artifact, dict) and artifact.get("provider"):
                 attempts = [{key: item.get(key) for key in ("provider", "type", "status", "kind", "ms")} for item in (artifact.get("attempts") or [])[:10] if isinstance(item, dict)]

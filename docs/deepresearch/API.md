@@ -17,7 +17,7 @@ Base: `/api/deepresearch`，由 DeerFlow Gateway 扩展路由提供。生产请�
 | POST | `/{id}/plan/edit` | 202，规范化新计划并重新等待审核 |
 | POST | `/{id}/plan/reject` | 202，拒绝计划 |
 | POST | `/{id}/cancel` | 取消；已完成报告不会被覆盖 |
-| POST | `/{id}/retry` | 202，恢复 recoverable FAILED，预算不重置 |
+| POST | `/{id}/retry` | 202，恢复 recoverable FAILED，预算不重置（报告完成后的追问会开启新任务并重置用量，见“预算按任务计”） |
 | GET | `/{id}/events` | SSE，after / Last-Event-ID 持久事件游标；`Cache-Control: no-store, no-transform` |
 | GET | `/{id}/evidences` | 证据目录与 lineage |
 | GET | `/{id}/sources` | 已发现来源与实际调用，分别返回 sources/calls |
@@ -31,15 +31,15 @@ Base: `/api/deepresearch`，由 DeerFlow Gateway 扩展路由提供。生产请�
 | GET | `/{id}/llm-calls` | 本次研究的全部模型调用（含指标；`audited: false` 表示早于审计或关闭了内容记录） |
 | GET | `/{id}/llm-calls/{call_id}` | 一次调用的完整消息、工具定义、参数、返回、与上一次调用的差异、可重建的 OpenAI 请求 |
 | GET | `/{id}/llm-calls/export` | JSONL：逐条调用的完整请求与返回 |
-| GET | `/settings` | 研究设置：当前值、配置文件默认值、已覆盖字段、运维上限、目录、凭据状态、供应商健康度 |
-| POST | `/settings` | 管理员保存设置；`version` 不匹配返回 409 `PROFILE_VERSION`，校验失败返回 422 及字段路径 |
+| GET | `/settings` | 研究设置：当前值、配置文件默认值、已覆盖字段、运维上限、目录（含 `catalog.nodes`、`catalog.gap_codes`）、凭据状态、供应商健康度。不能编辑的用户看到的请求头/环境变量/URL 里的明文凭据显示为 `[hidden]` |
+| POST | `/settings` | 管理员保存设置；`version` 不匹配返回 409 `PROFILE_VERSION`，校验失败返回 422 及字段路径。不接受角色 `path`、stdio MCP 服务、自定义模型类和请求头/环境变量里的明文凭据（只能写在运维配置文件里） |
 | POST | `/settings/reset` | 管理员把指定字段（或全部）恢复为配置文件 |
 | POST | `/settings/restore` | 管理员回滚到某个历史版本 |
 | GET | `/settings/history` | 设置修改历史：版本、时间、修改人、改动字段 |
 | POST | `/settings/secrets` | 管理员保存或删除只写密钥（`secret:名字` 引用它；接口不返回值） |
-| POST | `/settings/test-model` | 管理员用提交的模型配置真实发一次普通请求和一次工具调用 |
+| POST | `/settings/test-model` | 管理员用提交的模型配置真实发一次普通请求、一次工具调用和一次“只返回 JSON”的请求（`json_contract`：是否可解析、耗时、输出速度） |
 | POST | `/settings/test-provider` | 管理员真实调用某个数据源供应商，返回耗时、条数与样例 |
-| POST | `/settings/mcp-tools` | 管理员连接一个 MCP 服务并列出它的工具与参数 |
+| POST | `/settings/mcp-tools` | 管理员连接一个 MCP 服务并列出工具：`{ok, tools: [{name, description, arguments, allowed}]}`（`allowed` 按 `allowed_tools` 白名单）；失败时 `{ok: false, kind, message}`，`kind` 为 `auth` / `timeout` / `network` / `server` / `config`，`message` 不回显传输层错误文本。未在运维配置里定义的 stdio 服务返回 422 |
 | GET | `/settings/health` | 供应商健康度快照：成功/失败次数、冷却剩余、最近错误类别 |
 
 ## 创建
@@ -58,6 +58,8 @@ Base: `/api/deepresearch`，由 DeerFlow Gateway 扩展路由提供。生产请�
   }
 }
 ```
+
+**预算要按部署来传，不要照抄上面的数字。** 页面的做法是先 `GET /capabilities`，把返回的 `budget_ceiling` 原样作为 `budget`；上限为不限的部署传 `null`。省略 `budget` 会得到上例这组很小的默认值：12 万 Token 扣掉报告预留、再由并行步骤平分后，每步份额小于研究员的第一轮请求，引擎在第一轮就去掉工具调用，研究以 `NO_EVIDENCE` 失败（工具调用 0 次），而且重试无效。一次公网研究通常要几百万 Token。
 
 `Idempotency-Key` 同用户同请求可复用，不同请求体复用返回 409。预算不可超过部署上限。`source_names` 表示优先顺序，不代表放开未注册工具或取消来源要求。模型调用先估算预留，再按返回 usage 结算；`model_tokens` 包含已结算用量及未结算/未知用量的预留，`reported_model_tokens` 只累计提供方统计，不承诺精确计费硬限。研究角色使用原生预算中间件提前提醒收尾，不能将全部共享预算视为单个 Researcher 的额度。
 
@@ -85,9 +87,11 @@ edit body：`{"plan_version":1,"plan":{...}}`；plan 包含 goal、title、brief
 
 完成后的追问先进入 `RESPONDING`：解释直接回答；改写只修改现有 Markdown 文档并生成新版本，不重新调用搜索；新证据需求开启新的 `cycle` 和计划。旧报告版本始终保留，读取/导出仍检查当前 owner/ACL。
 
+追问被停止（`CANCELLED`）或失败（`FAILED`）后，已发布的报告仍在，同一接口可以继续追问：接受消息时清除 `cancel_requested` 并按新任务重置用量。没有报告的 `CANCELLED`/`FAILED` 任务返回 409 `RUN_STOPPED`（不可恢复）：用 `/retry` 恢复或新建研究。执行中的其它状态仍返回 409 `RUN_BUSY`。
+
 ## 事件与 Trace
 
-事件包含 `seq/type/run_id/at/data`，SSE id 为 seq。Trace 的 data 另包含 trace_id、span_id、parent_span_id、kind、name、status、duration_ms 及可选 payload/error_type。
+事件包含 `seq/type/run_id/at/data`，SSE id 为 seq。`GET /{id}` 的快照带 `last_event_seq`（读取快照之前的最新事件序号）；页面打开运行中的研究时用 `events?after=<last_event_seq>` 接续，不必从 0 回放整段事件历史。Trace 的 data 另包含 trace_id、span_id、parent_span_id、kind、name、status、duration_ms 及可选 payload/error_type。
 
 trace 分页返回 `{"trace_id":"...","items":[...],"next_cursor":123}`。导出每行一个完整事件。started 无对应 ended 可能是活动调用或进程中断，不能推断成功。载荷可能被截断；设置关闭内容采集后仅保存元数据。
 
@@ -108,18 +112,31 @@ trace 分页返回 `{"trace_id":"...","items":[...],"next_cursor":123}`。导出
 | 字段 | 内容 |
 | --- | --- |
 | `time` | `wall_seconds`、`active_seconds`、`waiting_seconds`、`model_seconds`、`tool_seconds`、`queue_seconds`、`in_progress`、`phases[]` |
-| `tokens` | `input`、`output`、`cache_read`、`reasoning`、`total`、`unreported_calls`、`estimated_unreported`、`cache_read_ratio` |
+| `tokens` | `input`、`output`、`cache_read`、`reasoning`、`total`、`unreported_calls`、`estimated_unreported`、`cache_read_ratio`、`prefix_reuse_ratio`（同一会话里与上一次请求从头相同的提示词占比，即前缀缓存命中的上限；不依赖模型服务上报用量） |
 | `cost` | `currency`、`total`、`by_currency`、`priced_calls`、`unpriced_models`；未配置 `pricing` 时为空 |
 | `model_calls` | 次数、进行中、错误与错误码、finish reason、延迟 p50/p95、最大上下文 |
-| `tools` | 次数、错误率、`error_types`、延迟、返回字符、搜索与读取、`repeat_calls` / `repeat_calls_same_agent`、`failing_domains`（读取失败最多的 10 个站点及其错误类型）、按工具明细 |
+| `tools` | 次数、错误率、`error_types`、延迟、返回字符、搜索（`search` 与 `data` 查询；被预算拒绝的调用计入 `budget_stops` 而不是搜索）与读取、`repeat_calls` / `repeat_calls_same_agent`、`failing_domains`（读取失败最多的 10 个站点及其错误类型）、按工具明细 |
 | `agents` | 子 Agent 执行明细、按角色汇总、失败码、最大并行数 |
 | `units` | 每个研究单元（含补研）的耗时、模型调用、Token、费用、工具调用、搜索、读取页面、原始证据、被引用页面数、每条引用 Token |
-| `budget` | Token、工具调用、时长的上限与已用比例；上限为空表示不限 |
+| `budget` | Token、工具调用、时长的上限与已用比例；上限为空表示不限。`earlier_tasks[]`：同一会话里已结束任务的 `cycle`、`closed_at`、`model_tokens`、`tool_calls`、`elapsed_seconds` |
 | `research` / `report` / `cache` | 单元与补研、证据裁剪、转换重试、报告规模与修复、缓存复用 |
 | `efficiency` | 每条引用 Token/费用/计算时长、读取页面与引用比例、每个研究单元搜索次数、重复工具调用占比、转换与失败子 Agent 的 Token 占比 |
-| `breakdown` | `by_phase`、`by_purpose`、`by_skill`、`by_model`、`by_unit`、`by_cycle` |
+| `breakdown` | `by_node`（每个节点另有 `cache_read_ratio` 与 `prefix_reuse_ratio`）、`by_phase`、`by_purpose`、`by_skill`、`by_model`、`by_unit`、`by_cycle` |
 
-提供方未上报用量的调用只计次数与预留估算，不计入 Token 合计与费用。费用只是按配置单价的估算，不是账单。
+`breakdown.by_node[]` 对应研究配置里可以单独调参的节点（`rewrite`、`plan`、`research`、`conversion`、`outline`、`section`、
+`summary`、`revision`、`follow_up`，外加 `compaction` 与无法归类的 `unknown`）：`node`、`models[]`、`model_calls`、
+`model_errors`、`unreported_usage`、`input_tokens` / `output_tokens` / `cache_read_tokens` / `reasoning_tokens` / `total_tokens`、
+`max_input_tokens`、`avg_output_tokens`、`truncated`（输出碰到上限）、`retries`（契约或引用修复次数）、`model_ms`、
+`latency_ms{count, avg, p50, p95, max}`、`cost`。各节点的调用数与 Token 合计等于总数。
+
+**预算按任务计。** 报告完成后发送的消息（回答、改写报告或开启新一轮研究）是同一会话里的新任务：`usage` 归零，
+之前的用量追加到 `usage_history`。研究中的消息（steering）和计划修改仍属于当前任务。
+
+**时间预算。** `max_elapsed_seconds` 到点前 `report_time_reserve_seconds` 秒研究开始收尾：事件 `research.unit.deadline`
+（`tools_stop_after_seconds`、`hard_timeout_seconds`）、`research.search.limited`（`scope: time`）、单元失败码
+`RESEARCH_TIME_SPENT`；报告照常生成。只有“上限 + 一份报告预留”之后仍未完成才以 `TIMEOUT` 失败。
+
+提供方未上报用量的调用只计次数与预留估算，不计入 Token 合计与费用；所有调用都未上报时 Token 合计及其比率为 `null`。费用只是按配置单价的估算，不是账单。
 
 工具错误类型：抛出异常时为异常类名（如 `SSLError`）；工具返回错误结果时按内容粗分为 `HTTP nnn`、异常名（如 `ConnectError`）、
 `EmptyContent` 或 `ToolReturnedError`，只用于统计分组。重复调用指同一工具以完全相同的参数，在一次成功调用之后再次调用；
@@ -179,9 +196,12 @@ A run without any citable evidence fails with recoverable `NO_EVIDENCE`.
 ResearchPlan adds `title`, `brief`, `assumptions`, `acknowledgement`,
 `report_style` (`brief`, `standard`, `detailed`) and `source_policy`
 (`allowed_domains`, `excluded_url_prefixes`, `require_original`). Source
-configuration adds `role` (`search`, `read`, `data`). Only fetched pages, records
-from non-search tools and legacy document evidence are citable unless the
-operator enables `cite_search_results`.
+configuration adds `role` (`search`, `read`, `data`) and `enabled`. Only fetched
+pages, records from non-search tools and legacy document evidence are citable
+unless the operator enables `cite_search_results` or no enabled source has
+`role: read` (nothing can open an original, so search results are the
+evidence). Each citation carries `basis`: `page`, `record` or `search excerpt`;
+exports label the last one "search excerpt; the original was not opened".
 
 New report versions have `format: "markdown-v2"` and contain:
 

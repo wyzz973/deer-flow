@@ -10,6 +10,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from .channels import BUDGET_STOP
 from .contracts import RawEvidence
 from .evidence import digest
 from .sources import fetched_source, observed_sources
@@ -22,6 +23,26 @@ class NativeExecution:
     messages: list[dict[str, Any]] = field(default_factory=list)
     receipts: list[dict[str, Any]] = field(default_factory=list)
     stop_reason: str | None = None
+
+
+def derived_receipts(messages):
+    """Receipts of an execution whose engine did not stamp any.
+
+    Research keeps the engine's receipt ledger out of the model's context, and
+    the engine's switch for it also stops stamping. A receipt only states that a
+    call happened and how it ended, which the archived tool messages already
+    say; ids follow the engine's r1..rN order of tool results.
+    """
+    calls = {call["id"]: call for message in messages for call in message.get("tool_calls") or [] if call.get("id")}
+    receipts = []
+    for message in messages:
+        if message.get("type") != "tool" or not message.get("tool_call_id"):
+            continue
+        meta = (message.get("additional_kwargs") or {}).get("deerflow_tool_meta")
+        status = (meta.get("status") if isinstance(meta, dict) else None) or message.get("status") or "success"
+        name = message.get("name") or calls.get(message["tool_call_id"], {}).get("name") or ""
+        receipts.append({"id": f"r{len(receipts) + 1}", "tool_call_id": message["tool_call_id"], "tool_name": name, "status": str(status)})
+    return receipts
 
 
 # The host's tool-output budget moves oversized results to this virtual path and
@@ -41,7 +62,30 @@ def _externalized_path(message, text):
 BROWSER_LEAVES_PAGE = {"browser_click", "browser_type", "browser_back", "browser_close"}
 
 
-def research_observations(execution: NativeExecution, sources):
+def derive(item, **updates):
+    """A derived evidence record, validated instead of copied blindly.
+
+    ``model_copy`` skips validation, so a title taken from a signed URL or text
+    that arrived empty used to be stored and only rejected later, in
+    evidence_merge, where it failed the whole unit. Validation bounds display
+    fields here and reports the records that cannot be evidence at all.
+    """
+    from pydantic import ValidationError
+
+    try:
+        return RawEvidence.model_validate({**item.model_dump(mode="json"), **updates})
+    except ValidationError:
+        return None
+
+
+def call_label(source, call):
+    """A reader-facing title for a source tool's combined output: what was asked, not a receipt id."""
+    args = call.get("args") if isinstance(call.get("args"), dict) else {}
+    asked = next((args[key] for key in ("query", "q", "keywords", "search_query", "question", "url", "uri", "link") if isinstance(args.get(key), str) and args[key].strip()), None)
+    return f"{source.name}: {' '.join(asked.split())[:160]}" if asked else None
+
+
+def research_observations(execution: NativeExecution, sources, cite_search_results=False):
     from deerflow.utils.messages import message_content_to_text
 
     from .contracts import safe_http_url
@@ -79,6 +123,9 @@ def research_observations(execution: NativeExecution, sources):
         text = message_content_to_text(message.get("content") or "")
         if not text.strip():
             continue
+        artifact = message.get("artifact")
+        if isinstance(artifact, dict) and artifact.get("schema") == BUDGET_STOP:
+            continue  # the budget's instruction to the model, not a read
         if name == "browser_navigate" and not source:
             try:
                 browser_url = safe_http_url((call.get("args") or {}).get("url"))
@@ -102,9 +149,10 @@ def research_observations(execution: NativeExecution, sources):
             source_id = "source_" + digest(["external", name, canonical_url(opened)])[:24]
             document_id = "doc_" + digest([execution.execution_id, call_id, source_id])[:24]
             evidence[raw_id] = envelope
-            evidence[document_id] = envelope.model_copy(
-                update={"raw_id": document_id, "title": opened, "url": opened, "source_uri": None, "origin": "external", "provenance": "fetched_document", "source_id": source_id, "document_hash": digest(text)}
-            )
+            document = derive(envelope, raw_id=document_id, title=opened, url=opened, source_uri=None, origin="external", provenance="fetched_document", source_id=source_id, document_hash=digest(text))
+            if document is None:
+                continue
+            evidence[document_id] = document
             catalog.append({"raw_id": document_id, "receipt_id": receipt.get("id"), "tool_call_id": call_id, "tool_name": name, "origin": "external", "url": opened, "title": opened, "provenance": "fetched_document"})
             catalog.append({"raw_id": raw_id, "receipt_id": receipt.get("id"), "tool_call_id": call_id, "tool_name": name, "origin": "runtime", "excerpt": text[:20000], "superseded": True})
             continue
@@ -113,9 +161,10 @@ def research_observations(execution: NativeExecution, sources):
         if page is not None:
             document_id = "doc_" + digest([execution.execution_id, call_id, page["fetched"]["id"]])[:24]
             raw_ref = f"execution:{execution.execution_id}:{call_id}"
-            evidence[document_id] = page["item"].model_copy(
-                update={"raw_id": document_id, "snippet": text[:20000], "raw_content_ref": raw_ref, "source_uri": None, "provenance": "fetched_document", "title": page["fetched"]["title"], "url": page["fetched"]["url"]}
-            )
+            document = derive(page["item"], raw_id=document_id, snippet=text[:20000], raw_content_ref=raw_ref, source_uri=None, provenance="fetched_document", title=page["fetched"]["title"], url=page["fetched"]["url"])
+            if document is None:
+                continue
+            evidence[document_id] = document
             # The anonymous read_file envelope stays auditable but is superseded.
             raw_id = "raw_" + digest([execution.execution_id, call_id])[:24]
             evidence[raw_id] = RawEvidence(
@@ -136,7 +185,10 @@ def research_observations(execution: NativeExecution, sources):
         raw_id = "raw_" + digest([execution.execution_id, call_id])[:24]
         item = RawEvidence(
             raw_id=raw_id,
-            title=f"{source.name if source else name} / {receipt.get('id', call_id)}",
+            # A declared source's output can be cited as a whole (an MCP tool
+            # whose answer has no record structure), so its title says what was
+            # asked rather than showing a receipt id.
+            title=(call_label(source, call) if source else None) or f"{source.name if source else name} / {receipt.get('id', call_id)}",
             source_uri=f"{'mcp-result' if source and source.kind == 'mcp' else 'tool-result'}://{execution.execution_id}/{raw_id}",
             # Files, sandbox and other native tools can support findings too.
             # Only explicitly configured source tools carry an internal or
@@ -150,11 +202,16 @@ def research_observations(execution: NativeExecution, sources):
             raw_content_ref=f"execution:{execution.execution_id}:{call_id}",
         )
         evidence[raw_id] = item
-        artifact = message.get("artifact")
         fetched = fetched_source(artifact, connector=source.name if source else name, origin=item.origin) if source and source.kind in {"native", "channel"} else None
         # A knowledge source's records become separate citable evidence with
         # their own titles; the combined tool output stays as a superseded copy.
         records = artifact.get("records") if source and source.role == "data" and isinstance(artifact, dict) and artifact.get("schema") == "deepresearch.records.v1" else None
+        # Where search results are the evidence (no source opens pages, or the
+        # operator declared them citable), each result is cited on its own with
+        # its title and link instead of the whole result list.
+        if records is None and cite_search_results and source and source.role == "search" and isinstance(artifact, dict) and artifact.get("schema") == "deepresearch.search.v1":
+            records = [record for record in artifact.get("results") or [] if isinstance(record, dict) and not record.get("opaque")]
+        recorded_urls = set()
         if records:
             for index, record in enumerate(records[:100]):
                 if not isinstance(record, dict) or not str(record.get("snippet") or "").strip():
@@ -164,32 +221,43 @@ def research_observations(execution: NativeExecution, sources):
                     link = safe_http_url(record.get("url")) if record.get("url") else None
                 except ValueError:
                     link = None
-                evidence[record_id] = item.model_copy(
-                    update={
-                        "raw_id": record_id,
-                        "title": str(record.get("title") or item.title)[:1000],
-                        "url": link,
-                        "source_uri": f"tool-result://{execution.execution_id}/{record_id}",
-                        "snippet": str(record["snippet"])[:20000],
-                        "published_at": None,
-                        "document_hash": digest(str(record["snippet"])),
-                    }
+                found = derive(
+                    item,
+                    raw_id=record_id,
+                    title=str(record.get("title") or item.title)[:1000],
+                    url=link,
+                    source_uri=f"tool-result://{execution.execution_id}/{record_id}",
+                    snippet=str(record["snippet"])[:20000],
+                    published_at=None,
+                    document_hash=digest(str(record["snippet"])),
                 )
-                catalog.append({"raw_id": record_id, "receipt_id": receipt.get("id"), "tool_call_id": call_id, "tool_name": name, "origin": item.origin, "title": evidence[record_id].title, "url": link, "record": index + 1})
+                if found is None:
+                    continue
+                evidence[record_id] = found
+                if link:
+                    recorded_urls.add(canonical_url(link))
+                catalog.append({"raw_id": record_id, "receipt_id": receipt.get("id"), "tool_call_id": call_id, "tool_name": name, "origin": item.origin, "title": found.title, "url": link, "record": index + 1})
         if fetched:
             document_id = "doc_" + digest([execution.execution_id, call_id, fetched["id"]])[:24]
-            document = item.model_copy(
-                update={"raw_id": document_id, "title": fetched["title"], "url": fetched["url"], "source_id": fetched["id"], "source_uri": None, "provenance": "fetched_document", "document_hash": fetched["document_hash"]}
-            )
-            evidence[document_id] = document
-            if external := _externalized_path(message, text):
-                pages[external] = {"fetched": fetched, "item": document}
-            catalog.append({"raw_id": document_id, "receipt_id": receipt.get("id"), "tool_call_id": call_id, "tool_name": name, "origin": item.origin, "url": fetched["url"], "title": fetched["title"], "provenance": "fetched_document"})
+            document = derive(item, raw_id=document_id, title=fetched["title"], url=fetched["url"], source_id=fetched["id"], source_uri=None, provenance="fetched_document", document_hash=fetched["document_hash"])
+            if document is None:
+                # The page cannot be evidence, but the call still happened: its
+                # links and its envelope are recorded below like any other.
+                fetched = None
+            else:
+                evidence[document_id] = document
+                if external := _externalized_path(message, text):
+                    pages[external] = {"fetched": fetched, "item": document}
+                catalog.append({"raw_id": document_id, "receipt_id": receipt.get("id"), "tool_call_id": call_id, "tool_name": name, "origin": item.origin, "url": fetched["url"], "title": fetched["title"], "provenance": "fetched_document"})
         for observed in observed_sources(text, connector=source.name if source else name, origin=item.origin):
             if fetched and observed["canonical_url"] == fetched["canonical_url"]:
                 continue
+            if observed["canonical_url"] in recorded_urls:
+                continue  # already cited as its own search result
             document_id = "doc_" + digest([execution.execution_id, call_id, observed["id"]])[:24]
-            document = item.model_copy(update={"raw_id": document_id, "title": observed["title"], "url": observed["url"], "source_id": observed["id"], "source_uri": None, "snippet": observed["excerpt"], "provenance": "observed_source"})
+            document = derive(item, raw_id=document_id, title=observed["title"], url=observed["url"], source_id=observed["id"], source_uri=None, snippet=observed["excerpt"], provenance="observed_source")
+            if document is None:
+                continue
             evidence[document_id] = document
             catalog.append({"raw_id": document_id, "receipt_id": receipt.get("id"), "tool_call_id": call_id, "tool_name": name, "origin": item.origin, "url": observed["url"], "title": observed["title"], "excerpt": observed["excerpt"]})
         # When the native reader registered the page itself, cite that page
@@ -205,7 +273,9 @@ def ground_source_annotations(evidences, annotations):
     or silently turn a paraphrase into an allegedly verbatim source excerpt.
     """
     by_id = {e.raw_id: e for e in evidences}
-    original = {e.raw_content_ref: e.snippet for e in evidences if e.provenance == "tool_output"}
+    # The complete tool output: only the call's own envelope holds it. Records
+    # derived from the same call share its reference but carry one record each.
+    original = {e.raw_content_ref: e.snippet for e in evidences if e.provenance == "tool_output" and e.raw_id.startswith("raw_")}
 
     def normalize(text):
         return " ".join(text.split()).casefold()
@@ -217,5 +287,9 @@ def ground_source_annotations(evidences, annotations):
         body = normalize(original.get(evidence.raw_content_ref, ""))
         if annotation.title.strip() and normalize(annotation.title) in body:
             evidence.title = annotation.title.strip()
-        if annotation.quote.strip() and normalize(annotation.quote) in body:
+        # A link seen in a result list sits next to other results. Its quote must
+        # come from its own surroundings, or a neighbour's sentence would be
+        # shown under this link's address.
+        scope = normalize(evidence.snippet) if evidence.provenance == "observed_source" else body
+        if annotation.quote.strip() and normalize(annotation.quote) in scope:
             evidence.snippet = annotation.quote.strip()

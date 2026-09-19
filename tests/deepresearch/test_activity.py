@@ -112,7 +112,11 @@ def test_tool_detail_uses_declared_roles_and_safe_urls_only():
     assert tool_detail("search", '{"q": "json args"}') == {"query": "json args"}
     assert tool_detail("read", {"url": "https://docs.gitlab.com/duo"}) == {"url": "https://docs.gitlab.com/duo"}
     assert tool_detail("read", {"url": "javascript:alert(1)"}) == {}
-    assert tool_detail("data", {"query": "private business argument"}) == {}
+    # A knowledge source is queried like a search engine: the owner's timeline
+    # shows what is being looked up ("0 searches" is wrong for a research that
+    # only has knowledge tools). Other arguments of a data tool stay out.
+    assert tool_detail("data", {"query": "差旅 报销 标准", "tenant": "private business argument"}) == {"query": "差旅 报销 标准"}
+    assert tool_detail("data", {"filters": {"owner": "private business argument"}}) == {}
 
 
 @pytest.mark.asyncio

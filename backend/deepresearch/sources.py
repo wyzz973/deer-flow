@@ -53,6 +53,20 @@ def fetched_source(artifact, *, connector=None, origin="runtime"):
     }
 
 
+def _window_start(text, match, previous):
+    """Where a link's own text begins.
+
+    What follows a link (its snippet) belongs to it; what precedes it belongs to
+    the entry before, except the label on its own line or in its own object
+    ("1. [Title](url)", {"title": ..., "url": ...}).
+    """
+    start = max(0, match.start() - 350)
+    if previous is None:
+        return start
+    own = max(text.rfind("\n", 0, match.start()), text.rfind("{", 0, match.start())) + 1
+    return max(start, previous.end(), own)
+
+
 def observed_sources(content, *, connector=None, origin="runtime"):
     """Return actual links and nearby excerpts, not a normalized search result."""
     text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False, default=str)
@@ -60,7 +74,8 @@ def observed_sources(content, *, connector=None, origin="runtime"):
     text = text[:MAX_SCAN_CHARS]
     labels = {html.unescape(url): label for label, url in MARKDOWN_LINK.findall(text)}
     found = {}
-    for match in URL.finditer(text):
+    matches = list(URL.finditer(text))
+    for position, match in enumerate(matches):
         if clipped and match.end() == len(text):
             continue  # A cut-off locator is not a complete observed URL.
         url = html.unescape(match.group().rstrip(".,;:!?"))
@@ -82,12 +97,16 @@ def observed_sources(content, *, connector=None, origin="runtime"):
             "url": url,
             "canonical_url": canonical,
             "domain": domain,
-            "title": labels.get(url) or url,
+            # With no link label the URL is the title; signed URLs run long.
+            "title": (labels.get(url) or url)[:1000],
             "title_observed": url in labels,
             "origin": origin,
             "connector": connector,
             "status": "discovered",
-            "excerpt": text[max(0, match.start() - 350) : min(len(text), match.end() + 700)],
+            # The text around this link, stopping at its neighbours: in a result
+            # list the next entry's sentences belong to the next link, and a quote
+            # taken from them must not be shown under this address.
+            "excerpt": text[_window_start(text, match, matches[position - 1] if position else None) : min(len(text), match.end() + 700, matches[position + 1].start() if position + 1 < len(matches) else len(text))],
         }
         if len(found) >= 100:
             break

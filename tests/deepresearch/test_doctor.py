@@ -103,3 +103,19 @@ async def test_probe_failures_are_readable_and_never_echo_credentials(monkeypatc
 
     missing = await probe_model("missing", settings=offline_settings(monkeypatch))
     assert missing["ok"] is False and "not configured" in missing["error"]
+
+
+def test_doctor_names_an_engine_that_admits_fewer_roles_than_research_runs(settings):
+    from types import SimpleNamespace
+
+    from deepresearch.doctor import engine_capacity
+
+    settings.max_concurrency, settings.writer_concurrency = 6, 8
+    host = SimpleNamespace(subagent_runtime=SimpleNamespace(max_running=3, queue_timeout_seconds=300))
+    capacity = engine_capacity(settings, host)
+    assert (capacity["needed"], capacity["max_running"], capacity["ok"]) == (8, 3, False)
+    assert "subagent_runtime.max_running" in capacity["warning"] and "8" in capacity["warning"]
+    host.subagent_runtime.max_running = 8
+    assert engine_capacity(settings, host) == {"needed": 8, "max_running": 8, "ok": True}
+    # A host without the section imposes no limit research could know about.
+    assert engine_capacity(settings, SimpleNamespace())["ok"] is True

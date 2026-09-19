@@ -59,7 +59,7 @@ async def test_model_and_tool_calls_are_recorded_with_phase_tokens_and_sizes(set
     await callbacks.on_tool_end(types.SimpleNamespace(content="x" * 321, status="success", artifact=None, tool_call_id="t1"), run_id="t1")
     await callbacks.on_tool_start({"name": "web_fetch"}, "{}", run_id="t2", inputs={"url": "https://example.com"})
     await callbacks.on_tool_end(types.SimpleNamespace(content="Error: Jina API returned status 429: slow down", status="error", artifact=None, tool_call_id="t2"), run_id="t2")
-    await callbacks.on_chat_model_start({}, [[HumanMessage(content="again")]], run_id="m2")
+    await callbacks.on_chat_model_start({}, [[HumanMessage(content="system prompt"), HumanMessage(content="ledger"), HumanMessage(content="task")]], run_id="m2")
 
     class RateLimited(Exception):
         status_code = 429
@@ -91,6 +91,11 @@ async def test_model_and_tool_calls_are_recorded_with_phase_tokens_and_sizes(set
     }
     assert first["prompt_chars"] == len("system prompt") + len("task") and first["duration_ms"] >= 0 and first["estimated_tokens"] > 0
     assert second["status"] == "error" and second["error_code"] == "MODEL_RATE_LIMIT" and second["estimated_tokens"] > 0
+    # The first request of a thread has nothing before it. The second repeats
+    # only the system prompt: a message inserted behind it ended the prefix.
+    assert "prefix_chars" not in first
+    assert (second["prefix_messages"], second["prefix_chars"]) == (1, len("system prompt"))
+    assert (third["prefix_messages"], third["prefix_chars"]) == (0, 0)
     tool, retry = await store.calls("r")
     assert tool["output_chars"] == 321 and tool["phase"] == "dispatch" and tool["execution_id"] == "exec-1"
     assert tool["request_key"] == retry["request_key"] == request_key({"url": "https://example.com"}) and "error_type" not in tool
@@ -195,7 +200,7 @@ def test_summary_quantifies_time_tokens_cost_tools_agents_and_efficiency():
     assert [(phase["phase"], phase["seconds"]) for phase in time["phases"]] == [("planner", 25), ("dispatch", 600), ("synthesis", 120)]
     assert (time["model_seconds"], time["tool_seconds"], time["queue_seconds"]) == (74, 3.7, 1.5)
 
-    assert summary["tokens"] == {"input": 14500, "output": 2500, "cache_read": 8000, "reasoning": 0, "total": 17000, "unreported_calls": 1, "estimated_unreported": 5000, "cache_read_ratio": 0.552}
+    assert summary["tokens"] == {"input": 14500, "output": 2500, "cache_read": 8000, "reasoning": 0, "total": 17000, "unreported_calls": 1, "estimated_unreported": 5000, "cache_read_ratio": 0.552, "prefix_reuse_ratio": None}
     # m1 1400 + m2 (2000 + 8000*0.1 + 500*2) + m3 3600 micro-dollars; "other" has no price.
     assert summary["cost"] == {"currency": "USD", "total": 0.0088, "by_currency": {"USD": 0.0088}, "priced_calls": 3, "unpriced_models": ["other"]}
 
@@ -259,8 +264,14 @@ def test_summary_quantifies_time_tokens_cost_tools_agents_and_efficiency():
         "citations": 3,
         "tokens_per_citation": 4600,
     }
-    assert (supplement["supplement"], supplement["failed"], supplement["citations"], supplement["tokens_per_citation"]) == (True, True, 1, 0)
-    assert summary["budget"] == {"max_model_tokens": 68000, "model_tokens_used": 0.25, "max_tool_calls": None, "tool_calls_used": None, "max_elapsed_seconds": 1620, "elapsed_used": 0.5}
+    # Its only model call failed without reporting usage: the tokens are unknown, not zero.
+    assert (supplement["supplement"], supplement["failed"], supplement["citations"], supplement["tokens_per_citation"], supplement["total_tokens"]) == (True, True, 1, None, None)
+    assert summary["budget"] == {"max_model_tokens": 68000, "model_tokens_used": 0.25, "max_tool_calls": None, "tool_calls_used": None, "max_elapsed_seconds": 1620, "elapsed_used": 0.5, "earlier_tasks": []}
+    # Each tunable node: what it cost and how it behaved.
+    nodes = {row["node"]: row for row in summary["breakdown"]["by_node"]}
+    assert sum(row["model_calls"] for row in nodes.values()) == summary["model_calls"]["count"]
+    assert sum(row["total_tokens"] for row in nodes.values()) == summary["tokens"]["total"]
+    assert all({"latency_ms", "truncated", "retries", "avg_output_tokens", "models"} <= set(row) for row in nodes.values())
 
     efficiency = summary["efficiency"]
     assert efficiency == {
@@ -412,3 +423,32 @@ def test_metrics_cli_compares_runs_from_a_data_directory(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out)[0]["tokens"]["total"] == 17000
     main(["--data-dir", str(tmp_path), "--format", "table"])
     assert "tokens/cite" in capsys.readouterr().out
+
+
+def test_prefix_reuse_is_the_ceiling_of_what_a_prompt_cache_could_serve():
+    from deepresearch.metrics import summarize
+
+    def call(index, node, prompt, prefix=None, cached=0):
+        body = {"id": f"m{index}", "status": "ok", "model": "flash", "config_node": node, "purpose": "agent", "usage_reported": True, "input_tokens": prompt // 4, "cache_read_tokens": cached, "prompt_chars": prompt}
+        return body if prefix is None else {**body, "prefix_chars": prefix}
+
+    # A researcher loop whose requests only append, and a section written once.
+    calls = [call(1, "research", 4000), call(2, "research", 8000, 4000, cached=900), call(3, "research", 12000, 8000, cached=1900), call(4, "section", 6000)]
+    summary = summarize({"run_id": "r", "status": "COMPLETED"}, model_calls=calls, tool_calls=[], agent_runs=[], events=[], spans=[], unit_results=[])
+    assert summary["tokens"]["prefix_reuse_ratio"] == 0.4  # 12000 of 30000 characters
+    nodes = {row["node"]: row for row in summary["breakdown"]["by_node"]}
+    assert (nodes["research"]["prefix_reuse_ratio"], nodes["research"]["cache_read_ratio"]) == (0.5, 0.467)
+    # One request per thread: nothing could repeat. Records from before the measure say nothing.
+    assert nodes["section"]["prefix_reuse_ratio"] is None
+
+
+def test_a_run_keeps_its_own_status_when_its_tools_tried_several_providers():
+    """The summary reported the status of the last provider attempt ("cache",
+    "ok") as the status of the run, so a completed research read as "cache"."""
+    from deepresearch.metrics import summarize
+
+    attempts = [{"provider": "tavily", "type": "tavily", "status": "error", "kind": "quota", "ms": 300}, {"provider": "jina", "type": "jina_reader", "status": "cache", "ms": 0}]
+    call = {"id": "t1", "tool_name": "web_fetch", "role": "read", "status": "success", "duration_ms": 900, "attempts": attempts}
+    summary = summarize({"run_id": "r", "status": "COMPLETED"}, model_calls=[], tool_calls=[call], agent_runs=[], events=[], spans=[], unit_results=[])
+    assert summary["status"] == "COMPLETED"
+    assert [(row["provider"], row["errors"], row["cached"]) for row in summary["tools"]["by_provider"]] == [("tavily", 1, 0), ("jina", 0, 1)]

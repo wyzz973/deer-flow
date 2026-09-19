@@ -15,6 +15,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from urllib.parse import quote
 
 from . import extract
 from .audit import scrub_text
@@ -117,14 +118,27 @@ def _key(spec, required):
     return key
 
 
-def _render(template, request):
-    """Fill {query}/{url}/{max_results}/{time_range} in strings, keeping numbers typed."""
+def _render(template, request, *, encode=False):
+    """Fill {query}/{url}/{max_results}/{time_range} in strings, keeping numbers typed.
+
+    ``encode`` is for a URL template: the model writes the query, so a raw
+    ``&``, ``#`` or space would add or cut parameters of the operator's API.
+    A page address keeps its own structure when it is the path of a reader API
+    (``https://reader/{url}``) and is encoded when it is a query value.
+    """
     values = {"query": request.query or "", "url": request.url or "", "max_results": request.max_results, "time_range": request.time_range or ""}
     if isinstance(template, str):
         whole = re.fullmatch(r"\{(query|url|max_results|time_range)\}", template.strip())
-        if whole:
+        if whole and not encode:
             return values[whole.group(1)]
-        return re.sub(r"\{(query|url|max_results|time_range)\}", lambda match: str(values[match.group(1)]), template)
+
+        def fill(match):
+            value = str(values[match.group(1)])
+            if not encode or (match.group(1) == "url" and "?" not in template[: match.start()]):
+                return value
+            return quote(value, safe="")
+
+        return re.sub(r"\{(query|url|max_results|time_range)\}", fill, template)
     if isinstance(template, dict):
         return {key: _render(value, request) for key, value in template.items() if not (value == "{time_range}" and not request.time_range)}
     if isinstance(template, list):
@@ -140,12 +154,26 @@ def _brief(text):
     return " ".join(text.split())[:300]
 
 
-async def _http(spec, method, url, *, secrets=(), headers=None, params=None, body=None, raw=False, follow_redirects=True, user_agent=API_USER_AGENT):
+async def _http(spec, method, url, *, secrets=(), headers=None, params=None, body=None, raw=False, follow_redirects=True, user_agent=API_USER_AGENT, max_bytes=None):
     import httpx
 
     try:
         async with httpx.AsyncClient(timeout=spec.timeout_seconds, follow_redirects=follow_redirects, trust_env=True, headers={"User-Agent": user_agent}) as client:
-            response = await client.request(method, url, headers=headers, params=params, json=body)
+            if max_bytes is None:
+                response = await client.request(method, url, headers=headers, params=params, json=body)
+            else:
+                # The address comes from the model or from a web page: stop
+                # reading at the cap instead of buffering whatever is served.
+                async with client.stream(method, url, headers=headers, params=params, json=body) as streamed:
+                    chunks, size = [], 0
+                    async for chunk in streamed.aiter_bytes():
+                        chunks.append(chunk)
+                        size += len(chunk)
+                        if size >= max_bytes:
+                            break
+                    # aiter_bytes already decoded the body; the rebuilt response must not decode it again.
+                    kept = [(name, value) for name, value in streamed.headers.items() if name.lower() not in {"content-encoding", "content-length", "transfer-encoding"}]
+                    response = httpx.Response(streamed.status_code, headers=kept, content=b"".join(chunks)[:max_bytes], request=streamed.request)
     except httpx.TimeoutException as exc:
         raise ProviderError("timeout", f"{type(exc).__name__} after {spec.timeout_seconds:g}s") from None
     except httpx.HTTPError as exc:
@@ -333,7 +361,9 @@ async def direct(spec, request):
         if problem:
             raise ProviderError("blocked", problem.removeprefix("Error: "))
         try:
-            response = await _http(spec, "GET", url, raw=True, follow_redirects=False, user_agent=BROWSER_USER_AGENT, headers={"Accept": "text/html,application/xhtml+xml,text/plain,application/pdf;q=0.9,*/*;q=0.5"})
+            response = await _http(
+                spec, "GET", url, raw=True, follow_redirects=False, user_agent=BROWSER_USER_AGENT, max_bytes=MAX_DOCUMENT_BYTES, headers={"Accept": "text/html,application/xhtml+xml,text/plain,application/pdf;q=0.9,*/*;q=0.5"}
+            )
         except ProviderError as exc:
             # A site refusing, missing or timing out a page says nothing about
             # direct fetching in general; the next provider may still read it.
@@ -439,7 +469,7 @@ async def http(spec, request, *, request_secrets=None):
     key = _key(spec, False)
     if key:
         secrets.append(key)
-    url = _render(spec.url, request)
+    url = _render(spec.url, request, encode=True)
     params = _render(spec.params, request) or None
     body = _render(spec.body, request) if spec.body is not None else None
     response = await _http(spec, spec.method, url, secrets=secrets, headers=headers, params=params, body=body, raw=True)

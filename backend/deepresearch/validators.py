@@ -23,14 +23,20 @@ def research_gaps(plan: ResearchPlan, units, findings, pool, results=(), citable
     gaps = []
     # A supplement can satisfy its original objective; it is not a new user objective.
     for original in plan.research_units:
+        # A supplement names the step it extends. Matching gap-id prefixes took
+        # "market-size" for a supplement of "market" and closed the wrong gap.
         family = {original.id}
-        family |= {u["id"] for u in units if (u.get("parent_gap_id") or "").startswith(original.id + "-")}
+        family |= {u["id"] for u in units if u.get("parent_gap_id") and (u.get("depends_on") or [None])[0] == original.id}
         relevant = [f for f in findings if f["unit_id"] in family]
         evidence_ids = {eid for f in relevant for eid in f["evidence_ids"] if eid in pool and (citable_ids is None or eid in citable_ids)}
         evidences = [pool[eid] for eid in evidence_ids]
         problems = []
         latest = next((result for result in reversed(results) if result["unit_id"] in family), None)
-        if latest and latest.get("open_questions"):
+        # Open questions earn one more round. A researcher can always think of
+        # another question, so asking again after a supplement never converged:
+        # two planned steps ran as six with max_iterations 2 and as eighteen with 8.
+        supplemented = len(family) > 1
+        if latest and latest.get("open_questions") and not supplemented:
             problems.append(("open-questions", "仍可通过公开资料补充：" + "；".join(latest["open_questions"][:6])))
         if not relevant or not evidences:
             problems.append(("coverage", "该研究目标尚无可引用的发现"))
@@ -84,7 +90,8 @@ def supplemental_units(plan, gaps, iteration, remaining):
                 **{
                     **original.model_dump(),
                     "id": f"S{iteration}-{digest(uid)[:8]}",
-                    "objective": original.objective + "\n只补充以下缺口：" + "；".join(g["description"] for g in missing),
+                    # The objective has a length limit; a long list of open questions must not make the supplement invalid.
+                    "objective": (original.objective[:2400] + "\n只补充以下缺口：" + "；".join(g["description"] for g in missing))[:3900],
                     "parent_gap_id": missing[0]["gap_id"],
                     "depends_on": [uid],
                 }

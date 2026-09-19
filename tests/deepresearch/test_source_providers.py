@@ -1,12 +1,11 @@
 """Research sources: format-independent extraction, provider presets and failover."""
 
 import json
+import sys
+import types
 
 import httpx
 import pytest
-
-import sys
-import types
 
 from deepresearch import channels, extract, providers
 from deepresearch.config import McpServerSpec, ProviderSpec, SourceSpec
@@ -318,3 +317,155 @@ async def test_http_provider_headers_use_the_request_credential(settings, monkey
         assert [item["title"] for item in outcome.records] == ["内部文档"]
     finally:
         SECRETS.set("kb-token", None)
+
+
+@pytest.mark.asyncio
+async def test_a_step_that_runs_out_of_searches_is_told_to_finish_instead_of_failing(settings, tmp_path):
+    """Hitting the search ceiling must wind the step down, not fail the run.
+
+    The researcher is told how many searches a step may make and, once they are
+    used, the tool answers with a stop instruction so the model writes its notes
+    from what it already has.
+    """
+    from deepresearch.channels import SearchBudget
+    from deepresearch.store import Store
+
+    store = Store(tmp_path / "budget.sqlite")
+    await store.start()
+    run = {"run_id": "r", "owner": "u", "usage": {"model_tokens": 0, "tool_calls": 0}, "budget": {"max_model_tokens": None, "max_tool_calls": 100}}
+    await store.create(run, "key", "hash")
+    budget = SearchBudget(store, "r", "u1", limit=2)
+
+    assert await budget.reserve() is None and await budget.reserve() is None
+    refusal = await budget.reserve()
+    assert refusal and "all 2 of its searches" in refusal.text and "no more searches" in refusal.text.lower()
+    assert (await store.get("r"))["usage"]["tool_calls"] == 2  # a refused call costs nothing
+    events = [event for event in await store.events("r") if event["type"] == "research.search.limited"]
+    assert len(events) == 1 and events[0]["data"]["unit_id"] == "u1"
+    assert await budget.reserve()  # still refusing, still one event
+    assert len([event for event in await store.events("r") if event["type"] == "research.search.limited"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_run_wide_tool_ceiling_also_winds_a_step_down(settings, tmp_path):
+    from deepresearch.channels import SearchBudget
+    from deepresearch.store import Store
+
+    store = Store(tmp_path / "ceiling.sqlite")
+    await store.start()
+    run = {"run_id": "r", "owner": "u", "usage": {"model_tokens": 0, "tool_calls": 0}, "budget": {"max_model_tokens": None, "max_tool_calls": 1}}
+    await store.create(run, "key", "hash")
+    budget = SearchBudget(store, "r", "u1", limit=None)
+
+    assert await budget.reserve() is None
+    refusal = await budget.reserve()
+    assert refusal and refusal.reason == "run" and "budget" in refusal.text.lower()
+    assert (await store.get("r"))["usage"]["tool_calls"] == 1
+
+
+@pytest.mark.asyncio
+async def test_an_exhausted_step_never_reaches_a_provider(settings, tmp_path, monkeypatch):
+    from deepresearch import channels
+    from deepresearch.store import Store
+
+    store = Store(tmp_path / "tool-budget.sqlite")
+    await store.start()
+    await store.create({"run_id": "r", "owner": "u", "usage": {"model_tokens": 0, "tool_calls": 0}, "budget": {"max_model_tokens": None, "max_tool_calls": 50}}, "key", "hash")
+
+    async def unexpected(*args, **kwargs):
+        raise AssertionError("A step without searches left must not call a provider")
+
+    monkeypatch.setattr(channels, "call", unexpected)
+    budget = channels.SearchBudget(store, "r", "u1", limit=0)
+    source = SourceSpec(name="web", tool="web_search", role="search", origin="external", providers=[{"id": "ddg", "type": "duckduckgo"}])
+    tool = channels.build_tool(source, settings, "r", budget=budget)
+    message = await tool.ainvoke({"type": "tool_call", "name": "web_search", "args": {"query": "q"}, "id": "c1"})
+    assert "write your research notes" in message.content.lower()
+    assert message.artifact == {"schema": channels.BUDGET_STOP, "reason": "step"}
+
+
+@pytest.mark.asyncio
+async def test_a_step_out_of_searches_can_still_open_the_pages_it_found(settings, tmp_path, monkeypatch):
+    """The search allowance counts searches, not page reads.
+
+    Only an opened page is citable. Charging reads to the search allowance left
+    a live run (40e5b85a) with three searches per step, no page ever read and no
+    citable evidence. Reads still count toward the run-wide tool ceiling.
+    """
+    from deepresearch import channels
+    from deepresearch.store import Store
+
+    store = Store(tmp_path / "reads.sqlite")
+    await store.start()
+    await store.create({"run_id": "r", "owner": "u", "usage": {"model_tokens": 0, "tool_calls": 0}, "budget": {"max_model_tokens": None, "max_tool_calls": 3}}, "key", "hash")
+
+    async def fake(provider, request, servers=None, request_secrets=None):
+        if request.role == "read":
+            return providers.Outcome(document={"title": "Guide", "url": request.url, "text": "uv.lock pins every platform."})
+        return providers.Outcome(records=[{"title": "Guide", "url": "https://docs.example/guide", "snippet": "lock files"}])
+
+    monkeypatch.setattr(channels, "call", fake)
+    budget = channels.SearchBudget(store, "r", "u1", limit=1)
+    search = channels.build_tool(SourceSpec(name="web", tool="web_search", role="search", origin="external", providers=[{"id": "ddg", "type": "duckduckgo"}]), settings, "r", budget=budget)
+    read = channels.build_tool(SourceSpec(name="reader", tool="web_fetch", role="read", origin="external", providers=[{"id": "reader", "type": "direct"}]), settings, "r", budget=budget)
+
+    await search.ainvoke({"type": "tool_call", "name": "web_search", "args": {"query": "uv lock"}, "id": "s1"})
+    refused = await search.ainvoke({"type": "tool_call", "name": "web_search", "args": {"query": "again"}, "id": "s2"})
+    assert "no more searches" in refused.content.lower() and "open" in refused.content.lower()
+    page = await read.ainvoke({"type": "tool_call", "name": "web_fetch", "args": {"url": "https://docs.example/guide"}, "id": "p1"})
+    assert page.artifact["schema"] == "deerflow.web_page.v1" and "every platform" in page.content
+    assert (await store.get("r"))["usage"]["tool_calls"] == 2
+    # Past the run-wide ceiling a read is refused too, and the model is told to stop.
+    await read.ainvoke({"type": "tool_call", "name": "web_fetch", "args": {"url": "https://docs.example/other"}, "id": "p2"})
+    stopped = await read.ainvoke({"type": "tool_call", "name": "web_fetch", "args": {"url": "https://docs.example/third"}, "id": "p3"})
+    assert "research-wide tool budget" in stopped.content and stopped.artifact == {"schema": channels.BUDGET_STOP, "reason": "run"}
+    assert (await store.get("r"))["usage"]["tool_calls"] == 3
+
+
+def test_a_budget_stop_reply_is_never_evidence():
+    """The stop instruction is a message to the model, not something it read.
+
+    In live run 40e5b85a every refused read became a citable-looking
+    ``tool_output`` record whose text was the instruction itself.
+    """
+    from deepresearch import channels
+
+    source = SourceSpec(name="reader", tool="web_fetch", role="read", origin="external", providers=[{"id": "reader", "type": "direct"}])
+    execution = NativeExecution(
+        answer="notes",
+        execution_id="exec",
+        messages=[
+            {"type": "ai", "tool_calls": [{"id": "p1", "name": "web_fetch", "args": {"url": "https://docs.example/guide"}}]},
+            {"type": "tool", "name": "web_fetch", "tool_call_id": "p1", "content": "No more searches in this step ...", "artifact": {"schema": channels.BUDGET_STOP, "reason": "step"}},
+        ],
+    )
+    evidences, catalog = research_observations(execution, [source])
+    assert evidences == [] and catalog == []
+
+
+@pytest.mark.asyncio
+async def test_parallel_searches_in_one_turn_cannot_overrun_the_step_allowance(settings, tmp_path):
+    """A model often sends several searches in one turn; they run concurrently.
+
+    Each must claim its slot before waiting on the ledger, otherwise all of
+    them see the same remaining allowance and every one is executed.
+    """
+    import asyncio
+
+    from deepresearch.channels import SearchBudget
+    from deepresearch.store import Store
+
+    store = Store(tmp_path / "parallel.sqlite")
+    await store.start()
+    await store.create({"run_id": "r", "owner": "u", "usage": {"model_tokens": 0, "tool_calls": 0}, "budget": {"max_model_tokens": None, "max_tool_calls": 100}}, "key", "hash")
+    budget = SearchBudget(store, "r", "u1", limit=2)
+
+    outcomes = await asyncio.gather(*(budget.reserve() for _ in range(3)))
+    assert sum(outcome is None for outcome in outcomes) == 2
+    assert (await store.get("r"))["usage"]["tool_calls"] == 2
+
+    # A slot the run-wide ceiling refuses is given back to the step.
+    tight = SearchBudget(store, "r", "u2", limit=5)
+    await store.mutate("r", lambda run: run["budget"].update({"max_tool_calls": 2}))
+    assert (await tight.reserve()).reason == "run"
+    assert tight.used == 0

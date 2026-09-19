@@ -1,9 +1,14 @@
 "use client";
 
+import { ArrowLeft, ArrowRight } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import { faviconUrl } from "@/core/deepresearch/api";
-import { excerptPreview, sourceTitle } from "@/core/deepresearch/presentation";
+import {
+  excerptPreview,
+  sourceSummary,
+  sourceTitle,
+} from "@/core/deepresearch/presentation";
 import type { Citation } from "@/core/deepresearch/types";
 import { cn } from "@/lib/utils";
 
@@ -14,6 +19,11 @@ function hostOf(url?: string | null) {
     return "";
   }
 }
+
+/** The hover card that previews a citation: 340px wide, fade only. It is
+ * portalled out of the page, so it carries the research palette itself. */
+export const CITATION_CARD_CLASS =
+  "deepresearch-surface research-fade w-[340px] max-w-[calc(100vw-2rem)] overflow-hidden rounded-[16px] border-(--dr-line) p-0 shadow-lg";
 
 const HOSTNAME = /^(?:[a-z0-9-]+\.)+[a-z][a-z0-9-]+$/;
 
@@ -58,7 +68,8 @@ export function SiteIcon({
           alt=""
           loading="lazy"
           decoding="async"
-          className="size-3.5 object-contain"
+          // Scales with the badge: 16px in lists, 12px inside a domain chip.
+          className="size-[72%] object-contain"
           onError={() =>
             setState({
               host,
@@ -82,8 +93,27 @@ export function SiteIcon({
   );
 }
 
-/** Hover-card body for a citation: the source and the excerpt it was cited for.
- * Several excerpts of one page share a number; the hovered evidence wins. */
+/** “摘录”: the citation rests on what a search tool showed, not on the page
+ * itself (`basis: "search excerpt"`). Absent for pages and records, and for
+ * reports written before the field existed. */
+export function BasisNote({ citation }: { citation: Citation }) {
+  if (citation.basis !== "search excerpt") return null;
+  return (
+    <span
+      data-citation-basis
+      title="检索摘录，未读取原文"
+      aria-label="检索摘录，未读取原文"
+      className="shrink-0 rounded-full border border-(--dr-line) px-1.5 text-[11px] leading-4 text-(--dr-text-tertiary)"
+    >
+      摘录
+    </span>
+  );
+}
+
+/** Hover-card body for a citation, like ChatGPT's: site, title and the excerpt
+ * it was cited for, each clamped to two lines. Several excerpts of one page
+ * share a number; the hovered evidence opens first and the arrows reach the
+ * rest. No URL, date or number: the sources panel has them. */
 export function CitationPreview({
   citation,
   evidenceId,
@@ -94,47 +124,76 @@ export function CitationPreview({
   const excerpts = citation.excerpts?.length
     ? citation.excerpts
     : [{ evidence_id: citation.evidence_id, text: citation.snippet }];
-  const chosen =
-    excerpts.find((item) => item.evidence_id === evidenceId) ?? excerpts[0];
-  const text = excerptPreview(chosen?.text);
+  const hovered = Math.max(
+    0,
+    excerpts.findIndex((item) => item.evidence_id === evidenceId),
+  );
+  // The reader's own choice lasts until another evidence is hovered.
+  const [picked, setPicked] = useState<{ from: string; index: number }>();
+  const key = `${citation.evidence_id}:${evidenceId ?? ""}`;
+  const index =
+    picked?.from === key
+      ? Math.min(picked.index, excerpts.length - 1)
+      : hovered;
+  // Two lines are all there is: do not spend them repeating the title.
+  const text =
+    sourceSummary(excerpts[index]?.text, citation.title, 360) ||
+    excerptPreview(excerpts[index]?.text);
   const domain = citation.domain ?? hostOf(citation.url);
+  const step = (delta: number) =>
+    setPicked({
+      from: key,
+      index: (index + delta + excerpts.length) % excerpts.length,
+    });
   return (
-    <div className="space-y-2 text-xs">
-      <div className="text-muted-foreground flex items-center gap-2">
-        <SiteIcon domain={domain} />
-        <span className="min-w-0 truncate">{domain || "工具执行记录"}</span>
-        <span className="ml-auto tabular-nums">[{citation.number}]</span>
-      </div>
-      <p className="line-clamp-2 text-sm leading-5 font-medium">
-        {sourceTitle(citation.title, citation.url)}
-      </p>
-      <div>
-        <p className="text-muted-foreground mb-1 font-medium">
-          {citation.provenance === "fetched_document"
-            ? "原文片段"
-            : "引用关联片段"}
-        </p>
-        {text ? (
-          <blockquote className="border-border text-foreground/80 line-clamp-6 border-l-2 pl-3 leading-5">
-            {text}
-          </blockquote>
-        ) : (
-          <p className="text-muted-foreground">没有可显示的片段。</p>
-        )}
-      </div>
+    <div data-citation-preview>
       {excerpts.length > 1 && (
-        <p className="text-muted-foreground">
-          本页另有 {excerpts.length - 1} 段引用片段
-        </p>
+        <div className="bg-muted text-muted-foreground flex h-8 items-center gap-1 px-2">
+          <button
+            type="button"
+            aria-label="上一段摘录"
+            className="hover:text-foreground flex size-6 items-center justify-center rounded-md"
+            onClick={() => step(-1)}
+          >
+            <ArrowLeft className="size-4" />
+          </button>
+          <button
+            type="button"
+            aria-label="下一段摘录"
+            className="hover:text-foreground flex size-6 items-center justify-center rounded-md"
+            onClick={() => step(1)}
+          >
+            <ArrowRight className="size-4" />
+          </button>
+          <span
+            aria-live="polite"
+            className="ml-auto pr-1 text-xs tabular-nums"
+          >
+            {index + 1} / {excerpts.length}
+          </span>
+        </div>
       )}
-      {citation.url && (
-        <p className="text-muted-foreground truncate">
-          {citation.published_at
-            ? `${citation.published_at.slice(0, 10)} · `
-            : ""}
-          {citation.url}
+      <div className="space-y-1.5 p-3">
+        <div className="text-muted-foreground flex items-center gap-2 text-sm leading-5">
+          <SiteIcon domain={domain} className="size-4" />
+          <span className="min-w-0 truncate">{domain || "工具执行记录"}</span>
+          <span className="ml-auto flex">
+            <BasisNote citation={citation} />
+          </span>
+        </div>
+        <p
+          data-citation-title
+          className="line-clamp-2 text-[15px] leading-5 font-semibold"
+        >
+          {sourceTitle(citation.title, citation.url)}
         </p>
-      )}
+        <p
+          data-citation-excerpt
+          className="text-muted-foreground line-clamp-2 text-sm leading-5 break-words"
+        >
+          {text || "没有可显示的片段。"}
+        </p>
+      </div>
     </div>
   );
 }

@@ -1,6 +1,6 @@
 # DeepResearch 交接文档
 
-更新时间：2026-09-18。本文面向继续开发本项目的工程师或 Agent，记录当前状态、验收证据、运行方式、
+更新时间：2026-09-19。本文面向继续开发本项目的工程师或 Agent，记录当前状态、验收证据、运行方式、
 风险和下一步。架构与工作流细节见 [ARCHITECTURE.md](ARCHITECTURE.md)，接口契约见 [API.md](API.md)。
 本文不是产品宣传，也不是全量安全认证。
 
@@ -16,8 +16,9 @@
 | 更早的基线 | `5fa0299c` `feat(deepresearch): unify native research chat and harden workflow recovery` |
 | 功能状态 | 交互、工作流、报告与前端改造完成；五次真实 DeepSeek 研究端到端完成；配置与 DeerFlow 解耦（研究自己的模型、数据源与供应商故障切换、MCP、角色、提示词、上下文压缩）、请求改写节点、设置页、LLM 调用审计均已完成并真实验收 |
 | 离线开发 | 不联网的本地 Agent 从 [OFFLINE_AGENT_GUIDE.md](OFFLINE_AGENT_GUIDE.md) 开始；配置见 [MODEL_CONFIGURATION.md](MODEL_CONFIGURATION.md)、[DEERFLOW_CONFIGURATION.md](DEERFLOW_CONFIGURATION.md)、[RESEARCH_CONFIGURATION.md](RESEARCH_CONFIGURATION.md)；模板在 `examples/deepresearch/offline/` |
+| 最近一轮 | 2026-09-19：全模块代码审查与修复、按节点调参、仅 MCP / 无原文研究、模型网关兼容、时间预算收尾，见第 3.6 节与第 4 节末尾 |
 | 本次回归 | 见第 6 节 |
-| 未验证 | 干净克隆部署、生产构建、公司 MCP 与 SSO、真实手机视口、报告事实逐条核验；远端 CI 以 GitHub Actions 结果为准 |
+| 未验证 | 干净克隆部署、生产构建、目标环境的 MCP 与 SSO、真实手机视口、报告事实逐条核验；远端 CI 以 GitHub Actions 结果为准 |
 
 **务必保留用户原有的本地修改：**
 `backend/packages/harness/deerflow/community/aio_sandbox/local_backend.py`。
@@ -165,11 +166,201 @@
   `POST /settings/test-model` 返回 `ok: true`（普通回复 ready、工具调用 lookup、用量 30 tokens），
   把 `rewrite_model` 指向它后新建研究，改写节点拿到完整契约并进入规划；假服务日志显示全程只有 `stream=True` 请求。
 
+**merge 节点的长标题 / 长网址问题（2026-09-18 用户报告）**
+- 根因：`observations.py` 用 `model_copy(update=...)` 生成派生证据，**绕过 pydantic 校验**。超长标题（页面没有标题时用
+  整条网址，GitHub 的签名链接能到 1500+ 字符）、无法作为定位符的网址、空正文都会被写进结果，直到 `evidence_merge`
+  统一校验时才报错，而且一条坏记录会让整个研究失败（真实运行 `52e358b9` 就是这样挂的）。
+- 修复分三层：
+  1. 产出端：`observations.derive()` 走完整校验再落库，无法成为证据的记录当场跳过；`observed_sources` 的标题限长 1000。
+  2. 契约层：展示性字段（标题、发布方、正文片段、计划与步骤标题）超长时截断而不是拒绝；定位符、ID、结论、简报仍然严格。
+  3. merge 节点：`evidence.valid_result()` 逐条校验历史结果，丢掉当前 schema 无法接受的记录并记事件
+     `research.evidence.dropped`（只记 raw_id 与字段名），发现仍保留活着的引用，引用全被丢掉的发现才一起丢；
+     结构性错误照旧让运行失败。
+- 顺带修掉一个弱模型的坑：步骤标题（上限 80）或计划标题（上限 120）写超一点就会让整份计划被拒、进入转换重试甚至失败，现在直接截断。
+- 验证：用真实运行 `52e358b9` 存下的 12 份单元结果回放，全部可用；新增测试覆盖超长标题、带凭据的网址、空正文、
+  引用修复与结构性错误仍然失败。
+
+**预算不再直接让研究失败（2026-09-18 用户要求）**
+- 用户要求：能控制大模型的搜索次数，而不是“搜索次数到上限就报错、整个 workflow 失败”。
+- 新增 `max_searches_per_unit`（默认 30，可在设置页改）：这个数字写进研究员的任务载荷（`search_budget`），
+  用完后检索工具返回“不能再检索，读完已找到的页面后写笔记”，研究单元正常收尾。**读网页不计入**
+  （只有读过的原文能被引用），只计入全局 `max_tool_calls`；全局工具次数用完时所有数据源工具都要求收尾。
+  数据源工具自己记账，模型回调不再重复预留（否则一次检索会扣两次，并且会先抛致命错误）。
+- 停止提示带 `deepresearch.budget_stop.v1` 标记，`research_observations` 跳过它，不会变成证据。
+- 次数是工具端强制执行的，不依赖模型听话：超额的搜索直接返回停止提示，不会调用供应商。模型一轮常并行发 2–3 个搜索，
+  所以每次搜索在等待账本之前就先占位；原先先检查、后计数，并行调用会一起越过上限（测试复现：上限 2 时 3 个并行全部放行）。
+- 模型遵守情况（4 次真实运行、15 个研究步骤、每步上限 3）：没有步骤实际执行超过 3 次；13 步主动没超，
+  2 步尝试了第 4 次，被拒一次后就不再搜索。供应商全部失败的搜索也计入次数（防止失败时反复重试）。
+- 模型 token 预算同样改为收尾：
+  - 每次调用按真实量级预留（研究回合“输入 + 4096”，写报告“输入 + 8192”），结束后按实际用量结算；
+    不上报用量时按完整输出上限记账。原来每次预留整个 `max_output_tokens`（32768），120k 预算在实际只用一半时就显得用完了，
+    并发 3 个章节写作也根本放不下。
+  - 报告预留改为“上限的 1/5，至少 60000，最多一半”（`REPORT_RESERVE_FLOOR`；实测一份 3 单元报告 8 次调用约 145k）。
+  - 每个研究单元分到“研究剩余额度 ÷ 同时进行的单元数 − 整理余量”，通过引擎自带的 `TokenBudgetMiddleware`
+    生效：用到一半提醒收尾，用满时去掉工具调用、让它写笔记（`stop_reason=token_capped`，报告局限里用报告语言说明）。
+    运行有有限预算时总是生效，宿主为研究角色关掉自身兜底上限时也生效；宿主开启的上限只会让它更严。
+  - 整理笔记（conversion）可以动用报告预留；研究调用若仍超出研究额度，抛非致命的 `RESEARCH_BUDGET_SPENT` → 该单元降级；
+    `store.research_spent`（已有单元因预算失败，或剩余不足一个回合）为真时不再补研。
+- 真实验证（DeepSeek v4 flash，每步 3 次检索，均为 API 创建）：
+  - `40e5b85a`（旧逻辑）：读网页被计入检索次数，3 次搜索后一页都没读成，停止提示还被记成证据 → `NO_EVIDENCE`。
+  - `1f2eb215`：读网页正常了，但 3 个单元并行读页面，研究额度半路用尽、单元失败、证据全丢 → `NO_EVIDENCE`。
+  - `07a0c7a6`：每步份额没生效——在线启动器 `--unlimited-budget` 为研究角色关掉了引擎原生预算，旧代码随之跳过。
+  - `83a18759`：份额生效，3 个单元被截停后正常完成；写报告的大纲调用要预留“输入 + 32768”，放不进剩余 30k → `BUDGET_EXHAUSTED`。
+  - `0ecd0bcb`（默认 120k tokens / 60 次工具）：**COMPLETED**，83k tokens、11 次工具、62 条证据、2 条引用；
+    两个单元降级为“未能完成”并写进局限。报告单薄是 120k 预算本身的结果。
+  - `8b16f9ef`（token 不限、全局工具 15 次，即网页端带部署上限的情形）：**COMPLETED**，工具恰好用满 15 次后收尾，
+    259 条证据、5 条引用、无失败单元。
+- 已知限制：120k 预算能保证出报告，但研究很浅。`deepresearch.example.yaml` 的 `budget_ceiling` 与 API 默认值都是 120k，
+  网页端会把部署上限当作预算发出；需要像样的研究时应调大 `max_model_tokens`（一次完整研究实测数百万 token）。
+
 **其他修复**
 - 角色方法论不再把 SKILL 文件的 YAML 头信息发给模型（`Settings.methodology`）。
 - 证据的展示字段（标题、发布方）超长时截断而不是校验失败：一条 1584 字符的签名图片链接曾让 `evidence_merge` 抛出
   ValidationError，整个研究失败（真实运行 `52e358b9` 中复现）。
 - 研究员进度说明的语言要求增加对比强调（“即使这些指令和你读到的网页是别的语言”）。
+
+## 3.6 本轮完成的工作（2026-09-19）：代码审查、节点调参、仅 MCP 研究、网关兼容、时间收尾
+
+用户要求：通读交接文档后对 DeepResearch 模块做代码审查，找潜在错误、漏洞与逻辑错误；并明确了目标——
+全部配置独立于 DeerFlow、一个文件配好；搜索既要支持自己的 MCP 也要能扩展其他工具，必要时禁用网页工具只用 MCP，
+MCP 要带 Cookie/Token 鉴权、返回格式不统一、多数拿不到原文、要有白名单；首先保证工作流可用，成本/时间/性能可观测；
+模型网关只支持 Chat Completions；为了 JSON 输出稳定，每个节点的模型与参数都要能单独调；整条链路
+（改写 → 计划 → 并行研究 → 证据检查与补研 → 大纲 → 并行章节 → 输出）都要可调。追加要求：**代码、目录名与配置里不要单独区分
+某一种部署，这些都是统一的通用能力**（不要出现 company 之类的变体命名或单独模板）。
+
+做法：我自己通读核心链路（workflow / runner / native / models / structured / channels / providers / mcp / extract /
+observations / report_policy / prompts / store 预算 / service 驱动），三个只读审查代理分别审持久化与 API、报告与证据契约、前端，
+每条发现都带复现脚本；随后修复，并用真实运行验证。真实运行又暴露了四个单测发现不了的问题（见第 4 节）。
+
+**按节点调参（新增 `config.NodeSpec`、`nodes:`）**
+- 九个可调节点：`rewrite`、`plan`、`research`、`conversion`、`outline`、`section`、`summary`、`revision`、`follow_up`。
+  每个节点可设 `model`、`temperature`、`top_p`、`max_tokens`、`timeout_seconds`、`output_retries`、`json_mode`（仅直接调用）、
+  `extra_body`；`rewrite` 与 `summary` 可以关闭。参数写在该次执行私有的模型副本上（`models.with_node`），由引擎自己的模型工厂生效。
+- 工作流调优项：`writer_concurrency`、`plan_min_units` / `plan_max_units`、`max_seconds_per_unit`、`max_findings_per_unit`、
+  `supplement_gap_codes`、`report_time_reserve_seconds`；`max_output_tokens` 默认 4096 → 8192；角色超时上限 1800 → 14400 秒。
+- 指标新增 `breakdown.by_node`：每个节点的模型、调用、Token、P50/P95、被截断次数、格式重试次数、费用，合计与总数一致。
+  `doctor` 输出每个节点实际生效的模型与参数，并新增 JSON 契约探测（含输出速度）。
+
+**仅 MCP、无原文的研究**
+- 没有任何启用的 `role: read` 数据源时，检索结果就是证据（`report_policy.results_citable`，全模块唯一规则）：
+  研究员用 `prompts.research_records`，整理用 `prompts.conversion_records` 与不含 `source_annotations` 的契约，
+  每条检索结果单独成为证据，参考资料标注“检索摘录，未读取原文”，写作模型被要求归因式表述。
+  原先提示词和工具说明写死“先打开页面、摘要不可引用”，这类部署要么让模型去找不存在的工具，要么以 `NO_EVIDENCE` 结束。
+- 可引用结论随证据保存（`RawEvidence.citable`）：角色白名单只有内部检索、而部署里另有网页读取工具时，缺口判断与写作不再推翻研究单元的结论。
+- `sources[].enabled`：保留配置但不提供给规划与研究员（网页工具一键停用）。
+- MCP：`mcp_servers.<name>.allowed_tools` 白名单（加载时与解析工具时各查一次）；请求头/环境变量支持
+  `Bearer ${ENV}`、`sid=${secret:NAME}` 插值且同样脱敏；连接失败归类为鉴权/超时/网络/服务异常并给出可读提示
+  （原先一律是 `network (ExceptionGroup)`，401 与连不上无法区分）；`kind: mcp` 数据源原先完全不计入工具预算，现已计量并有单次调用超时；
+  工具发现缓存有上限；`doctor --probe-mcp`。
+- 异构返回：只有正文、没有标题与链接的片段（`{content, score, doc_id}`）也逐条成为记录；自身带 `name`/`description` 的信封不再被当成一条记录；
+  识别更多日期与 `*_id` 字段。
+
+**模型网关兼容（新增 `chat_completions.py`）**
+- `provider: openai` 加非官方 `base_url` 时发送 `max_tokens`（LangChain 总是改名为 `max_completion_tokens`，老协议网关会忽略或拒绝），
+  并开启流式用量（LangChain 在设置 `base_url` 后默认关闭，导致所有调用“未上报用量”）。`ModelSpec` 新增 `top_p`、`stream_usage`、`max_tokens_param`。
+
+**可用性**
+- 时间预算改为收尾：原先 `max_elapsed_seconds` 到点整个运行失败且不可恢复。现在研究在剩余一份报告预留时收尾，报告照常生成（细节见 RESEARCH_CONFIGURATION 第 11 节）。
+- 预算按任务计：原先 `usage` 从不重置，研究用掉大半预算后，任何追问（回答、改写、新一轮研究）都会因预算或时间失败。
+- 规划鲁棒性：计划里出现未知角色、未知或已停用的数据源、步骤超限时带原因重试，最后一次自动修正，而不是整个运行失败；规划只安排现有数据源能回答的步骤。
+- 补研收敛：`open-questions` 每个步骤只触发一轮；饱和与 `NO_EVIDENCE` 按“被发现引用的可引用证据”判断（原先按证据池大小，
+  会补研到上限、写两遍报告再以 `FINAL_VALIDATION` 失败）；补研归属按 `depends_on` 而不是 ID 前缀。
+- 弱模型输出：只有 `</think>` 的推理不再进入正文；示例对象在前时取真实对象；尾逗号/单引号可读；被截断的回复得到“请缩短”的反馈；
+  改写失败时不再把残缺 JSON 整段当成研究请求。
+- 报告：接近的标记写法归一化、畸形标记报错并清除；未闭合代码围栏不再吞掉后续章节；大纲标签先清洗再组装；局限永远不为空；
+  空章节写成局限；改写结果丢章节时拒绝发布；非文档内链接与图片（含 `//host`）一律删除；单页应用路由视为不同页面；无 URL 记录去重并显示来源名。
+
+**安全（设置页写入口统一收口在 `profile.guard`）**
+- 角色 `path` 可读取宿主任意文件并经 `GET /settings` 回显给所有登录用户 → 设置页只接受方法论正文。
+- 设置页可新增 stdio MCP 服务（“列出工具”即在网关主机上执行命令，绕过宿主对 stdio 的加固）→ stdio 只能写在运维配置文件里。
+- 自定义模型类、请求头/环境变量里的明文凭据同理拒绝；不能编辑的用户看到的明文凭据显示为 `[hidden]`。
+- 自定义 HTTP 供应商的 URL 模板对查询词做 URL 编码；直接抓取改为流式限长（原先先整包下载再截断）。
+- 长工具结果归档时保持为文本（原先超过 2 万字符会变成 `{'preview': …}` 字典并进入证据摘录）；数据源 artifact 的归档上限放宽以保留全部记录。
+
+**观测**
+- MCP 供应商的内层调用不再被研究回调二次记录与二次计费；知识库查询计入“搜索”；被预算拒绝的调用记为 `budget_stops` 而不算搜索；
+  所有调用都未上报用量时 Token 为 `null` 而不是 0；`budget.earlier_tasks`。
+
+**前端**
+- 审查修复：已有报告的会话在追问失败或被停止后不再是死路（错误与“从检查点恢复”可见，输入框保持可用，后端接受继续追问；
+  没有报告的已停止任务返回 409 `RUN_STOPPED`，与执行中的 `RUN_BUSY` 区分开）；表单内“取消更新 / 停止”按钮不再把草稿当作研究更新提交；
+  事件流收到非 200 后按退避重建并在流不健康时轮询；事件持续到达时刷新不再被取消；已完成任务不再从头回放事件，
+  运行中的任务从快照里的 `last_event_seq` 接续；
+  报告正文不渲染远程图片；页内新建研究后点侧栏入口会回到新研究；目录按渲染后的标题定位；倒计时归零后“开始”可重新点击；
+  Trace 时间线分页拉全；未计量的数值显示“—”。
+- 设置页：新增“节点调参”一节（按工作流顺序，每个节点一张卡，未配置即继承）、数据源启用开关与“没有读取工具”的提示、
+  MCP 工具白名单（列出工具时勾选，失败时显示鉴权/超时/网络等原因）、模型的 `top_p` / 流式用量 / 输出上限参数名、
+  运行参数（写作并发、计划步骤数范围、每步软时限与发现条数、补研触发的缺口类型、报告预留时间、报告长度系数）；
+  修复：脏草稿下保存密钥绕过 409、模型改名途经同名时劫持对方的引用与单价、恢复版本后表单仍是旧草稿、卡片用数组下标做 key、无效输入不阻止保存；
+  请求头/环境变量里疑似明文凭据在前端就会报错。
+- 指标页新增“按节点”表（模型、调用、错误、Token、平均输出、被截断、格式重试、P50/P95、耗时、费用）。
+- ChatGPT 对标改造（依据 [CHATGPT_BENCHMARK_2026-09-19.md](CHATGPT_BENCHMARK_2026-09-19.md) 的实测数值）：研究页作用域内的冷白配色（`.deepresearch-surface`，不改全站 token）；
+  提交后的“正在思考 → 正在制定研究计划”流光文字与 24px 圆角骨架块；纯白计划卡/进度卡（16px 步骤、圆环 spinner、平滑的圆环倒计时、
+  带流光的状态行、搜索计数、4px 进度条、圆形停止键）；完成后统计行加白色报告卡（蓝色文档图标、可滚动预览、渐隐遮罩）；
+  全屏阅读器（侧栏收成图标轨、624px 正文栏、28/24/20px 标题层级、左侧目录刻度条不再压正文、悬停目录浮层、滚动后才出现的顶栏底线、开合淡入淡出）；
+  引用标记、两行摘录的悬停卡、点击后来源面板联动高亮；右侧面板默认 375px、胶囊页签、按域名分组的来源与“已扫描的来源”、统一视觉语言的活动时间线；
+  `citations[].basis` 为检索摘录时显示“摘录”标注；`prefers-reduced-motion` 下关闭流光与过渡。
+  共享组件只有一处改动：`chat-box.tsx` 的扩展面板新增可选的 `defaultSize`（研究页传 375px，其他页面行为不变）。
+
+**提示词缓存（2026-09-19 晚，用户反馈"输入 69.7k · 缓存命中 27%"）**
+- 诊断方法：调用审计里每条消息按哈希存储，对同一会话相邻两次请求求"从头相同的消息数"。结果是研究员循环每一轮只有系统提示词相同：
+  引擎的 `ToolReceiptMiddleware`（子 Agent 链固定 `render_mode="always"`）在系统提示词后面插入一份"工具回执清单"，每轮重写、不断变长，
+  于是其后的全部历史每一轮都失效。研究节点占输入 Token 的 91%，命中率只有 4–5%；去掉这条消息后同一批录制数据的可复用前缀是 77–82%，
+  并且除它以外没有任何其他前缀破坏点。
+- 对照 pi（`earendil-works/pi`，原 `badlogic/pi-mono`）的做法：对话只追加、前缀里不放易变内容、会话 ID 写进供应商认识的路由字段、
+  对不认识这些字段的后端按兼容开关省略、把未命中显示出来。逐条落地：
+  1. `tool_receipt_ledger: false`（新设置，默认关）：`model_budget_config` 在研究私有的引擎配置里关闭 `verification.receipts_enabled`，
+     宿主配置不变、不改引擎代码；引擎的开关连打标一起关，所以 `observations.derived_receipts` 从归档的工具消息推导 `r1..rN` 与状态，
+     证据目录不变。研究员输出提示词与压缩提示词不再要求引用回执 ID（模型已经看不到它们）。
+  2. 载荷顺序从"所有调用相同"到"只有本次调用才有"：研究步骤 `instructions` 在最前、`unit` 在数据源之后、预算计数在最后；
+     章节写作把 `findings`/`evidence` 放在 `section` 之前（同一批步骤写出的章节共享整段证据前缀，修复调用只多出草稿）；
+     转换请求改为 `{"task", "answer"}`。`digest` 按键排序，缓存键不变。
+  3. `ModelSpec.session_param` / `session_header`（默认不发送；OpenAI 官方地址自动带 `prompt_cache_key`）：把会话的摘要 ID 写进请求体字段或请求头，
+     供多副本网关做会话粘性；设置页"模型"卡片有对应输入框。`models.merged_overrides` 顺带修了直接调用（改写、转换）里节点 `extra_body`
+     会整体替换模型自带 `extra_body` 的问题（引擎的 `model_overrides` 是整字段覆盖）。
+  4. 可观测：每次模型调用记录 `prefix_messages` / `prefix_chars`，指标新增 `tokens.prefix_reuse_ratio` 与按节点的
+     `cache_read_ratio` / `prefix_reuse_ratio`，指标页"按节点"表新增"缓存命中 / 可复用"列、效率区新增"可复用前缀（缓存命中上限）"。
+     可复用低=请求开头被改写；可复用高而命中低=模型服务没缓存或没有会话粘性。它不依赖供应商上报用量，没有 usage 的网关也能看。
+- **逐节点核对请求体（同日，用户追问"每次请求都符合前缀匹配吗"）**：第一轮只改了研究、章节、笔记整理三个节点，核对后发现还有三处把"每次都不同的内容"放在最前面，已修：
+  追问 `respond` 原来 `message` 在最前、后面才是整份报告（每次追问整份报告都作废），现在是计划 → 报告 → 对话 → 本次消息 → 说明；
+  改写报告 `revise_report` 原来 `user_request` 在发现、证据、旧报告之前，现在发现与证据最前、请求最后；
+  计划 `plan` 原来请求在最前、5.8k 字符的固定内容（说明、契约、角色、数据源、上限）在最后，现在固定内容最前（`structured_task`：载荷以 `instructions` 开头时，`output_schema` 紧跟其后；写作类长载荷仍把两者留在末尾，保证指令贴近生成位置）。
+  对话窗口 `recent_messages` 不再每轮滑动一条（那样每次请求的第一条消息都变），改为每 10 条才移动一次窗口头。
+  守卫测试 `test_prompt_cache.py` 直接在"模型收到的文本"上断言：同一节点只在新内容上不同的两次调用，共享前缀分别 >60%（计划）、>90%（追问）。
+- 线上字节级的证据来自供应商自己：运行 `244cd6d5` 的 82 个研究后续轮次，DeepSeek 每一轮上报的命中 Token 都 ≥ 上一轮的完整输入（100%），工具定义哈希全程唯一。
+  也就是说消息序列化、工具调用参数的重新序列化、工具定义顺序都没有破坏前缀。
+- 做不到前缀复用的请求（不是缺陷，是内容本来就新）：每个会话的第一轮（只有系统提示词与固定说明能命中）、大纲（单次调用，内容全新）、
+  笔记整理里的笔记与调用目录、每份报告第一次被追问时、上下文压缩发生后的那一轮（历史被摘要替换，pi 同样如此）、并行同时起跑的请求之间。
+- 验收启动器：`--resume-dir` 原来把"示例配置里新增了一个等于默认值的键"也判为配置变更，任何新设置都会让旧验收目录无法恢复；
+  现在缺失的键按 `Settings` 的默认值比较（`live.setting_defaults`，含 `nodes: {}`、`supplement_gap_codes` 这类工厂默认值），其他差异照旧拒绝。
+- 没做的：Anthropic 的 `cache_control` 断点（引擎的中间件链由引擎拥有，未验证不加）；并行扇出的"先预热一个请求再放行其余"；
+  让笔记整理（conversion）接在研究员自己的会话后面以复用其整段上下文。
+
+**工程与审计技能，以及用它自测时发现的问题（2026-09-20）**
+- 新增 `.agents/skills/deepresearch-engineering/`：给接手的 Agent 用的工作技能（Codex 原生读取 `.agents/skills`；Claude Code 用
+  `ln -s ../../.agents/skills/deepresearch-engineering .claude/skills/`；其他 Agent 从 `backend/deepresearch/AGENTS.md` 的指引进入）。
+  `SKILL.md` 给方位、任务路线和不能做的事；`references/` 分开发、调试（错误码与定位路径）、测试与真实验收、调优（症状 → 设置）、审计报告模板与读数陷阱。
+  - `scripts/audit_run.py --run <id|前缀|页面 URL|thread|latest> [--baseline <run>]`：从研究库生成审计底稿（时间、Token、Agent 循环的上下文增长、
+    提示词缓存的供应商逐轮核对与前缀断点、工具与供应商、引擎准入排队、失败工具调用的耗时、补研与重做调用、规则发现及对应设置）；
+    带 `--baseline` 时另给两次运行的设置差异、指标对比、同一问题其他运行的自然波动。数字来自产品自己的 `metrics.collect`。
+  - `scripts/show_call.py`：列出并打开任意一次模型调用（默认只显示相对上一轮新增的消息）、导出成可重放的 Chat Completions 请求体、`--tools` 列出工具调用与各供应商的尝试。
+  - 两个脚本经只读连接读库（不拿写锁、不建表、不写字节码），输出默认写到已被 git 忽略的 `.deerflow/deepresearch/audits/`。
+    `tests/deepresearch/test_audit_skill.py` 用合成研究库跑它们并断言库文件一个字节不变：改表、记录字段或指标键时要连脚本一起改。
+- 自测方式：4 个任务（审计一次慢的研究、排查一次失败、验证一次调参的前后对比、给新增设置写实施计划）各跑两份子 Agent，一份用技能、一份不用。
+  29 条客观断言两组都全过（这个模型够强，而且仓库文档本身已经很全）；用技能的一组 Token −15%、用时 −23%。子 Agent 的反馈修掉了技能里的三处错误
+  （脚本并非只读、预算份额公式写错、旧超时字段）并补了同步清单、测试文件对应表、预算类失败重试无效等内容。
+- **自测顺带查出的产品问题，均已修复并有测试：**
+  1. **引擎准入排队（影响最大）。** 引擎的 `subagent_runtime.max_running`（宿主默认 3）小于研究的并发时，多出来的角色在引擎里排队：运行 `244cd6d5`
+     配置 6 路并发，实际 3 路，三个步骤空等 203 / 261 / 292 秒（总时长 625 秒里 dispatch 占 564 秒；再多等 8 秒就会撞上 300 秒准入超时而失败），
+     而研究侧的“排队秒”显示 0.3 秒。此前所有真实验收都受它影响。修复：验收启动器把 `max_running` 抬到不小于 `max(max_concurrency, writer_concurrency)`，
+     已有验收目录在下次启动时刷新这一项（`_write_yaml(..., refresh=("subagent_runtime",))`）；`python -m deepresearch.doctor` 新增 `engine_capacity`，不匹配时给出要改的值；
+     审计脚本从“角色提交 → 第一次模型调用”的间隔算出这段等待（规则 `engine-queue`）。**常规部署要在宿主 `config.yaml` 里自己设这个值。**
+     产品指标里仍没有这段等待，见第 7 节。
+  2. **章节超长返修（我上一轮重排载荷引入的回归）。** 把 `length` 挪到几万字证据之前后，章节初稿超出硬上限的比例从 1/8 升到 5/8（同题 4 次旧运行是 0–1 次重做），
+     每次多一次修复调用。已把 `length` 放回任务末尾、紧挨 `instructions`；共享前缀本来就止于证据，缓存不受影响。
+  3. **预算太小导致的 `NO_EVIDENCE` 报错误导。** 工具调用为 0 且研究预算已耗尽时，报错现在直接指出是预算、并标为不可重试（重试不改预算也不清已用量）；
+     `API.md` 的创建示例原来写的正是会失败的那组小预算，已加说明。
+  4. `metrics.summarize` 里 `status` 被供应商循环的局部变量覆盖，汇总与 `python -m deepresearch.metrics` 的 status 列把已完成的运行显示成 `cache` / `ok`。已改名并加测试。
 
 ## 4. 真实验收
 
@@ -276,6 +467,86 @@ duckduckgo 应答 88/115，direct 应答 115/143（28 次是单页面级错误�
 阻塞等问题，修复后从检查点恢复完成，过程与证据见 [STABILITY_AUDIT_2026-09-16.md](STABILITY_AUDIT_2026-09-16.md)。
 同一目录的 `ed5d5da5-f155-4a60-bf1f-00d69b822764` 是 SQLite/PostgreSQL 选型的旧格式报告样本。
 
+### 2026-09-19：仅 MCP、无原文、Chat Completions 网关的真实验收
+
+环境（数据目录 `live-` 前缀，由验收启动器新建；网关端口 8011，与用户正在使用的 8001 互不影响）：
+- 模型：DeepSeek `deepseek-v4-flash`，但按 `provider: openai` + `base_url` 接入，即纯 OpenAI Chat Completions，不走 DeepSeek 专用类。
+- 数据源：网页搜索与网页读取配置为 `enabled: false`；只有一个本机 MCP 服务（streamable HTTP），同时校验 `Authorization: Bearer …`
+  与 `Cookie: sid=…`（配置写成 `Bearer ${ENV}` 与 `sid=${secret:…}`，Cookie 经设置接口保存）；三个检索工具返回三种格式
+  （无标题无链接的 JSON 片段、`Title:/URL:` 文本块、带 `name`/`description` 信封的结构化对象），**没有任何工具能打开原文**；
+  另有一个危险工具 `delete_page` 用来检验白名单。
+- 验收启动器新增 `--research-overlay <yaml>`：用一份 YAML 覆盖生成的研究配置（数据源、`mcp_servers`、`nodes`、预算），不改示例文件。
+- 这个 MCP 服务、它的语料和覆盖层已放进仓库：`examples/deepresearch/mcp-stub/`（`server.py`、`corpus.json`、`research-overlay.yaml`、README 里有启动命令；`MCP_STUB_LATENCY` 可模拟慢工具）。
+
+| 运行 | 条件 | 结果 |
+| --- | --- | --- |
+| `b840e200`（修复前基线） | 每步 8 次检索、1 轮补研 | `COMPLETED` 119 秒、40 条引用、9 章 7 表 1 图；暴露下面四个问题 |
+| `2157aede`（修复后，同题） | 同上 | `COMPLETED` 84 秒、25 条引用、9 章 6 表 1 图；整理节点输出 5808 → 2453 token、P50 17.6 → 8.8 秒、0 错误；工具预算 28 = MCP 服务端实际收到的 24 次调用 + 4 次 `read_file`；摘录类引用带“检索摘录，未读取原文” |
+| `bd9be64e`（MCP 每次调用 7 秒且串行，时间上限 120 秒） | 第一版时间收尾 | `FAILED NATIVE_AGENT_TIMEOUT`：三个步骤都在研究截止点被硬超时杀掉，读到的内容全部丢失 |
+| `5dbeb29d`（MCP 每次 12 秒，时间上限 100 秒，修复后） | 时间收尾 | `COMPLETED` 74 秒、10 条引用；三个步骤在第一批检索后收到 `scope: time` 的停止提示，各自写出笔记并在局限里说明“第二批检索被时间预算终止” |
+
+鉴权与白名单（直接对 MCP 服务验证，亦经设置接口 `POST /settings/mcp-tools` 验证）：错误凭据 → `kind: auth`，
+“HTTP 401, the server rejected the credentials…”；保存的 Cookie 过期而请求自带凭据时只在该请求内覆盖；
+`delete_page` 不在白名单 → 解析工具时拒绝，列出工具时 `allowed: false`；四次真实运行里 MCP 服务端日志中 `delete_page` 调用为 0。
+
+真实运行暴露、单测此前发现不了的问题（均已修复并补测试）：
+1. `type: mcp` 供应商的内层 MCP 调用会触发研究回调：同一次检索被记录两次、工具预算被扣两次（25 次检索记成 41）。
+2. 网关忽略 `max_completion_tokens`：上限 4096 的整理调用写出了 7414 个 token；另有一次 `LengthFinishReasonError`。
+3. 整理节点单次输出 4–7k token（14–21 条发现，外加每条一份标题与引文副本），是慢模型上最大的时间开销。
+4. 时间收尾的硬超时正好等于研究截止点，慢工具场景下三个步骤同时被杀。
+另外：规划模型会为“只有内部数据源”的部署安排“核对外部官方文档”的步骤（已在改写与规划提示词里约束）；
+知识库查询不计入“搜索次数”、被拒绝的检索反而计入（已修）。
+
+按节点指标示例（`2157aede`）：rewrite 1 次 / 3.3 秒；plan 1 次 / 8.2 秒；research 13 次 P50 1.5 秒；
+conversion 3 次 P50 8.8 秒；outline 1 次 / 9.6 秒；section 7 次 P50 5.7 秒；summary 1 次 / 3.6 秒；全部 0 截断、0 重试；
+总 30.4 万 token，按测试单价估算 0.32 元。
+
+节点参数确实到达了供应商请求（运行 `8654f210` 的 LLM 调用审计，`params`）：rewrite `temperature 0.2 / max_tokens 1500`、
+plan `0 / 3000`、research `0.3`、conversion `0 / 6000`、outline `0.1`、section `0.5 / 6000`，包括走原生子 Agent 执行的节点。
+
+**与 ChatGPT 同题对照（2026-09-19）**：用户授权用其 ChatGPT Pro 账号实测了一次深度研究，界面、动效与时间线的实测数值
+（含样式表里的 shimmer 关键帧、各卡片尺寸、阅读器排版、引用悬停卡、来源与活动面板）以及差距清单见
+[CHATGPT_BENCHMARK_2026-09-19.md](CHATGPT_BENCHMARK_2026-09-19.md)。同一条请求我方运行 `82225b11`（公网模式、调参后）：
+**5 分 39 秒**完成（ChatGPT 9 分 09 秒）、60 条引用（45）、8 表 1 图（9 表 1 图）、来源同样以官方文档为主、0 错误 0 截断 0 格式重试、
+190.6 万 token；报告 2.9 万字，约为 ChatGPT 的 5–6 倍（`report_length_scale` 可调）。
+
+### 2026-09-19：提示词缓存的真实验收
+
+同一条请求（四个开源向量数据库选型）、同一模型（`deepseek-v4-flash`）、同样不限预算，8012 网关：
+
+| | 改动前 `8654f210` | 改动后 `244cd6d5` |
+| --- | --- | --- |
+| 输入 Token / 其中命中缓存 | 226.6 万 / 11.5 万（**5%**） | 342.9 万 / 287.3 万（**84%**） |
+| 未命中（按全价计费、需要重新 prefill）的输入 | 215.1 万 | 55.6 万 |
+| 检索研究节点 | 62 次，命中 5% | 88 次，命中 **88%**，可复用前缀 87% |
+| 章节写作节点 | 命中 6% | 命中 49% |
+| 研究节点单次调用耗时 | 3.0 秒（平均上下文 3.3 万） | 2.6 秒（平均上下文 3.6 万） |
+| 结果 | COMPLETED | COMPLETED，83 条引用、2.5 万字、0 错误 0 截断 |
+
+两次运行的计划不同（5 步 / 6 步），总时长不能直接比；可比的是命中率与未命中 Token。DeepSeek 官方服务 prefill 本来就快，单次调用只快了约 13%；
+自建的慢模型上 prefill 占比更高，收益会更明显（前提是推理服务开了 prefix caching，多副本时配了会话粘性）。
+追问路径（同一份报告连续问两个不同的问题）：改动前第二个问题命中 4%（运行 `521ed48d`，`message` 在最前），改动后 **94%**（运行 `244cd6d5`，1.57 万输入里 1.52 万命中）；
+第一个问题 2% 是预期的，那是这份报告第一次发给模型。
+浏览器（3112）里指标页显示"缓存命中 84%"、检索研究"88% / 87%"，控制台只有网站图标的 404（既有行为）。
+第一次验证运行 `431584b1` 失败（`NO_EVIDENCE`）与缓存无关：用接口创建时没带预算，默认 12 万 Token 被 5 个并行步骤平分后，
+引擎的预算中间件在第一轮就去掉了工具调用。接口调用方应显式传预算或不限。
+
+### 2026-09-20：引擎并发与章节长度修复的真实验收
+
+同一问题、同一模型、不限预算，8012 网关；用技能的 `audit_run.py --run 8a21a738 --baseline 244cd6d5` 对比（设置差异只有新增的两个空模型字段和压缩提示词）：
+
+| | 修复前 `244cd6d5` | 修复后 `8a21a738` |
+| --- | --- | --- |
+| 引擎 `subagent_runtime.max_running` | 3（研究配置 6 路并发、8 路写作） | 8（启动器在重启时刷新了已有验收目录的 `host.yaml`） |
+| 在引擎里排队 ≥20 秒的角色 | 3 个：203 / 261 / 292 秒 | 0 个 |
+| 活跃时长 | 632 秒（研究 564，写作 44） | **239 秒**（研究 207，写作 17） |
+| 章节调用 / 其中重做 | 13 / 5（全部因为超长） | 7 / **0** |
+| 报告 | 24.8k 字、83 条引用 | 18.7k 字、68 条引用（与更早的基线 18.2k 字一致） |
+| 缓存命中 | 84% | 82% |
+
+两次的计划不同（6 步 / 5 步），所以活跃时长的降幅里有一部分来自少一步；可以直接比的是“没有角色再排队”和“重做调用为 0”。
+搜索供应商的问题仍在（规则 `provider-failing`、`slow-tools` 照旧命中），这次运行里工具等待仍是研究阶段的大头。
+
 ## 5. 本地运行
 
 ### 5.1 端口与进程
@@ -314,7 +585,7 @@ python3 ../scripts/pnpm.py exec next dev --hostname 127.0.0.1 --port 3100
 - 前端需要 `DEER_FLOW_AUTH_DISABLED=1`，否则重启后会跳到 `/setup`。
 - 用 API 创建任务时，`budget` 各项不能超过 `/capabilities` 的 `budget_ceiling`，`max_model_tokens` 最大 2,000,000；
   省略 `budget` 会使用默认的 12 万 Token，而单次调用预留 393,216，会直接 `BUDGET_EXHAUSTED`。不限 Token 时传 `null`。
-- `--resume-dir` 要求生成的研究配置与数据目录中的 `research.yaml` 一致（`pricing` 除外）；给示例配置加字段后，私有配置也要同步加上。
+- `--resume-dir` 要求生成的研究配置与数据目录中的 `research.yaml` 一致（`pricing` 除外）；示例配置里新增的、等于默认值的字段不算变更，其余差异会拒绝恢复（换一个新的验收目录）。
 - 要在验收环境显示费用，把真实单价写进数据目录 `research.yaml` 的 `pricing`（键为模型名），重启网关即可，已有任务不受影响。
 
 ### 5.3 诊断
@@ -403,6 +674,44 @@ DEEPRESEARCH_E2E_FRONTEND_PORT=3200 DEEPRESEARCH_E2E_REUSE_BACKEND=1 DEEPRESEARC
 未运行：`make test-blocking-io`、`make test-live`、前端生产构建。远端 CI 结果见 GitHub Actions 的 “DeepResearch full-stack checks”。单元测试使用伪造提供方，只证明适配与生命周期行为，
 不能代替真实研究与浏览器验收。
 
+### 2026-09-19 回归
+
+从 `backend/`：
+
+```sh
+uv run --no-sync --with python-docx python -m pytest ../tests/deepresearch -q                  # 262 passed（技能与自测修复后；提示词缓存两轮后 256，此前 250）（新增 test_tuning.py、test_review_fixes.py，offline 模板新增 1 项）
+uv run --no-sync --with python-docx python -m pytest ../tests/deepresearch tests/test_subagent_executor.py \
+  tests/test_summarization_middleware.py tests/test_context_compaction.py tests/test_web_fetch_paging.py -q   # 全部通过
+uv run --no-sync python -m pytest tests/test_jina_client.py -q                                 # 44 passed（与 -p no:logging 同跑时 7 个用例因缺少 caplog 报 error，与本轮无关）
+uv run --no-sync ruff check deepresearch ../tests/deepresearch && uv run --no-sync ruff format --check deepresearch ../tests/deepresearch
+```
+
+从 `frontend/`：
+
+```sh
+python3 ../scripts/pnpm.py rstest run deepresearch   # 168 passed（提示词缓存一轮后；此前 167，再之前 73）
+python3 ../scripts/pnpm.py test                      # 1456 passed
+python3 ../scripts/pnpm.py check                     # eslint + tsc，通过
+```
+
+浏览器端到端 `playwright.deepresearch.config.ts`：5 passed，连跑两轮，加 `last_event_seq` 后再跑一轮仍 5 passed。3100 正被使用，所以是在一份前端副本上跑的
+（演示后端 8022 + `next dev --port 3200`，按第 6 节“浏览器端到端”的 REUSE 方式）。两点经验：副本不在 git 仓库里，Playwright 往项目目录写 `test-results/` 会让 Tailwind
+不停重新扫描、`app/layout` 热更新循环，工作区页刷新后一直加载不出来，加 `--output <项目外目录> --reporter=list` 后消失（真实仓库的根 `.gitignore` 已忽略这些目录）；
+用例里“追问后 `usage.tool_calls` 仍为 4”的断言随“预算按任务计”改为 `usage.tool_calls == 0` 且 `usage_history.at(-1).tool_calls == 4`。
+
+真实核对“停止追问后继续对话”（验收网关 8012 + 前端副本 3112，任务 521ed48d）：对已完成报告发追问后立即停止 → `CANCELLED`、报告仍在；
+再次 `POST /messages` 返回 202 并在约 3 秒内得到回答、状态回到 `COMPLETED`、用量按新任务重置；浏览器里该会话的输入框可用、
+停止提示为“研究已停止。已生成的报告仍可阅读和导出，也可以继续就这份报告提问或要求修改。”，通过界面发送后回答出现、提示消失，控制台无错误。
+快照 `last_event_seq` 实测为 1515（该任务的事件总数），刷新后事件流从 `after=12/13` 接续而不是 `after=0`（演示后端日志）。
+
+没有运行：后端默认离线全量、`make test-blocking-io`、`make test-live`、前端生产构建。本轮的人工浏览器检查同样在前端副本上做：`next dev --port 3112`，`DEER_FLOW_INTERNAL_GATEWAY_BASE_URL` 指向
+运行新后端代码的验收网关 8012；检查了设置页（节点调参、保存往返）、提交后的等待态、计划卡与倒计时、研究中的进度卡、
+完成态报告卡、全屏阅读器、点击引用后的来源面板。宿主仓库原有的 AGENTS 指导链超限（`subagents/AGENTS.md`、`middlewares` 链）仍在，与本轮无关。
+
+已知遗留：计划卡/等待占位下方仍会出现共享消息列表的“复制”按钮；等待占位依赖共享消息列表“有内容才渲染”的规则
+（占位消息必须带非空文本，`research-conversation.tsx` 有注释），这一点只有浏览器检查、没有列表级单测；
+旧报告的引用摘录仍以页面导航开头（新报告已改为从正文第一句开始）。
+
 ### 2026-09-18 回归
 
 从 `backend/`：
@@ -427,7 +736,14 @@ python3 ../scripts/pnpm.py test    # 1363 passed（新增 32 条：llm-calls / s
 
 ## 7. 残余风险与未验证项
 
-- 只在本机用 DeepSeek 验收；公司 MCP、其他模型、SSO 与多用户权限未验收。设置页的“测试模型 / 测试供应商 / 列出 MCP 工具”
+- **产品指标看不到引擎准入排队。** `time.queue_seconds` 只量研究侧的信号量；角色在引擎里排队的时间计入了步骤耗时与 `agents` 的秒数，
+  `agents.max_parallel` 也是名义值。审计脚本能算出来（`engine-queue`），指标页还不能：可以在 `metrics.summarize` 里按“子 Agent 开始 → 第一次模型调用”补一个字段。
+- **本机的搜索供应商状态差**（不是代码问题，但会让任何耗时结论失真）：Tavily 配额用尽、Serper 鉴权/网络失败，搜索全靠 DuckDuckGo，
+  失败率约 26%、每次失败 35 秒，研究员运行时间的 84% 在等工具。做耗时对比前先修好凭据，或在供应商上设 `timeout_seconds`。
+- 自测里两份独立报告都指出、但这次没有动的两点：失败的搜索也计入每步的 `max_searches_per_unit`；被预算拒绝的“读取”可能被算进 `reads` / `pages_read`
+  （读代码得出，未验证；今天拒绝读取很少见，加了按步骤的页面上限之后才会放大）。
+- 技能自测只在一个很强的模型上做过，断言两组全过，区分不出质量差异；技能对较弱模型（目标环境的自建模型）的帮助没有验证。
+- 只在本机用 DeepSeek 验收；目标环境的 MCP、其他模型、SSO 与多用户权限未验收。设置页的“测试模型 / 测试供应商 / 列出 MCP 工具”
   只在 DeepSeek、Tavily、Serper、Jina、DuckDuckGo、direct 上真实跑过，其余预设（brave、exa、bocha、searxng、firecrawl、
   tavily_extract、ragflow、lightrag、http 模板、mcp 供应商）只有单元测试与假服务覆盖。
 - 研究员进度说明的语言在提示词加强后于一次验收中做到 132/132 全中文；其他语言、其他模型未验证。
@@ -448,13 +764,34 @@ python3 ../scripts/pnpm.py test    # 1363 passed（新增 32 条：llm-calls / s
 - 离线环境加本地模型、内网知识库的完整研究没有验收过；离线模板只验证了配置合法、网关能启动、模型不可达时的报错。
   较弱的本地模型在计划、数据整理、引用标记上的失败率未知，调参建议来自代码与联网验收经验，不是离线实测结论。
 
+- 2026-09-19 新增的能力里，只有这些经过真实运行：节点调参（温度、`max_tokens`）、仅 MCP / 无原文研究、`allowed_tools`、
+  请求头插值与保存的 Cookie、`kind: mcp` 与 `type: mcp` 两种接法、时间收尾（工具以 `scope: time` 停止）、
+  Chat Completions 客户端（`max_tokens`、流式用量）、经设置接口保存节点开关与 `report_length_scale` 后新建的研究按快照执行
+  （关闭 `summary` 后没有摘要调用；0.45 触发了两次章节缩短修复）、设置接口拒绝 stdio MCP / 明文凭据 / 角色文件路径（422）。
+  `json_mode` 只在一次运行里开过（DeepSeek 兼容端点，出现过一次 `LengthFinishReasonError` 后回退到普通请求）；
+  `nodes.*.model` 指向不同模型、关闭 `rewrite`、`max_seconds_per_unit`、`request_secret_headers` 经真实 HTTP 请求头传入、
+  `RESEARCH_TIME_SPENT` 在真实运行里降级单元，只有单元测试。
+- 真实网关没有验证过：流式用量与 `max_tokens` 参数名的自动判断基于 LangChain 的行为和 DeepSeek 的 OpenAI 兼容端点；
+  网关拒绝 `stream_options` 时要手动写 `stream_usage: false`。真正的慢模型（每秒十几个 token）下的超时与时间预留取值没有实测依据。
+- 时间预算的整体硬超时是“上限 + 一份报告预留”，单元硬超时可以借用一半报告预留：总时长可能略超 `max_elapsed_seconds`，这是有意的取舍。
+- 预算按任务计之后，`usage` 只反映当前任务；需要整个会话的累计用量时看 `usage_history` 或指标接口。
+- 设置页写入口的边界（`profile.guard`）会拒绝已经保存的、含 stdio MCP 或明文凭据的旧覆盖层：启动时回退到配置文件并在设置页显示错误，需要管理员重新保存。
+- 读者语言只有中文与英文两套报告标签：日文、韩文提问会告诉研究员用对应语言写，但报告的固定标题（执行摘要、研究范围与局限、参考资料）是英文。
+- `kind: mcp` 直挂数据源的引用仍是“整次调用一条证据”，标题为“数据源名: 查询词”；要逐条引用需用 `type: mcp` 供应商。
+- 前端的 ChatGPT 对标改造依据的是截图量取值（ChatGPT 的卡片渲染在跨域 iframe 里，读不到计算样式），圆环缓动、spinner 转速等动效参数是近似值。
+
 ## 8. 建议下一步
 
+0. 用真实的模型网关与内部 MCP 跑一次完整研究：先 `python -m deepresearch.doctor --probe-model <模型> --probe-mcp`
+   （看 `json_contract`、`usage`、输出速度与 MCP 工具清单），再按“指标 → 按节点”里的被截断、格式重试与 P95 延迟调 `nodes`；
+   很慢时依次尝试：`supplement_gap_codes: [coverage, unsupported]`、`plan_max_units` 3–4、`report_length_scale` 0.5、关闭 `nodes.summary` / `nodes.rewrite`。
 1. 人工评审 82490499、68ff862b 与 52e358b9 的报告事实与结构，形成报告质量验收标准（一手来源比例、状态与日期准确性、事实/推断区分）。
 2. 用真实的企业 MCP 服务验证 `mcp` 供应商与 `kind: mcp` 数据源：工具发现缓存、按请求凭据（已实现并有单元测试，未接真实服务验收）、异构返回的解析结果。
 2. 跑远端 CI、干净克隆部署与前端生产构建。
-3. 用公司实际 MCP 与普通 Chat Completions 模型验证异构返回、身份、工具授权、跨用户读取与导出。
+3. 用目标环境的实际 MCP 与普通 Chat Completions 模型验证异构返回、身份、工具授权、跨用户读取与导出。
 4. 在真实手机与深色主题下复验阅读器、来源抽屉、引用悬浮卡。
+4a. 在目标环境确认推理服务开了 prefix caching（vLLM `--enable-prefix-caching`、SGLang RadixAttention 默认开），网关多副本时给模型配
+   `session_param` 或 `session_header`；判断依据是指标里"可复用前缀"高而"缓存命中"低。网关不上报缓存 Token 时只能看单次调用延迟是否下降。
 5. 调优耗时：研究并发、补研停止条件、单元数量；考虑发布报告时预热引用域名的网站图标。
 6. 生产运维：多 worker 或外部存储方案、备份与保留策略、故障注入（网络中断、429、5xx、慢工具）。
 7. 按指标调优：给 Jina 配 key 或加退避，降低 `HTTP 429` / `ConnectError`；评估提高研究并发（排队累计过长）；
@@ -478,7 +815,10 @@ python3 ../scripts/pnpm.py test    # 1363 passed（新增 32 条：llm-calls / s
 - 全量后端测试时如果验收网关与 AIO 容器仍在运行，Docker 端到端测试可能被干扰；判断失败前单独重跑。
 - 演示后端在 CI 中只安装 `backend/deepresearch/requirements.txt`；报告或演示路径新增第三方依赖时同步更新该清单，本地 uv 环境不会暴露缺失。
 - `/deepresearch-demo` 这类不经过工作区布局的页面必须提供限高父容器，否则研究页面的可调整面板会塌缩。
-- 公司已有 DeerFlow 时，适配原生宿主接口与完整 feature 差异，不要覆盖公司的业务代码、配置、Skills 或认证体系。
+- 目标环境已有 DeerFlow 时，适配原生宿主接口与完整 feature 差异，不要覆盖对方的业务代码、配置、Skills 或认证体系。
+- 不要在运行中的角色对话里"往前面插消息"或改写已有消息（包括打开 `tool_receipt_ledger`、在系统提示词里放日期/预算/计数）：
+  供应商只复用从第一个 token 起相同的前缀，开头变一个字后面全部重算。改了请求构造后看指标里的"可复用前缀"，研究节点应在 80% 以上。
+- 任务载荷里新增字段时按"所有调用相同 → 本次运行相同 → 只有本次调用才有 → 每次都变的计数"的顺序放，不要随手加在最前面。
 - 指标中的 `null` 表示没有测量，不要当成 0 汇总；新增指标时，历史数据缺字段也要返回 `null`。
 - `request_key`、`error_type` 只用于统计分组，不要据此改变研究流程；`request_key` 是脱敏后参数的哈希，不要改成保存参数原文。
 - 指标写入必须吞掉自身异常，只记日志；不要让观测代码的故障让研究失败。
@@ -487,15 +827,20 @@ python3 ../scripts/pnpm.py test    # 1363 passed（新增 32 条：llm-calls / s
 
 ## 10. 文档索引
 
+- 接手、调试、测试与**运行审计**的技能：[`.agents/skills/deepresearch-engineering/`](../../.agents/skills/deepresearch-engineering/SKILL.md)。
+  `scripts/audit_run.py --run <id|URL|latest> [--baseline <run>]` 从研究数据库生成审计底稿（时间、Token、缓存、工具、补研与修复、规则发现与对应设置），
+  `scripts/show_call.py` 打开或重放一次模型调用；审计报告模板与读数陷阱在 `references/audit-report.md`。
+
 | 文档 | 状态与用途 |
 | --- | --- |
 | [OFFLINE_AGENT_GUIDE.md](OFFLINE_AGENT_GUIDE.md) | 不联网的本地 Agent 开发入口（规则、命令、排错） |
 | [MODEL_CONFIGURATION.md](MODEL_CONFIGURATION.md) / [DEERFLOW_CONFIGURATION.md](DEERFLOW_CONFIGURATION.md) / [RESEARCH_CONFIGURATION.md](RESEARCH_CONFIGURATION.md) | 模型、宿主、研究配置说明 |
-| [LOCAL_AGENT_HANDOFF.md](LOCAL_AGENT_HANDOFF.md) | 本地 / 公司 Agent 的入口页，指向上面的文档 |
+| [LOCAL_AGENT_HANDOFF.md](LOCAL_AGENT_HANDOFF.md) | 本地 / 内网 Agent 的入口页，指向上面的文档 |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | 当前架构与工作流（权威） |
 | [HANDOFF.md](HANDOFF.md) | 当前交接状态（本文） |
 | [API.md](API.md) / [openapi.json](openapi.json) | 当前接口契约 |
-| [CHATGPT_BENCHMARK_2026-09-16.md](CHATGPT_BENCHMARK_2026-09-16.md) | ChatGPT 实测观察、差距与改造前后对照 |
+| [CHATGPT_BENCHMARK_2026-09-16.md](CHATGPT_BENCHMARK_2026-09-16.md) | ChatGPT 实测观察（流程）、差距与改造前后对照 |
+| [CHATGPT_BENCHMARK_2026-09-19.md](CHATGPT_BENCHMARK_2026-09-19.md) | ChatGPT 界面与动效的实测数值、逐项差距清单、同题耗时/引用/报告对照 |
 | `README.deepresearch.md`（仓库根） | 安装、配置、使用 |
 | [NATIVE_RUNTIME.md](NATIVE_RUNTIME.md) / [REUSE_AUDIT.md](REUSE_AUDIT.md) | 原生复用专题，仍然有效 |
 | [EXTENDING.md](EXTENDING.md) | 新增研究角度与来源 |

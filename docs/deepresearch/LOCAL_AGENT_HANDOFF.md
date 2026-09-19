@@ -1,4 +1,4 @@
-# 本地 / 公司 Agent 交接入口
+# 本地 / 内网 Agent 交接入口
 
 在不联网的机器上继续开发时，从 [OFFLINE_AGENT_GUIDE.md](OFFLINE_AGENT_GUIDE.md) 开始。它包含工作规则、环境检查、运行方式、
 改动定位、测试命令和常见错误。配置分三份：[模型配置](MODEL_CONFIGURATION.md)、

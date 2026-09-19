@@ -114,7 +114,7 @@ def test_url_variants_of_one_page_share_a_number_and_titles_are_readable():
         "E003": {**page("E003", "https://docs.example.org/guide?lang=zh"), "title": "https://docs.example.org/guide?lang=zh"},
         "E004": {**page("E004", "https://raw.example.org/docs/setup.md"), "title": "Untitled"},
         "E005": {**page("E005", None), "source_uri": "mcp-result://exec/raw_1", "source_name": "kb", "title": "kb / r1"},
-        "E006": {**page("E006", None), "source_uri": "mcp-result://exec/raw_2", "source_name": "kb", "title": "kb / r2"},
+        "E006": {**page("E006", None), "source_uri": "mcp-result://exec/raw_2", "source_name": "kb", "title": "kb / r2", "document_hash": "another-passage"},
     }
     document = documents.assemble("Report", "A [[E001]] B [[E002]] C [[E003]] D [[E004]] E [[E005]] F [[E006]]", [("Details", "G [[E002]]")], lang="en")
     mapping = documents.bind(document, pool)
@@ -124,6 +124,15 @@ def test_url_variants_of_one_page_share_a_number_and_titles_are_readable():
     exported = documents.export_markdown(document, mapping, pool, "en")
     assert "Untitled" not in exported and "[Official guide]" in exported
     assert "Untitled" not in documents.html_document(document, mapping, pool, "en")
+    # A record without a link names its source, never an internal result URI.
+    assert "kb / r1 — kb" in exported and "mcp-result://" not in exported
+    # The same knowledge-base passage returned by two queries is one reference.
+    same = {**pool, "E006": {**pool["E006"], "document_hash": pool["E005"]["document_hash"]}}
+    assert documents.bind(document, same)["E006"] == documents.bind(document, same)["E005"]
+    # A single-page application names its pages in the fragment.
+    routed = {"E001": page("E001", "https://wiki.corp.example/#/doc/1"), "E002": page("E002", "https://wiki.corp.example/#/doc/2"), "E003": page("E003", "https://wiki.corp.example/guide#install")}
+    routes = documents.bind(documents.assemble("Report", "A [[E001]] B [[E002]] C [[E003]]", [], lang="en"), routed)
+    assert routes["E001"] != routes["E002"]
 
 
 def test_schema_repair_reports_the_actual_table_field_without_echoing_values():

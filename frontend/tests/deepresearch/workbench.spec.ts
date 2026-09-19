@@ -51,10 +51,12 @@ for (const entry of ["/deepresearch-demo", "/workspace/deepresearch"]) {
         "演示：已按你的要求调整计划——只关注并发与运维，优先官方资料",
       ),
     ).toBeVisible();
+    await expect(page.locator('[aria-label="研究报告预览"]')).toBeVisible();
+    // The report takes the plan's place: no plan card or folded strip remains.
+    await expect(page.locator('[aria-label="研究计划"]')).toHaveCount(0);
     await expect(
       page.locator("summary").filter({ hasText: "计划已更新" }),
-    ).toBeVisible();
-    await expect(page.locator('[aria-label="研究报告预览"]')).toBeVisible();
+    ).toHaveCount(0);
     expect(page.url()).toContain(id);
 
     await page
@@ -92,15 +94,16 @@ for (const entry of ["/deepresearch-demo", "/workspace/deepresearch"]) {
     await page.getByRole("button", { name: "导出报告", exact: true }).click();
     const reportDownload = page.waitForEvent("download");
     await page
-      .getByRole("menuitem", { name: "导出为 MD", exact: true })
+      .getByRole("menuitem", { name: "导出到 Markdown", exact: true })
       .click();
     expect((await reportDownload).suggestedFilename()).toBe(
       `research-${id}.md`,
     );
 
     await page.getByRole("tab", { name: /^活动/ }).click();
+    // The panel is headed by the plan title; the region keeps a fixed name.
     await expect(
-      page.getByRole("heading", { name: "研究活动", exact: true }),
+      page.getByRole("region", { name: "研究活动", exact: true }),
     ).toBeVisible();
     // Cost and efficiency come from the recorded calls, with a raw export.
     await page.getByRole("tab", { name: "指标", exact: true }).click();
@@ -146,10 +149,14 @@ for (const entry of ["/deepresearch-demo", "/workspace/deepresearch"]) {
       }),
     ).toBeVisible();
     await expect(page.locator('[aria-label="研究报告预览"]')).toHaveCount(1);
+    // Budgets are per task: the explanation is a new task that searched
+    // nothing, and the research it follows keeps its own closed record.
     const run = (await (await page.request.get(`${backend}/${id}`)).json()) as {
       usage: { tool_calls: number };
+      usage_history: { tool_calls: number }[];
     };
-    expect(run.usage.tool_calls).toBe(4);
+    expect(run.usage.tool_calls).toBe(0);
+    expect(run.usage_history.at(-1)?.tool_calls).toBe(4);
   });
 }
 
@@ -191,7 +198,7 @@ test("native workspace history and research details work on mobile", async ({
   const details = page.getByRole("dialog", { name: "研究详情", exact: true });
   await expect(details).toBeVisible();
   await expect(
-    details.getByRole("heading", { name: "研究活动", exact: true }),
+    details.getByRole("region", { name: "研究活动", exact: true }),
   ).toBeVisible();
   await expect
     .poll(() =>

@@ -1,10 +1,15 @@
-import { expect, it } from "@rstest/core";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, expect, it, rs } from "@rstest/core";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 
 import { ResearchPlanCard } from "@/components/deepresearch/plan-card";
+import { planCardHidden } from "@/core/deepresearch/presentation";
 import type { ResearchMessage } from "@/core/deepresearch/types";
 
 import { makeRun } from "../../core/deepresearch/fixtures";
+
+afterEach(() => {
+  rs.useRealTimers();
+});
 
 it("does not restart a cached plan countdown when the card remounts", () => {
   const run = { ...makeRun(), client_received_at: performance.now() - 20_100 };
@@ -33,6 +38,17 @@ it("does not restart a cached plan countdown when the card remounts", () => {
   expect(
     screen.getByRole("button", { name: /开始研究 倒计时 25 秒/ }),
   ).toBeTruthy();
+  // The arc is sent to where it will be when this second ends (24/45 left)
+  // and travels there linearly for one second, so it never jumps.
+  const arc = first.container.querySelector("[data-countdown-arc]")!;
+  const length = Number(arc.getAttribute("stroke-dasharray"));
+  expect(Number(arc.getAttribute("stroke-dashoffset")) / length).toBeCloseTo(
+    1 - 24 / 45,
+    5,
+  );
+  expect(arc.getAttribute("class")).toContain("duration-1000");
+  expect(arc.getAttribute("class")).toContain("ease-linear");
+  expect(arc.getAttribute("class")).toContain("motion-reduce:transition-none");
   first.unmount();
   const second = render(card);
   expect(
@@ -156,10 +172,41 @@ it("shows short step titles and live progress while research runs", () => {
     "正在搜索：SQLite WAL concurrency",
   );
   expect(screen.getByText("12 次搜索")).toBeTruthy();
+  // The live status shimmers, and a new text is a new element so it fades in.
+  const live = screen.getByRole("status");
+  expect(live.className).toContain("loading-shimmer");
+  expect(live.className).toContain("fade-in");
+  // A running step turns the ring spinner; a waiting one is not greyed out.
+  const step = screen.getByText("比较并发写入").closest("li")!;
+  expect(step.getAttribute("data-step-state")).toBe("running");
+  expect(step.querySelector("[data-research-spinner]")).toBeTruthy();
+  expect(step.className).toContain("text-base");
+  for (const item of view.container.querySelectorAll(
+    "li[data-step-state=pending]",
+  ))
+    expect(item.innerHTML).not.toContain("text-muted-foreground");
   fireEvent.click(screen.getByRole("button", { name: "更新研究要求" }));
   fireEvent.click(screen.getByRole("status"));
   expect(updated && details).toBe(true);
   expect(screen.getByRole("button", { name: "停止研究" })).toBeTruthy();
+  view.rerender(
+    <ResearchPlanCard
+      {...handlers}
+      message={planMessage(run)}
+      run={run}
+      activity={{
+        status: "RESEARCHING",
+        started_at: run.created_at,
+        finished_at: null,
+        elapsed_seconds: 31,
+        counts: { searches: 13, pages_read: 3, steps: 1, steps_done: 0 },
+        current: { kind: "read", domain: "sqlite.org" },
+        items: [],
+      }}
+    />,
+  );
+  expect(screen.getByRole("status").textContent).toBe("正在阅读：sqlite.org");
+  expect(screen.getByRole("status")).not.toBe(live);
   // Once research only formats the report, updates are no longer offered.
   view.rerender(
     <ResearchPlanCard
@@ -173,13 +220,15 @@ it("shows short step titles and live progress while research runs", () => {
   view.unmount();
 });
 
-it("collapses superseded, finished and stopped plans like ChatGPT", () => {
+it("leaves the conversation once the report exists, like ChatGPT; folds a superseded plan", () => {
   const run = makeRun("done", "COMPLETED");
   const message = planMessage(run);
   const view = render(
     <ResearchPlanCard {...handlers} message={message} run={run} />,
   );
-  expect(screen.getByText(/研究计划 · Compare databases/)).toBeTruthy();
+  // The stats line and the report card take the plan's place: no folded strip.
+  expect(view.container.innerHTML).toBe("");
+  expect(planCardHidden(message, run)).toBe(true);
   view.rerender(
     <ResearchPlanCard
       {...handlers}
@@ -200,6 +249,7 @@ it("collapses superseded, finished and stopped plans like ChatGPT", () => {
     />,
   );
   expect(screen.getByText("研究已停止")).toBeTruthy();
+  expect(planCardHidden(message, { ...run, status: "CANCELLED" })).toBe(false);
   view.unmount();
 });
 
@@ -221,5 +271,150 @@ it("lets an edited plan start as-is without a countdown", () => {
   ).toBe("true");
   fireEvent.click(screen.getByRole("button", { name: "开始研究" }));
   expect(started).toBe(true);
+  view.unmount();
+});
+
+/** A finished report followed by a follow-up question in the same task. */
+function followedUp(status: string) {
+  const run = makeRun("followed", status);
+  const message = { ...planMessage(run), cycle: 0 };
+  run.conversation = [
+    {
+      id: "initial",
+      role: "user",
+      kind: "text",
+      text: "q",
+      at: run.created_at,
+    },
+    message,
+    {
+      id: "report-1",
+      role: "assistant",
+      kind: "report",
+      text: "报告",
+      at: run.created_at,
+      cycle: 0,
+    },
+    { id: "u2", role: "user", kind: "text", text: "追问", at: run.created_at },
+  ];
+  return { run, message };
+}
+
+it("keeps a failed follow-up visible and retryable under the folded plan", () => {
+  const { run, message } = followedUp("FAILED");
+  run.error = { code: "MODEL_TIMEOUT", message: "模型超时", recoverable: true };
+  const retries: boolean[] = [];
+  const view = render(
+    <ResearchPlanCard
+      {...handlers}
+      message={message}
+      run={run}
+      onRetry={(limited = false) => retries.push(limited)}
+    />,
+  );
+  // The plan itself is gone once a report exists …
+  expect(screen.queryByText(/研究计划 · Compare databases/)).toBeNull();
+  expect(view.container.querySelector("details")).toBeNull();
+  // … but the failure and the way out are not hidden with it.
+  expect(planCardHidden(message, run)).toBe(false);
+  expect(screen.getByRole("alert").textContent).toBe("模型超时");
+  fireEvent.click(screen.getByRole("button", { name: "从检查点恢复" }));
+  expect(retries).toEqual([false]);
+
+  view.rerender(
+    <ResearchPlanCard
+      {...handlers}
+      message={message}
+      run={{ ...run, error: { ...run.error, recoverable: false } }}
+    />,
+  );
+  expect(
+    screen
+      .getByRole("button", { name: "从检查点恢复" })
+      .hasAttribute("disabled"),
+  ).toBe(true);
+
+  // A superseded plan card never claims the failure of a newer plan.
+  view.rerender(
+    <ResearchPlanCard
+      {...handlers}
+      message={message}
+      run={{ ...run, plan: { ...run.plan!, plan_version: 2 } }}
+    />,
+  );
+  expect(screen.queryByRole("alert")).toBeNull();
+  expect(screen.queryByRole("button", { name: "从检查点恢复" })).toBeNull();
+  expect(view.container.innerHTML).toBe("");
+  view.unmount();
+});
+
+it("says a stopped follow-up was stopped instead of looking finished", () => {
+  const { run, message } = followedUp("CANCELLED");
+  const view = render(
+    <ResearchPlanCard {...handlers} message={message} run={run} />,
+  );
+  expect(screen.queryByText(/研究计划 · Compare databases/)).toBeNull();
+  expect(screen.getByRole("status").textContent).toContain("研究已停止");
+  expect(screen.getByRole("status").textContent).toContain(
+    "继续就这份报告提问",
+  );
+  view.unmount();
+  // The finished task itself shows neither notice.
+  const done = followedUp("COMPLETED");
+  const finished = render(
+    <ResearchPlanCard {...handlers} message={done.message} run={done.run} />,
+  );
+  expect(screen.queryByRole("status")).toBeNull();
+  expect(screen.queryByRole("alert")).toBeNull();
+  expect(finished.container.innerHTML).toBe("");
+  finished.unmount();
+});
+
+it("hands the start button back when the deadline passes and nothing starts", () => {
+  rs.useFakeTimers({
+    toFake: [
+      "setTimeout",
+      "clearTimeout",
+      "setInterval",
+      "clearInterval",
+      "performance",
+    ],
+  });
+  // Two seconds before the server-owned deadline.
+  const run = { ...makeRun(), client_received_at: performance.now() - 43_000 };
+  let refreshes = 0;
+  let started = 0;
+  const view = render(
+    <ResearchPlanCard
+      {...handlers}
+      message={planMessage(run)}
+      run={run}
+      onStart={() => started++}
+      onExpire={() => refreshes++}
+    />,
+  );
+  expect(
+    screen.getByRole("button", { name: /开始研究 倒计时 2 秒/ }),
+  ).toBeTruthy();
+  expect(refreshes).toBe(0);
+
+  act(() => {
+    rs.advanceTimersByTime(2250);
+  });
+  const waiting = screen.getByRole("button", { name: "开始研究" });
+  expect(waiting.textContent).toBe("即将开始");
+  expect(waiting.hasAttribute("disabled")).toBe(true);
+  // The server owns the start: ask it what happened instead of guessing.
+  expect(refreshes).toBe(1);
+
+  act(() => {
+    rs.advanceTimersByTime(5000);
+  });
+  const recovered = screen.getByRole("button", { name: "开始研究" });
+  expect(recovered.textContent).toBe("开始");
+  expect(recovered.hasAttribute("disabled")).toBe(false);
+  expect(refreshes).toBe(2);
+  fireEvent.click(recovered);
+  expect(started).toBe(1);
   view.unmount();
 });

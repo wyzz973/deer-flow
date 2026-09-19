@@ -23,9 +23,11 @@ import {
 } from "@/components/workspace/workspace-container";
 import { researchApi } from "@/core/deepresearch/api";
 import {
+  carryMeta,
   changedSections,
   draftProblems,
   edit,
+  mergeSecrets,
   SECTION_FIELDS,
   SECTION_LABELS,
   type SettingsSection,
@@ -33,7 +35,9 @@ import {
 import type { EditableSettings, SettingsView } from "@/core/deepresearch/types";
 import { cn } from "@/lib/utils";
 
+import { InvalidFields } from "./settings/fields";
 import { ModelsSection } from "./settings/models-section";
+import { NodesSection } from "./settings/nodes-section";
 import {
   McpSection,
   RuntimeSection,
@@ -94,6 +98,21 @@ export function ResearchSettings({
   const [section, setSection] = useState<SettingsSection>("models");
   const [saving, setSaving] = useState(false);
   const [failure, setFailure] = useState<SaveFailure | null>(null);
+  // Text a field shows but the draft cannot hold (see InvalidFields).
+  const [invalid, setInvalid] = useState<Record<string, string>>({});
+  const reportInvalid = useCallback((id: string, problem: string | null) => {
+    setInvalid((current) => {
+      if ((current[id] ?? null) === problem) return current;
+      const next = { ...current };
+      if (problem) next[id] = problem;
+      else delete next[id];
+      return next;
+    });
+  }, []);
+  // Bumped whenever the form is replaced from outside (discard, reload, reset,
+  // restore): the section remounts, so text typed into a field, test results
+  // and fetched tool lists of the previous draft do not outlive it.
+  const [epoch, setEpoch] = useState(0);
   const view = pinned ?? loaded.data ?? null;
   const draft = edited ?? view?.settings ?? null;
   const setDraft = useCallback(
@@ -121,8 +140,13 @@ export function ResearchSettings({
     [draft, view],
   );
   const problems = useMemo(
-    () => (draft && view ? draftProblems(draft, view) : []),
-    [draft, view],
+    () => [
+      ...new Set([
+        ...(draft && view ? draftProblems(draft, view) : []),
+        ...Object.values(invalid),
+      ]),
+    ],
+    [draft, invalid, view],
   );
   const dirty = changed.length > 0;
 
@@ -155,11 +179,27 @@ export function ResearchSettings({
     );
 
   const disabled = !view.editable || saving;
-  const adopt = (next: SettingsView, keepDraft = false) => {
+  // The server's answer replaces the form: version, settings and no draft.
+  const adopt = (next: SettingsView, remount = true) => {
     setPinned(next);
-    if (!keepDraft) setEdited(null);
+    setEdited(null);
     setFailure(null);
+    if (remount) setEpoch((current) => current + 1);
     client.setQueryData(queryKey, next);
+  };
+  // A secrets call changes no settings. Taking its version or settings would
+  // re-pin an unsaved draft to the newest version, and the next save would
+  // overwrite another administrator's work instead of answering 409.
+  const adoptSecrets = (next: SettingsView) => {
+    setPinned((current) => (current ? mergeSecrets(current, next) : current));
+    client.setQueryData<SettingsView>(queryKey, (current) =>
+      current ? mergeSecrets(current, next) : current,
+    );
+  };
+  const discard = () => {
+    setEdited(null);
+    setFailure(null);
+    setEpoch((current) => current + 1);
   };
   const save = () => {
     setSaving(true);
@@ -167,7 +207,10 @@ export function ResearchSettings({
     void api
       .saveSettings(view.version, draft)
       .then((next) => {
-        adopt(next);
+        // The saved lists are the draft's lists: cards keep their keys, so a
+        // save does not remount them or drop their test results.
+        carryMeta(draft, next.settings);
+        adopt(next, false);
         toast.success(
           `已保存为第 ${next.version} 版，之后新建的研究使用这些设置`,
         );
@@ -227,8 +270,12 @@ export function ResearchSettings({
             </button>
           ))}
         </nav>
-        {/* Keyed by section so each section opens at its top. */}
-        <div key={section} className="min-h-0 min-w-0 flex-1 overflow-y-auto">
+        {/* Keyed by section so each section opens at its top, and by epoch so
+            a replaced form starts clean. */}
+        <div
+          key={`${section}:${epoch}`}
+          className="min-h-0 min-w-0 flex-1 overflow-y-auto"
+        >
           <div className="mx-auto w-full max-w-4xl space-y-5 px-4 py-6 md:px-8">
             {!view.editable && (
               <p className="rounded-lg border border-amber-500/40 bg-amber-500/5 p-3 text-sm">
@@ -253,34 +300,39 @@ export function ResearchSettings({
                   className="ml-auto"
                   disabled={disabled}
                   title="只修改页面上的草稿，保存后生效"
-                  onClick={() =>
+                  onClick={() => {
                     setDraft(
                       edit(draft, (next) => {
                         for (const field of sectionFields)
                           (next as Record<string, unknown>)[field] =
                             structuredClone(view.defaults[field]);
                       }),
-                    )
-                  }
+                    );
+                    setEpoch((current) => current + 1);
+                  }}
                 >
                   <RotateCcw className="size-3.5" />
                   本节恢复为配置文件的设置
                 </Button>
               )}
             </header>
-            {section === "models" && <ModelsSection {...props} />}
-            {section === "roles" && <RolesSection {...props} />}
-            {section === "prompts" && <PromptsSection {...props} />}
-            {section === "sources" && <SourcesSection {...props} />}
-            {section === "mcp" && <McpSection {...props} />}
-            {section === "runtime" && <RuntimeSection {...props} />}
+            <InvalidFields.Provider value={reportInvalid}>
+              {section === "models" && <ModelsSection {...props} />}
+              {section === "nodes" && <NodesSection {...props} />}
+              {section === "roles" && <RolesSection {...props} />}
+              {section === "prompts" && <PromptsSection {...props} />}
+              {section === "sources" && <SourcesSection {...props} />}
+              {section === "mcp" && <McpSection {...props} />}
+              {section === "runtime" && <RuntimeSection {...props} />}
+            </InvalidFields.Provider>
             {section === "secrets" && (
               <SecretsSection
                 view={shown}
                 api={api}
                 disabled={disabled}
                 dirty={dirty}
-                onView={(next) => adopt(next, true)}
+                onSecrets={adoptSecrets}
+                onRestored={adopt}
                 onReset={serverReset}
               />
             )}
@@ -344,14 +396,7 @@ export function ResearchSettings({
                   {changed.map((item) => SECTION_LABELS[item]).join("、")}
                 </span>
                 <div className="ml-auto flex gap-2">
-                  <Button
-                    variant="ghost"
-                    disabled={saving}
-                    onClick={() => {
-                      setEdited(null);
-                      setFailure(null);
-                    }}
-                  >
+                  <Button variant="ghost" disabled={saving} onClick={discard}>
                     <Undo2 className="size-4" />
                     放弃修改
                   </Button>

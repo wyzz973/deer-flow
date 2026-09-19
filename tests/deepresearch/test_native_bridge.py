@@ -85,6 +85,9 @@ async def test_roles_use_native_executor_with_scoped_tools_and_credentials(setti
     assert captured["config"].max_turns == Agent().max_turns
     assert captured["app_config"].models[0].model_extra["max_tokens"] == settings.max_output_tokens
     assert config.models[0].model_extra["max_tokens"] == 32768
+    # The engine's per-turn receipt ledger would rewrite the head of every
+    # request; research roles run without it, and the host setting is untouched.
+    assert captured["app_config"].verification.receipts_enabled is False and config.verification.receipts_enabled is True
     assert "private-value" not in captured["prompt"]
     assert captured["cleaned"]
 
@@ -95,6 +98,24 @@ async def test_roles_use_native_executor_with_scoped_tools_and_credentials(setti
     long_reply = await execute_role(settings, store, run, "technical-route", {"unit": {"id": "R2"}}, [], Agent(), {})
     assert long_reply.answer == result.result.strip()
     assert "response_metadata" not in long_reply.messages[0]
+
+    # Without engine stamping, receipts come from the archived tool messages in
+    # the engine's r1..rN order, with the status the engine normalized.
+    result.ai_messages = [
+        {"type": "ai", "content": "", "tool_calls": [{"id": "c1", "name": "web_search", "args": {}}, {"id": "c2", "name": "web_fetch", "args": {}}]},
+        {"type": "tool", "tool_call_id": "c1", "name": "web_search", "content": "ok"},
+        {"type": "tool", "tool_call_id": "c2", "content": "Error: 429", "status": "success", "additional_kwargs": {"deerflow_tool_meta": {"status": "error"}}},
+    ]
+    derived = await execute_role(settings, store, run, "technical-route", {"unit": {"id": "R2b"}}, [], Agent(), {})
+    assert derived.receipts == [
+        {"id": "r1", "tool_call_id": "c1", "tool_name": "web_search", "status": "success"},
+        {"id": "r2", "tool_call_id": "c2", "tool_name": "web_fetch", "status": "error"},
+    ]
+    # An operator who wants the ledger in the model's context can keep it.
+    settings.tool_receipt_ledger = True
+    await execute_role(settings, store, run, "technical-route", {"unit": {"id": "R2c"}}, [], Agent(), {})
+    assert captured["app_config"].verification.receipts_enabled is True
+    settings.tool_receipt_ledger = False
 
     settings.skills["technical-route"].max_turns = 5
     await execute_role(settings, store, run, "technical-route", {"unit": {"id": "R3"}}, [], Agent(), {})

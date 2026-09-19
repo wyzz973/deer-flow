@@ -19,7 +19,27 @@ URL_KEYS = ("url", "link", "href", "uri", "source_url", "sourceUrl", "sourceURL"
 TITLE_KEYS = ("title", "name", "headline", "document_name", "doc_name", "docnm_kwd", "document_keyword", "file_name", "filename", "source_title")
 TEXT_KEYS = ("snippet", "summary", "description", "content", "text", "body", "abstract", "excerpt", "highlight", "highlights", "raw_content", "markdown", "chunk", "content_with_weight", "answer")
 DOCUMENT_TEXT_KEYS = ("markdown", "raw_content", "content", "text", "body", "html_content", "page_content")
-DATE_KEYS = ("published_at", "publishedAt", "publishedDate", "published_date", "datePublished", "date", "publish_date", "page_age", "age", "updated_at", "last_updated")
+DATE_KEYS = (
+    "published_at",
+    "publishedAt",
+    "publishedDate",
+    "published_date",
+    "datePublished",
+    "date",
+    "publish_date",
+    "publish_time",
+    "publishTime",
+    "page_age",
+    "age",
+    "updated_at",
+    "last_updated",
+    "updated",
+    "update_time",
+    "updateTime",
+    "modified_at",
+    "created_at",
+    "create_time",
+)
 ID_KEYS = ("id", "document_id", "doc_id", "chunk_id", "_id")
 MARKDOWN_LINK = re.compile(r"\[([^\[\]\n]{1,300})\]\((https?://[^\s)]+)\)")
 TITLE_LINE = re.compile(r"(?im)^\s*(?:title|标题)\s*[:：]\s*(.+)$")
@@ -84,17 +104,36 @@ def content_text(content):
     return json.dumps(content, ensure_ascii=False, default=str)
 
 
-def _record(item, text_limit):
+# A chunk with text but neither title nor link is still a record when it sits
+# in a list of such chunks (a knowledge-base tool returning {content, score,
+# doc_id}). Shorter strings are labels or status fields, not content.
+MIN_CHUNK_CHARS = 40
+
+
+def _headline(text, limit=80):
+    """A title for an untitled chunk: its first line, cut at a word or clause."""
+    line = next((part.strip() for part in text.splitlines() if part.strip()), "")
+    line = re.sub(r"^[#>*\-\s]+", "", line)
+    if len(line) <= limit:
+        return line
+    cut = max(line.rfind(mark, 0, limit) for mark in (" ", "，", "。", "；", ",", ";"))
+    return line[: cut if cut > limit // 2 else limit].rstrip() + "…"
+
+
+def _record(item, text_limit, *, chunk=False):
     url = http_url(_first(item, URL_KEYS))
     title = _first(item, TITLE_KEYS)
     text = _first(item, TEXT_KEYS)
+    if chunk and not title and not url and text and len(text) >= MIN_CHUNK_CHARS:
+        title = _headline(html.unescape(text))
     if not ((url and (title or text)) or (title and text)):
         return None
     record = {"title": html.unescape(title or url or "")[:500], "url": url, "snippet": html.unescape(text or "")[:text_limit]}
     published = _first(item, DATE_KEYS)
     if published:
         record["published_at"] = published[:64]
-    identifier = item.get(next((key for key in ID_KEYS if key in item), ""), None)
+    # Internal tools name their identifier after the record: ticket_id, docId, article_id.
+    identifier = item.get(next((key for key in ID_KEYS if key in item), None) or next((key for key in item if re.search(r"(?:_id|Id|ID)$", key)), ""), None)
     if isinstance(identifier, (str, int)) and str(identifier).strip():
         record["id"] = str(identifier)[:200]
     return record
@@ -112,11 +151,20 @@ def records(value, *, limit=50, text_limit=1200):
         seen.add(key)
         found.append(record)
 
-    def walk(item, depth=0):
+    def holds_records(item):
+        """Whether a dict wraps a result list, however record-like its own fields look."""
+        for child in item.values():
+            if isinstance(child, list) and any(isinstance(entry, dict) and _record(entry, text_limit, chunk=True) is not None for entry in child[:5]):
+                return True
+        return False
+
+    def walk(item, depth=0, chunk=False):
         if len(found) >= limit or depth > 8:
             return
         if isinstance(item, dict):
-            record = _record(item, text_limit)
+            # An envelope such as {"name": "kb_search", "description": ..., "items": [...]}
+            # looks like one record; its list is what was asked for.
+            record = None if holds_records(item) else _record(item, text_limit, chunk=chunk)
             if record is not None:
                 add(record)
                 return
@@ -126,8 +174,10 @@ def records(value, *, limit=50, text_limit=1200):
                 elif isinstance(child, str) and child.strip()[:1] in "[{":
                     walk(parse_json(child), depth + 1)
         elif isinstance(item, list):
+            # Entries of a list of objects are candidates even without a title or link.
+            chunks = sum(isinstance(child, dict) for child in item) >= 1
             for child in item:
-                walk(child, depth + 1)
+                walk(child, depth + 1, chunk=chunks)
 
     if isinstance(value, (dict, list)):
         walk(value)
@@ -193,10 +243,11 @@ def document(value, requested_url=None):
     return {"title": (title or url or requested_url or "")[:1000], "url": url or requested_url, "text": text}
 
 
-def render_search(query, found, provider):
+def render_search(query, found, provider, *, citable=False):
     if not found:
         return f'No results for "{query}" (via {provider}).'
-    lines = [f'Search results for "{query}" ({len(found)} via {provider}). Snippets are for discovery; open a page before relying on it.', ""]
+    note = "These excerpts are the evidence; rely only on what they say." if citable else "Snippets are for discovery; open a page before relying on it."
+    lines = [f'Search results for "{query}" ({len(found)} via {provider}). {note}', ""]
     for index, record in enumerate(found, 1):
         label = record["title"].replace("[", "(").replace("]", ")") or record["url"]
         lines.append(f"{index}. [{label}]({record['url']})" if record.get("url") else f"{index}. {label}")

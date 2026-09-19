@@ -1,7 +1,9 @@
 import { describe, expect, it } from "@rstest/core";
 
 import {
+  activeHeadingIndex,
   citationId,
+  composerAccepts,
   countdownSeconds,
   escapeReportText,
   excerptPreview,
@@ -11,8 +13,10 @@ import {
   formatPercent,
   formatTokens,
   liveStatus,
+  nodeLabel,
+  pageKey,
   phaseLabel,
-  reportHeadings,
+  planCardHidden,
   reportMarkdown,
   readableExcerpt,
   reportSummaryLine,
@@ -22,8 +26,11 @@ import {
   sourceSummary,
   sourceTitle,
   uniqueCitationIds,
+  waitingPhase,
 } from "@/core/deepresearch/presentation";
-import type { Report } from "@/core/deepresearch/types";
+import type { Report, ResearchMessage } from "@/core/deepresearch/types";
+
+import { makeRun } from "./fixtures";
 
 describe("report-owned citation anchors", () => {
   const citations = { E001: 1 };
@@ -113,11 +120,7 @@ describe("ChatGPT-style research presentation", () => {
     );
   });
 
-  it("builds the reader outline from report headings outside code", () => {
-    expect(reportHeadings(reportMarkdown(v2))).toEqual([
-      { level: 2, text: "执行摘要" },
-      { level: 3, text: "路线图 P0" },
-    ]);
+  it("projects a historical report into the same Markdown outline", () => {
     const legacy: Report = {
       ...v2,
       format: undefined,
@@ -132,11 +135,61 @@ describe("ChatGPT-style research presentation", () => {
       },
     };
     expect(reportMarkdown(legacy)).toContain("摘要[1](#citation-E001)");
-    expect(reportHeadings(reportMarkdown(legacy)).map((h) => h.text)).toEqual([
-      "执行摘要",
-      "章节",
-      "结论",
-    ]);
+    expect(
+      reportMarkdown(legacy)
+        .split("\n")
+        .filter((line) => line.startsWith("## ")),
+    ).toEqual(["## 执行摘要", "## 章节", "## 结论"]);
+  });
+
+  it("follows the reading position in both directions", () => {
+    const line = 96;
+    // Before the first section (title block) the first entry is current.
+    expect(activeHeadingIndex([300, 900, 1500], line)).toBe(0);
+    expect(activeHeadingIndex([-400, 90, 700], line)).toBe(1);
+    expect(activeHeadingIndex([-900, -300, 40], line)).toBe(2);
+    // Scrolling back up: the third heading is below the line again, so the
+    // second section — the one on screen — is current, not the third.
+    expect(activeHeadingIndex([-700, -100, 240], line)).toBe(1);
+    expect(activeHeadingIndex([], line)).toBe(0);
+  });
+
+  it("accepts a message only when the server would", () => {
+    const accepts = (status: string, updating = false, welcome = false) =>
+      composerAccepts({ status, updating, welcome });
+    expect(accepts("", false, true)).toBe(true);
+    for (const status of [
+      "AWAITING_PLAN_CONFIRMATION",
+      "EDITING_PLAN",
+      "AWAITING_CLARIFICATION",
+      "COMPLETED",
+    ])
+      expect(accepts(status)).toBe(true);
+    // Running research takes a message only as an update the owner opened.
+    expect(accepts("RESEARCHING")).toBe(false);
+    expect(accepts("RESEARCHING", true)).toBe(true);
+    // Too late to steer: the report is being bound and rendered.
+    expect(accepts("RENDERING", true)).toBe(false);
+    expect(accepts("PLANNING", true)).toBe(false);
+    // Without a report the server refuses both (RUN_STOPPED); with one, a
+    // stopped or failed follow-up leaves a conversation that can go on.
+    for (const status of ["FAILED", "CANCELLED"]) {
+      expect(composerAccepts({ status, updating: false, welcome: false })).toBe(
+        false,
+      );
+      expect(
+        composerAccepts({
+          status,
+          updating: false,
+          welcome: false,
+          hasReport: true,
+        }),
+      ).toBe(true);
+    }
+    expect(accepts("FAILED")).toBe(false);
+    expect(accepts("CANCELLED")).toBe(false);
+    // A selected conversation that has not loaded yet.
+    expect(accepts("")).toBe(false);
   });
 
   it("describes live progress and never regresses it", () => {
@@ -218,6 +271,13 @@ describe("citation excerpt previews", () => {
       ),
     ).toBe("Setup See the guide and for smartcn.");
   });
+  it("drops code fences, quote marks and bullets, keeping the words", () => {
+    expect(
+      excerptPreview(
+        "```python\nprint('x')\n```\n> quoted **text**\n- first\n* second\n\n[docs](https://x.test/a)",
+      ),
+    ).toBe("print('x') quoted text first second docs");
+  });
   it("shortens long excerpts", () => {
     const preview = excerptPreview("字".repeat(400), 360);
     expect(preview).toHaveLength(361);
@@ -242,7 +302,37 @@ describe("source list summaries", () => {
   });
 });
 
+describe("page identity", () => {
+  it("ignores scheme, www and a trailing slash, like the server", () => {
+    const key = pageKey("https://www.example.com/docs/");
+    expect(pageKey("http://example.com/docs")).toBe(key);
+    expect(pageKey("https://EXAMPLE.com:443/docs#intro")).toBe(key);
+    expect(pageKey("https://example.com")).toBe(
+      pageKey("http://www.example.com/"),
+    );
+  });
+  it("keeps the query, a custom port and a single-page-app route", () => {
+    const key = pageKey("https://example.com/docs");
+    expect(pageKey("https://example.com/docs?page=2")).not.toBe(key);
+    expect(pageKey("https://example.com:8443/docs")).not.toBe(key);
+    expect(pageKey("https://example.com/docs#/doc/5")).not.toBe(key);
+    expect(pageKey("https://example.com/docs#!/doc/5")).not.toBe(key);
+  });
+  it("leaves unparseable locators as they are", () => {
+    expect(pageKey("not a url")).toBe("not a url");
+    expect(pageKey(null)).toBe("");
+  });
+});
+
 describe("research metrics formatting", () => {
+  it("names graph nodes and leaves unknown ones alone", () => {
+    expect(nodeLabel("rewrite")).toBe("请求改写");
+    expect(nodeLabel("section")).toBe("章节写作");
+    expect(nodeLabel("follow_up")).toBe("追问分流");
+    expect(nodeLabel("compaction")).toBe("上下文压缩");
+    expect(nodeLabel("unknown")).toBe("未知");
+    expect(nodeLabel("custom_node")).toBe("custom_node");
+  });
   it("formats tokens, costs, ratios and phase names", () => {
     expect(formatTokens(950)).toBe("950");
     expect(formatTokens(17000)).toBe("17.0k");
@@ -255,6 +345,78 @@ describe("research metrics formatting", () => {
     expect(formatPercent(0.552)).toBe("55%");
     expect(formatPercent(null)).toBe("—");
     expect(phaseLabel("dispatch")).toBe("研究");
+    expect(phaseLabel("rewrite")).toBe("请求改写");
     expect(phaseLabel("custom-phase")).toBe("custom-phase");
+  });
+});
+
+describe("what the conversation shows while it waits", () => {
+  const user: ResearchMessage = {
+    id: "u1",
+    role: "user",
+    kind: "text",
+    text: "q",
+    at: "2026-09-19T00:00:00+00:00",
+  };
+  const run = makeRun("waiting", "PLANNING");
+  const plan: ResearchMessage = {
+    id: "p1",
+    role: "assistant",
+    kind: "plan",
+    text: "plan",
+    plan: run.plan!,
+    at: user.at,
+    cycle: 0,
+  };
+  const report: ResearchMessage = {
+    id: "r1",
+    role: "assistant",
+    kind: "report",
+    text: "报告",
+    at: user.at,
+    cycle: 0,
+  };
+  const version = run.plan!.plan_version;
+
+  it("thinks on creation, holds a skeleton while the first plan is written", () => {
+    expect(waitingPhase("CREATED", [user], null)).toBe("thinking");
+    expect(waitingPhase("PLANNING", [user], null)).toBe("planning");
+    expect(waitingPhase("RESPONDING", [user, plan], version)).toBe("thinking");
+  });
+
+  it("disappears with the plan card, and never shows beside a plan under revision", () => {
+    // A revised plan keeps its own card, with a live status.
+    expect(waitingPhase("PLANNING", [user, plan, user], version)).toBeNull();
+    for (const status of [
+      "AWAITING_PLAN_CONFIRMATION",
+      "RESEARCHING",
+      "COMPLETED",
+      "FAILED",
+      "",
+    ])
+      expect(waitingPhase(status, [user, plan], version)).toBeNull();
+  });
+
+  it("comes back for a follow-up whose previous plan already has its report", () => {
+    expect(waitingPhase("PLANNING", [user, plan, report, user], version)).toBe(
+      "planning",
+    );
+  });
+
+  it("drops a plan from the conversation once its report exists, unless it still has news", () => {
+    const reported = { ...run, conversation: [user, plan, report] };
+    expect(planCardHidden(plan, { ...reported, status: "COMPLETED" })).toBe(
+      true,
+    );
+    // A legacy run has no conversation records, only a finished status.
+    expect(planCardHidden(plan, { ...run, status: "COMPLETED" })).toBe(true);
+    expect(planCardHidden(plan, { ...run, status: "RESEARCHING" })).toBe(false);
+    // A follow-up that failed or was stopped keeps its error and retry.
+    for (const status of ["FAILED", "CANCELLED"])
+      expect(planCardHidden(plan, { ...reported, status })).toBe(false);
+    // Still hidden while the follow-up is planned or answered.
+    expect(planCardHidden(plan, { ...reported, status: "PLANNING" })).toBe(
+      true,
+    );
   });
 });

@@ -21,8 +21,19 @@ from .render import citation_metadata
 MARKER = re.compile(r"(?:\[\[|【|\[)\s*(E\d{3,}(?:\s*[,，;；、]\s*E\d{3,})*)\s*(?:\]\]|】|\])(?!\()")
 MARKER_ID = re.compile(r"E\d{3,}")
 NUMERIC = re.compile(r"\[\^?\d{1,3}\](?![(:])")
-LINK = re.compile(r"\[([^\]\n]*)\]\(\s*<?(?:https?://|www\.)[^)\s]*>?\s*\)")
-BARE_URL = re.compile(r"<?\bhttps?://[^\s<>)\]\"'，。；]+>?")
+# Anything written like a marker that MARKER does not accept: [[E12]], [[e001]],
+# [[E001-E002]], [[E001 E002]], 【E1】, （E001）. normalize_markers rewrites the ones
+# that only differ in separators or case; what is left cannot be verified.
+# The parenthesized form is limited to three-digit IDs: "(E2650)" is a CPU, not a citation.
+LOOSE_MARKER = re.compile(r"\[\[[^\[\]\n]{0,80}\]\]|【\s*[Ee]\d+[^】\n]{0,40}】|[（(]\s*[Ee]\d{3}(?!\d)(?:\s*[,，、;；和与及&\-–~至到\s]\s*[Ee]\d{3}(?!\d))*\s*[）)]")
+# A writer may only link inside the document. Every other target is removed:
+# "//host/x.png" is as remote as "https://host/x.png", and an image or a link
+# the model chose is an exfiltration channel for injected instructions. The
+# label is bounded so a line of stray brackets cannot make matching quadratic.
+LINK = re.compile(r"!?\[([^\[\]\n]{0,300})\]\(\s*<?(?!#)[^)\s]*>?(?:\s+\"[^\"\n]{0,200}\")?\s*\)")
+REFERENCE_DEFINITION = re.compile(r"^\s{0,3}\[[^\]\n]{1,200}\]:\s*\S+.*$")
+BARE_URL = re.compile(r"<?\b(?:https?|ftp)://[^\s<>)\]\"'，。；]+>?|<?\bmailto:[^\s<>)\]\"'，。；]+>?")
+CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 INLINE_CODE = re.compile(r"(`+)(.+?)\1")
 LIST_PREFIX = re.compile(r"^(\s*(?:[-*+]|\d+[.)])\s+|\s*>\s*)")
@@ -65,8 +76,26 @@ LABELS = {
 }
 
 
+ASKS_ENGLISH = re.compile(r"(?i)\b(?:answer|reply|respond|write|report)\s+in\s+english\b|用英[文语]|英文(?:回答|撰写|输出|报告|写)")
+ASKS_CHINESE = re.compile(r"(?i)\bin\s+chinese\b|用中文|中文(?:回答|撰写|输出|报告|写)")
+
+
 def language(text):
-    return "zh" if re.search(r"[\u4e00-\u9fff]", text or "") else "en"
+    """The reader's language for report labels: "zh" or "en".
+
+    An explicit wish wins. Otherwise Chinese needs to carry the sentence: one
+    Chinese name inside an English question is still an English question, and
+    kana marks Japanese, which has no label set of its own and gets English labels.
+    """
+    text = text or ""
+    if ASKS_ENGLISH.search(text):
+        return "en"
+    if ASKS_CHINESE.search(text):
+        return "zh"
+    han = len(re.findall(r"[\u4e00-\u9fff]", text))
+    if not han or len(re.findall(r"[\u3040-\u30ff]", text)) * 5 > han:
+        return "en"
+    return "zh" if han >= len(re.findall(r"[A-Za-z]{2,}", text)) else "en"
 
 
 def _segments(document):
@@ -150,19 +179,23 @@ def _replace_markers(line, render):
 
 def problems(text, eligible):
     """Precise, value-free feedback for a bounded writer repair."""
-    unknown, numeric, links = set(), 0, 0
+    unknown, numeric, links, malformed = set(), 0, 0, []
 
     def scan(line):
         nonlocal numeric, links
         for match in MARKER.finditer(line):
             unknown.update(eid for eid in MARKER_ID.findall(match.group(1)) if eid not in eligible)
         prose = MARKER.sub("", line)
+        malformed.extend(match.group(0)[:40] for match in LOOSE_MARKER.finditer(prose))
+        prose = LOOSE_MARKER.sub("", prose)
         numeric += len(NUMERIC.findall(prose))
-        links += len(LINK.findall(prose)) + len(BARE_URL.findall(LINK.sub("", prose)))
+        links += len(LINK.findall(prose)) + len(BARE_URL.findall(LINK.sub("", prose))) + bool(REFERENCE_DEFINITION.match(prose))
         return line
 
     _map_lines(text, scan)
     errors = []
+    if malformed:
+        errors.append(f"{len(malformed)} malformed evidence marker(s) such as {malformed[0]}. Write markers exactly as [[E012]] or [[E012, E031]], with IDs copied from `evidence`.")
     if unknown:
         errors.append("Unknown or non-citable evidence IDs: " + ", ".join(sorted(unknown)[:30]) + ". Use only IDs listed in `evidence`; omit a statement that no listed evidence supports.")
     if numeric:
@@ -178,7 +211,9 @@ LEADING_MARKERS = re.compile(r"^\s*(?:" + MARKER.pattern + r"\s*)+")
 def _sentences(text):
     """Split prose into statements; a marker after the full stop belongs to
     the sentence it follows, not to the next one."""
-    parts = re.split(r"(?<=[。！？!?；;])|(?<=\.)(?=\s+[A-Z\u4e00-\u9fff*\[【])", text)
+    # A clause after a semicolon shares the sentence's citation, so removing
+    # only the cited half would leave the other half as an uncited fact.
+    parts = re.split(r"(?<=[。！？!?])|(?<=\.)(?<!e\.g\.)(?<!i\.e\.)(?<!\bvs\.)(?<!etc\.)(?<!\bNo\.)(?<!\bInc\.)(?<!\bLtd\.)(?<!\bCo\.)(?<!\bDr\.)(?<!\bMr\.)(?<!\bMs\.)(?<!\bFig\.)(?=\s+[A-Z\u4e00-\u9fff*\[【])", text)
     statements = []
     for part in filter(None, parts):
         lead = LEADING_MARKERS.match(part)
@@ -200,9 +235,15 @@ def sanitize(text, eligible):
     audit = {"dropped_statements": 0, "stripped_links": 0, "stripped_numeric_citations": 0}
 
     def invalid(fragment):
-        return any(eid not in eligible for match in MARKER.finditer(fragment) for eid in MARKER_ID.findall(match.group(1)))
+        if any(eid not in eligible for match in MARKER.finditer(fragment) for eid in MARKER_ID.findall(match.group(1))):
+            return True
+        # Something shaped like a citation that names no verifiable ID.
+        return bool(LOOSE_MARKER.search(MARKER.sub("", fragment)))
 
     def clean(line):
+        if REFERENCE_DEFINITION.match(line):
+            audit["stripped_links"] += 1
+            return None
         line, count = LINK.subn(lambda m: m.group(1), line)
         audit["stripped_links"] += count
         line, count = BARE_URL.subn("", line)
@@ -226,6 +267,9 @@ def sanitize(text, eligible):
         kept = [sentence for sentence in sentences if not invalid(sentence)]
         audit["dropped_statements"] += len(sentences) - len(kept)
         body = "".join(kept).strip()
+        if body.count("**") % 2:
+            # The removed sentence held one half of a bold span.
+            body = body.replace("**", "", 1).lstrip()
         return prefix + body if body else None
 
     return _map_lines(text, clean), audit
@@ -248,12 +292,73 @@ def _drop_process_notes(text):
             if line.strip():
                 paragraph.append(line)
                 continue
-            if paragraph and not (not BLOCK_START.match(paragraph[0]) and PROCESS_NOTE.search(" ".join(paragraph))):
+            joined = " ".join(paragraph)
+            # A cited paragraph is reader content even when its subject is
+            # evidence numbering (forensics, legal discovery); only uncited
+            # bookkeeping about how the text was produced goes.
+            if paragraph and not (not BLOCK_START.match(paragraph[0]) and PROCESS_NOTE.search(joined) and not MARKER.search(joined)):
                 output.extend(paragraph)
             paragraph = []
             output.append(line)
         output.pop()
     return re.sub(r"\n{3,}", "\n\n", "\n".join(output)).strip()
+
+
+def close_fences(text):
+    """(text, repaired): end a code fence the writer left open.
+
+    An answer cut off at the output cap inside ```mermaid would otherwise turn
+    every later section of the assembled report into code: headings, markers
+    and the scope section all disappeared and the report still validated. A
+    cut-off diagram cannot render, so it is dropped; other code is closed.
+    """
+    segments = _segments(text)
+    if not segments or not segments[-1][0]:
+        return text, False
+    lines = segments[-1][1]
+    opening = FENCE.match(lines[0])
+    closed = len(lines) > 1 and lines[-1].strip() and set(lines[-1].strip()) == {opening.group(1)[0]} and len(lines[-1].strip()) >= len(opening.group(1))
+    if closed:
+        return text, False
+    kept = [line for code, body in segments[:-1] for line in body]
+    if not re.match(r"^\s{0,3}[`~]{3,}\s*mermaid\b", lines[0], re.I):
+        kept += [*lines, opening.group(1)]
+    return "\n".join(kept).rstrip(), True
+
+
+def normalize_markers(text):
+    """Rewrite markers that differ from the contract only in separators or case.
+
+    ``[[e001]]``, ``[[E001 E002]]``, ``[[E001-E002]]``, ``【E001、E002】`` and
+    ``（E001）`` name real IDs; the IDs are still validated afterwards. A range is
+    never expanded and nothing is guessed: a marker without a three-digit ID
+    stays as it is and is reported as malformed.
+    """
+
+    def canonical(match):
+        if MARKER.fullmatch(match.group(0)):
+            return match.group(0)
+        ids = [eid.upper() for eid in re.findall(r"[Ee]\d{3,}", match.group(0))]
+        inner = re.sub(r"[Ee]\d+|[\s,，、;；和与及&\-–~至到\[\]【】（）()]", "", match.group(0))
+        return "[[" + ", ".join(dict.fromkeys(ids)) + "]]" if ids and not inner else match.group(0)
+
+    return _map_lines(text, lambda line: LOOSE_MARKER.sub(canonical, line))
+
+
+def plain_text(value, limit=None):
+    """A model-written label without links, URLs or citations of any kind.
+
+    Titles, key conclusions, assumptions and limitations are assembled into the
+    report as they are. A caveat such as "could not open https://..." or a
+    stray "[1]" used to fail final validation and rewrite the whole report.
+    """
+    text = CONTROL.sub("", " ".join(str(value or "").split()))
+    text = LINK.sub(lambda match: match.group(1), text)
+    text = BARE_URL.sub("", text)
+    text = LOOSE_MARKER.sub("", MARKER.sub("", text))
+    text = NUMERIC.sub("", text)
+    text = re.sub(r"\s+([，。；：、,.;:])", r"\1", re.sub(r"\s{2,}", " ", text)).strip()
+    return text[:limit] if limit else text
 
 
 def clean_answer(text, heading=None, *, whole_document=False):
@@ -263,13 +368,14 @@ def clean_answer(text, heading=None, *, whole_document=False):
     dropped. A section body loses a repeated heading and has its top-level
     headings demoted; a whole revised document keeps its own heading structure.
     """
-    text = visible_text(text or "").strip()
+    text = CONTROL.sub("", visible_text(text or "")).strip()
     first, _, rest = text.partition("\n")
     if "[[" not in first and PREAMBLE.match(first.strip()):
         text = rest.strip()
     wrapped = re.fullmatch(r"```(?:markdown|md)?\s*\n(.*?)\n```", text, re.S)
     if wrapped:
         text = wrapped.group(1).strip()
+    text = normalize_markers(close_fences(text)[0])
     text = _drop_process_notes(text)
     if whole_document:
         return text
@@ -355,9 +461,13 @@ def _page_identity(evidence, eid):
         except ValueError:
             host = None
         if host:
-            return (evidence.get("origin"), host + port, parts.path.rstrip("/") or "/", parts.query)
-    locator = evidence.get("source_uri") or eid
-    return (evidence.get("origin"), evidence.get("source_name"), locator, evidence.get("document_hash"))
+            # A single-page application routes in its fragment ("#/doc/5"): those are different pages.
+            route = parts.fragment if parts.fragment.startswith(("/", "!")) else ""
+            return (evidence.get("origin"), host + port, parts.path.rstrip("/") or "/", parts.query, route)
+    if evidence.get("document_hash"):
+        # The same knowledge-base passage returned by several queries is one reference.
+        return (evidence.get("origin"), evidence.get("source_name"), evidence["document_hash"])
+    return (evidence.get("origin"), evidence.get("source_name"), evidence.get("source_uri") or eid)
 
 
 def bind(document, pool):
@@ -398,19 +508,54 @@ def display_markdown(document, mapping):
     return _map_lines(document, lambda line: _literal_dollars(_replace_markers(line, lambda ids: "".join(f"[{number}](#citation-{eid})" for number, eid in _numbers(ids, mapping).items()))))
 
 
-EXCERPT_HEADER = re.compile(r"^(?:Source|Title|Excerpt|Literal matches|No literal match found)[^\n]*\n", re.M)
+# The native fetch header is a block at the top; the same words inside the page are its text.
+EXCERPT_HEADER = re.compile(r"\A(?:(?:Source|Title|Excerpt|Literal matches|No literal match found)[^\n]*\n)+")
 
 
 SYNOPSIS = re.compile(r"\A\[Full [^\]]* output saved to [^\]]*\]\n.*?(?:Raw sample[^\n]*\n|\Z)", re.S)
 
 
+MARKDOWN_IMAGE = re.compile(r"!\[[^\]\n]*\]\([^)\n]*\)")
+MARKDOWN_LINK = re.compile(r"\[([^\]\n]*)\]\([^)\n]*\)")
+
+
+def _prose(line):
+    """How much of a line is running text rather than navigation or markup."""
+    return len(re.sub(r"[\s#>*_`|\-=•·]+", "", line))
+
+
 def excerpt(snippet, limit=2000):
     """Readable excerpt: drop tool envelopes (a host synopsis of an externalized
-    result and the native fetch header lines) and keep the page text."""
+    result and the native fetch header lines) and keep the page text.
+
+    A fetched page starts with its navigation: logo links, menus, cookie
+    notices. Readers saw that as the "quote" of a citation. Link and image
+    syntax is reduced to its text, and the excerpt starts at the first line
+    that reads like a sentence; a page without one is kept from its start.
+    """
     text = SYNOPSIS.sub("", snippet or "")
     text = EXCERPT_HEADER.sub("", text)
-    text = re.sub(r"\n\[(?:More content|End of extracted page)[^\]]*\]\s*$", "", text).strip()
-    return text[:limit]
+    text = re.sub(r"\n\[(?:More content|End of extracted page|End of document)[^\]]*\]\s*$", "", text).strip()
+    text = MARKDOWN_LINK.sub(lambda match: match.group(1), MARKDOWN_IMAGE.sub("", text))
+    lines = [line.rstrip() for line in text.split("\n")]
+    start = next((index for index, line in enumerate(lines) if _prose(line) >= 60 and len(line.split()) + len(re.findall(r"[\u4e00-\u9fff]", line)) >= 12), 0)
+    # Keep the heading right above the first sentence: it says what the passage is about.
+    above = next((index for index in range(start - 1, max(-1, start - 4), -1) if lines[index].strip()), None)
+    if above is not None and lines[above].lstrip().startswith("#"):
+        start = above
+    body = "\n".join(lines[start:]).strip()
+    return re.sub(r"\n{3,}", "\n\n", body)[:limit]
+
+
+def evidence_basis(evidence, roles=None):
+    """What a citation rests on: an opened original, a returned record or a search excerpt.
+
+    ``roles`` maps source names to their operator-declared role.
+    """
+    provenance = evidence.get("provenance", "document")
+    if provenance in {"document", "fetched_document"}:
+        return "page"
+    return "search excerpt" if provenance == "observed_source" or (roles or {}).get(evidence.get("source_name")) == "search" else "record"
 
 
 def _display_title(item, pool):
@@ -427,15 +572,27 @@ def _display_title(item, pool):
     return item.get("title") or item.get("source_uri") or item["evidence_id"]
 
 
-def references(mapping, pool):
+BASIS_NOTE = {"zh": "检索摘录，未读取原文", "en": "search excerpt; the original was not opened"}
+
+
+def references(mapping, pool, roles=None):
     values = citation_metadata(mapping, pool)
     for item in values:
         item["title"] = _display_title(item, pool)
+        # A reader must be able to tell an opened original from the excerpt a
+        # search tool showed: the strongest basis in the group counts.
+        kinds = {evidence_basis(pool[eid], roles) for eid in item["evidence_ids"]}
+        item["basis"] = next(kind for kind in ("page", "record", "search excerpt") if kind in kinds)
     return values
 
 
-def citations(mapping, pool):
-    values = references(mapping, pool)
+def _locator(ref):
+    """What stands in for a link when a record has none: where it came from, never an internal URI."""
+    return ref.get("source_name") or ref.get("publisher") or ""
+
+
+def citations(mapping, pool, roles=None):
+    values = references(mapping, pool, roles)
     for item in values:
         item["domain"] = (urlsplit(item.get("url") or item.get("canonical_url") or "").hostname or "").removeprefix("www.")
         item["snippet"] = excerpt(item.get("snippet"), 1200)
@@ -444,23 +601,24 @@ def citations(mapping, pool):
     return values
 
 
-def _reference_lines(mapping, pool, lang):
+def _reference_lines(mapping, pool, lang, roles=None):
     lines = [f"## {LABELS[lang]['references']}", ""]
-    for ref in references(mapping, pool):
+    for ref in references(mapping, pool, roles):
         target = ref.get("url") or ref.get("canonical_url")
         title = ref["title"].replace("[", "(").replace("]", ")")
-        locator = f"[{title}](<{quote(target, safe=':/?=&%#@+;,~-._')}>)" if target else f"{title} — {ref.get('source_uri') or ''}"
+        locator = f"[{title}](<{quote(target, safe=':/?=&%#@+;,~-._')}>)" if target else f"{title} — {_locator(ref)}".rstrip(" —")
         date = f" · {str(ref['published_at'])[:10]}" if ref.get("published_at") else ""
-        lines += [f'<a id="ref-{ref["number"]}"></a>', f"{ref['number']}. {locator}{date}", ""]
+        note = f"（{BASIS_NOTE[lang]}）" if ref["basis"] == "search excerpt" and lang == "zh" else f" ({BASIS_NOTE[lang]})" if ref["basis"] == "search excerpt" else ""
+        lines += [f'<a id="ref-{ref["number"]}"></a>', f"{ref['number']}. {locator}{date}{note}", ""]
     return lines
 
 
-def export_markdown(document, mapping, pool, lang="zh", demo=False):
+def export_markdown(document, mapping, pool, lang="zh", demo=False, roles=None):
     body = _map_lines(document, lambda line: _literal_dollars(_replace_markers(line, lambda ids: "".join(f"[{number}](#ref-{number})" for number in _numbers(ids, mapping)))))
     lines = body.rstrip().split("\n")
     if demo:
         lines[1:1] = ["", f"> {LABELS[lang]['demo']}"]
-    return "\n".join([*lines, "", *_reference_lines(mapping, pool, lang)]).rstrip() + "\n"
+    return "\n".join([*lines, "", *_reference_lines(mapping, pool, lang, roles)]).rstrip() + "\n"
 
 
 def _markdown_parser():
@@ -469,16 +627,18 @@ def _markdown_parser():
     return MarkdownIt("commonmark", {"html": False, "linkify": False, "typographer": False}).enable(["table", "strikethrough"])
 
 
-def html_document(document, mapping, pool, lang="zh", demo=False):
+def html_document(document, mapping, pool, lang="zh", demo=False, roles=None):
     body = _map_lines(document, lambda line: _replace_markers(line, lambda ids: "\u27e6" + ",".join(str(number) for number in _numbers(ids, mapping)) + "\u27e7"))
     rendered = _markdown_parser().render(body)
     rendered = re.sub(r"\u27e6([\d,]+)\u27e7", lambda m: "".join(f'<sup><a href="#ref-{n}">[{n}]</a></sup>' for n in m.group(1).split(",")), rendered)
     esc = html.escape
     items = []
-    for ref in references(mapping, pool):
+    for ref in references(mapping, pool, roles):
         label = esc(ref["title"])
         target = ref.get("url") or ref.get("canonical_url")
-        label = f'<a rel="noreferrer noopener" href="{esc(target, quote=True)}">{label}</a>' if target else label + " — " + esc(ref.get("source_uri") or "")
+        label = f'<a rel="noreferrer noopener" href="{esc(target, quote=True)}">{label}</a>' if target else (label + " — " + esc(_locator(ref))).rstrip(" —")
+        if ref["basis"] == "search excerpt":
+            label += f" <small>({esc(BASIS_NOTE[lang])})</small>"
         items.append(f'<li id="ref-{ref["number"]}">{label}</li>')
     style = (
         "body{font:16px/1.7 system-ui,sans-serif;max-width:820px;margin:40px auto;padding:0 16px}"

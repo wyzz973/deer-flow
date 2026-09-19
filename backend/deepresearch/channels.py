@@ -17,14 +17,17 @@ import re
 import threading
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
 from . import extract
 from .audit import scrub_text
+from .contracts import ResearchError
 from .evidence import canonical_url, digest
 from .providers import PROVIDER_FAILURES, ProviderError, Request, call
+from .report_policy import results_citable
 
 MAX_ATTEMPTS = 6
 # (first cooldown, ceiling) in seconds; transient failures back off exponentially.
@@ -35,6 +38,9 @@ DESCRIPTIONS = {
     "read": "Open a web page or online document by its exact URL (from search results or the user) and return its readable text in excerpts. "
     "Continue a long page with start_index from the previous result, or pass query to jump to a section.",
     "data": "Search this knowledge source and return matching records with their titles and content. Records can be cited as evidence.",
+    # A search source whose results are the evidence: no read source is
+    # configured, or the operator declared that search returns citable text.
+    "search_citable": "Search and return result titles, links, dates and excerpts. These results can be cited as evidence: rely only on what an excerpt actually says. Run separate focused searches for separate questions.",
 }
 
 
@@ -209,29 +215,121 @@ def _excerpt(text, start_index, max_length, query):
     return position, end, matches
 
 
-def build_tool(source, settings, run_id, request_secrets=None):
+# Artifact of a reply that ends a step's searching. It is an instruction to the
+# model, never something it read, so observation skips it.
+BUDGET_STOP = "deepresearch.budget_stop.v1"
+
+
+@dataclass(frozen=True)
+class Stop:
+    reason: Literal["step", "run", "time"]
+    text: str
+
+    @property
+    def artifact(self):
+        return {"schema": BUDGET_STOP, "reason": self.reason}
+
+
+class SearchBudget:
+    """How many searches one research step may make, enforced gracefully.
+
+    A researcher that keeps searching used to end the whole run with
+    ``BUDGET_EXHAUSTED``. A step budget instead winds that step down: the step
+    knows its allowance up front (it is in the task payload) and, once it is
+    used, search tools answer with a stop instruction so the model writes its
+    notes from the evidence it already has. Page reads never count against the
+    allowance, because only an opened page is citable; they count toward the
+    run-wide ceiling, which winds every tool down the same way.
+    """
+
+    def __init__(self, store, run_id, unit_id, limit=None, deadline=None):
+        self.store, self.run_id, self.unit_id, self.limit = store, run_id, unit_id, limit
+        # time.monotonic() after which the step must wrap up: its own time
+        # allowance (max_seconds_per_unit) or what the run's time budget leaves
+        # for research. Like searches, time winds a step down instead of
+        # killing it: a step cut off by its hard timeout loses all it has read.
+        self.deadline = deadline
+        self.used = 0
+        self.announced = set()
+
+    async def reserve(self, kind="search"):
+        """Account one source call, or return the Stop that ends it."""
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            text = "Stop: the time for this research step is used up. Do not call search or read tools again. Write your research notes now from the evidence you already collected and say what remains unverified."
+            return await self._wrap_up(Stop("time", text))
+        searching = kind != "read"
+        if searching:
+            if self.limit is not None and self.used >= self.limit:
+                text = f"No more searches in this step: it has used all {self.limit} of its searches. You may still open pages you already found with the read tool; "
+                text += "then write your research notes from that evidence and say what remains unverified."
+                return await self._wrap_up(Stop("step", text))
+            # Claim the slot before waiting on the ledger: searches sent in one
+            # turn run concurrently and would otherwise all see it free.
+            self.used += 1
+        try:
+            await self.store.reserve(self.run_id, tool_calls=1)
+        except ResearchError as error:
+            if searching:
+                self.used -= 1
+            if error.code != "BUDGET_EXHAUSTED":
+                raise
+            text = "Stop: the research-wide tool budget is used up. Write your research notes now from the evidence you already collected, say what remains unverified, and do not call search or read tools again."
+            return await self._wrap_up(Stop("run", text))
+        return None
+
+    def call_timeout(self):
+        """Seconds a source call started now may take, or None without a deadline.
+
+        A call that starts before the deadline may finish a little after it,
+        but a slow source must not hold the step until its hard timeout.
+        """
+        if self.deadline is None:
+            return None
+        return max(5.0, self.deadline - time.monotonic() + 10.0)
+
+    async def _wrap_up(self, stop):
+        if stop.reason not in self.announced:
+            self.announced.add(stop.reason)
+            reason = {"step": f"this step has used all {self.limit} of its searches", "time": "the time for this research step is used up"}.get(stop.reason, "the research-wide tool budget is used up")
+            await self.store.event(self.run_id, "research.search.limited", {"unit_id": self.unit_id, "used": self.used, "limit": self.limit, "reason": reason, "scope": stop.reason})
+        return stop
+
+
+def build_tool(source, settings, run_id, request_secrets=None, budget=None):
     """One StructuredTool for a provider-based source; returns (content, artifact)."""
     from langchain_core.tools import StructuredTool, ToolException
 
-    description = source.description or DESCRIPTIONS[source.role]
+    citable_results = source.role == "search" and results_citable(settings)
+    description = source.description or DESCRIPTIONS["search_citable" if citable_results else source.role]
+
+    async def spent(kind="search"):
+        """None while the call is affordable, else the Stop that ends it."""
+        return await budget.reserve(kind) if budget is not None else None
 
     async def providers(request):
         try:
-            return await run_providers(source, request, settings, request_secrets)
+            return await asyncio.wait_for(run_providers(source, request, settings, request_secrets), budget.call_timeout() if budget is not None else None)
+        except TimeoutError:
+            raise ToolException("Error: the source did not answer in the time left for this step. Do not retry it; write your research notes from what you already have.") from None
         except ProviderError as error:
             raise ToolException("Error: " + str(error)) from None
 
     async def search(query: str, max_results: int = 8, time_range: str | None = None):
+        if stop := await spent():
+            return stop.text, stop.artifact
         query = " ".join(query.split())
         provider, outcome, attempts = await providers(Request("search", query=query, max_results=max_results, time_range=time_range))
         found = outcome.records[:max_results]
         artifact = {"schema": "deepresearch.search.v1", "source": source.name, "provider": provider.id, "provider_type": provider.type, "query": query, "results": found, "attempts": attempts, "raw_preview": outcome.raw[:2000]}
-        return extract.render_search(query, found, provider.id), artifact
+        return extract.render_search(query, found, provider.id, citable=citable_results), artifact
 
     async def read(url: str, start_index: int = 0, max_length: int = 8000, query: str | None = None):
         if not extract.http_url(url):
             raise ToolException("Error: url must be an absolute http(s) URL")
         cached = PAGES.get(run_id, url)
+        # A page already read in this run is free: continuing it costs no budget.
+        if cached is None and (stop := await spent("read")):
+            return stop.text, stop.artifact
         if cached is None:
             provider, outcome, attempts = await providers(Request("read", url=url))
             page = {"title": outcome.document.get("title") or url, "text": outcome.document["text"], "provider": provider.id, "provider_type": provider.type}
@@ -264,6 +362,8 @@ def build_tool(source, settings, run_id, request_secrets=None):
         return header + "\n\n" + excerpt + footer, artifact
 
     async def data(query: str, max_results: int = 8):
+        if stop := await spent():
+            return stop.text, stop.artifact
         query = " ".join(query.split())
         provider, outcome, attempts = await providers(Request("data", query=query, max_results=max_results))
         found = outcome.records[:max_results]

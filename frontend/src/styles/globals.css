@@ -451,3 +451,333 @@ html.dark .shiki span {
   --container-width-md: calc(var(--spacing) * 204);
   --container-width-lg: calc(var(--spacing) * 256);
 }
+
+/* DeepResearch surface.
+   The research page follows ChatGPT deep research: a cool white page, pure
+   white cards and three text greys. The tokens are overridden inside this
+   scope only, so the rest of the workspace keeps its own palette. Content that
+   is portalled out of the page (hover cards, menus, the mobile sheet) carries
+   the class itself. Rules here are unlayered on purpose: they have to win over
+   the utility classes Streamdown puts on report tables. */
+.deepresearch-surface {
+  --background: #fcfcfc;
+  --foreground: #0d0d0d;
+  --card: #ffffff;
+  --card-foreground: #0d0d0d;
+  --popover: #ffffff;
+  --popover-foreground: #0d0d0d;
+  --secondary: #ececec;
+  --secondary-foreground: #0d0d0d;
+  --muted: #f4f4f4;
+  --muted-foreground: #5d5d5d;
+  --accent: #f0f0f0;
+  --accent-foreground: #0d0d0d;
+  --border: rgba(0, 0, 0, 0.1);
+  --input: rgba(0, 0, 0, 0.15);
+  --dr-text-tertiary: #8f8f8f;
+  --dr-line: rgba(0, 0, 0, 0.1);
+  --dr-line-soft: rgba(0, 0, 0, 0.05);
+  --dr-track: #ececec;
+  --dr-chip: #f4f4f4;
+  --dr-dash: #c4c4c4;
+  --dr-accent: #0285ff;
+  --dr-selected: #fde68a;
+  --dr-selected-foreground: #0d0d0d;
+  --dr-skeleton-from: #f9f9f9;
+  --dr-skeleton-via: #ececec;
+  --dr-shimmer-contrast: #ffffffbf;
+}
+
+.dark .deepresearch-surface,
+.dark.deepresearch-surface {
+  --background: #0d0d0d;
+  --foreground: #ffffff;
+  --card: #212121;
+  --card-foreground: #ffffff;
+  --popover: #212121;
+  --popover-foreground: #ffffff;
+  --secondary: #2f2f2f;
+  --secondary-foreground: #ffffff;
+  --muted: #2a2a2a;
+  --muted-foreground: #afafaf;
+  --accent: #2f2f2f;
+  --accent-foreground: #ffffff;
+  --border: rgba(255, 255, 255, 0.1);
+  --input: rgba(255, 255, 255, 0.15);
+  --dr-text-tertiary: #8f8f8f;
+  --dr-line: rgba(255, 255, 255, 0.15);
+  --dr-line-soft: rgba(255, 255, 255, 0.05);
+  --dr-track: #2f2f2f;
+  --dr-chip: #2f2f2f;
+  --dr-dash: #5d5d5d;
+  --dr-selected: #f3e3a6;
+  --dr-selected-foreground: #0d0d0d;
+  --dr-skeleton-from: #181818;
+  --dr-skeleton-via: #2a2a2a;
+  --dr-shimmer-contrast: #0009;
+}
+
+/* "正在思考" and the live status line: a highlight sweeping across the text. */
+.loading-shimmer,
+.loading-shimmer-tertiary {
+  --shimmer-contrast: var(--dr-shimmer-contrast, #ffffffbf);
+  --shimmer-text-secondary: var(--muted-foreground);
+  background: var(--shimmer-text-secondary)
+    linear-gradient(
+      to right,
+      var(--shimmer-text-secondary) 0%,
+      var(--shimmer-contrast) 40%,
+      var(--shimmer-contrast) 60%,
+      var(--shimmer-text-secondary) 100%
+    );
+  background-size: 50% 200%;
+  background-repeat: no-repeat;
+  background-position: -100% top;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  display: inline-block;
+  animation: loading-shimmer 1.4s linear infinite;
+}
+
+.loading-shimmer-tertiary {
+  --shimmer-text-secondary: var(--dr-text-tertiary, var(--muted-foreground));
+}
+
+@keyframes loading-shimmer {
+  0% {
+    background-position: -100% top;
+  }
+  100% {
+    background-position: 250% top;
+  }
+}
+
+/* The block that holds the plan card's place while the plan is written. */
+.loading-results-shimmer {
+  background: linear-gradient(
+    to left,
+    var(--dr-skeleton-from, #f9f9f9),
+    var(--dr-skeleton-via, #ececec) 50%,
+    var(--dr-skeleton-from, #f9f9f9)
+  );
+  background-size: 1000px 100%;
+  animation: loading-results-shimmer 3s linear infinite;
+}
+
+@keyframes loading-results-shimmer {
+  0% {
+    background-position: -1000px 0;
+  }
+  100% {
+    background-position: 1000px 0;
+  }
+}
+
+@keyframes research-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* A spinner says "still working"; it keeps turning under reduced motion. */
+.research-spinner {
+  animation: research-spin 1s linear infinite;
+}
+
+/* Hover cards and the table of contents fade in; no zoom, no slide. */
+.research-fade {
+  --tw-enter-scale: 1;
+  --tw-enter-translate-x: 0;
+  --tw-enter-translate-y: 0;
+  --tw-exit-scale: 1;
+  --tw-exit-translate-x: 0;
+  --tw-exit-translate-y: 0;
+  animation-duration: 150ms;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* Shimmer becomes plain text; the spinner is the only motion left. */
+  .loading-shimmer,
+  .loading-shimmer-tertiary {
+    animation: none;
+    background: none;
+    -webkit-text-fill-color: currentColor;
+    color: var(--shimmer-text-secondary);
+  }
+  .loading-results-shimmer {
+    animation: none;
+    background: var(--dr-skeleton-via, #ececec);
+  }
+  .deepresearch-surface.animate-in,
+  .deepresearch-surface.animate-out,
+  .deepresearch-surface *:not(.research-spinner):not(.animate-spin) {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+/* Report typography shared by the preview card and the full-screen reader. */
+.research-report h1 {
+  margin-top: 0;
+  font-weight: 700;
+}
+.research-report h2,
+.research-report h3 {
+  font-weight: 600;
+}
+.research-report p {
+  margin-top: 8px;
+  margin-bottom: 8px;
+}
+.research-report blockquote {
+  margin: 16px 0;
+  border-left: 2px solid var(--dr-line, var(--border));
+  padding-left: 16px;
+  color: inherit;
+  font-style: italic;
+}
+
+.research-report [data-streamdown="table-wrapper"] {
+  position: relative;
+  margin: 16px 0;
+  gap: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 0;
+}
+/* Streamdown's own table actions: shown over the top-right corner on hover or
+   keyboard focus, like ChatGPT's copy button. */
+.research-report
+  [data-streamdown="table-wrapper"]
+  > div:first-child:not(:has(> table)) {
+  position: absolute;
+  top: 4px;
+  right: 0;
+  z-index: 1;
+  border-radius: 8px;
+  background: var(--card);
+  box-shadow: 0 0 0 1px var(--dr-line, var(--border));
+  opacity: 0;
+  transition: opacity 150ms ease-out;
+}
+.research-report [data-streamdown="table-wrapper"]:hover > div:first-child,
+.research-report
+  [data-streamdown="table-wrapper"]:focus-within
+  > div:first-child {
+  opacity: 1;
+}
+.research-report [data-streamdown="table-wrapper"] > div:has(> table) {
+  overflow-x: auto;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding-bottom: 6px;
+}
+/* Standard scrollbar properties switch the ::-webkit-scrollbar rules off, so
+   they are only the fallback where those rules do not exist. */
+@supports not selector(::-webkit-scrollbar) {
+  .research-report [data-streamdown="table-wrapper"] > div:has(> table) {
+    scrollbar-width: thin;
+    scrollbar-color: var(--dr-track, var(--muted)) transparent;
+  }
+}
+.research-report
+  [data-streamdown="table-wrapper"]
+  > div:has(> table)::-webkit-scrollbar {
+  height: 4px;
+  background: transparent;
+}
+.research-report
+  [data-streamdown="table-wrapper"]
+  > div:has(> table)::-webkit-scrollbar-track {
+  background: transparent;
+}
+.research-report
+  [data-streamdown="table-wrapper"]
+  > div:has(> table)::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: var(--dr-track, var(--muted));
+}
+.research-report table {
+  width: 100%;
+  border: 0;
+  border-collapse: collapse;
+}
+.research-report thead {
+  background: transparent;
+}
+.research-report thead,
+.research-report tbody,
+.research-report tr {
+  border: 0;
+}
+.research-report th,
+.research-report td {
+  min-width: 7rem;
+  padding: 12px 12px 12px 0;
+  text-align: left;
+  vertical-align: top;
+  font-size: var(--research-table-size, 14px);
+  line-height: 20px;
+}
+.research-report th {
+  border-bottom: 1px solid var(--foreground);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.research-report td {
+  border-top: 1px solid var(--dr-line, var(--border));
+}
+.research-report tbody tr:first-child td {
+  border-top: 0;
+}
+.research-report td:first-child {
+  font-weight: 600;
+}
+
+/* Diagrams sit on the page like a figure: centred, no card, never wider than
+   the column. */
+.research-report [data-streamdown="mermaid-block"] {
+  position: relative;
+  border: 0;
+  background: transparent;
+  padding: 0;
+}
+.research-report [data-streamdown="mermaid-block"] > div:first-child {
+  display: none;
+}
+/* Streamdown keeps the diagram's actions in a sticky bar pulled up over a
+   label row; without the label they float over the top-right corner. */
+.research-report [data-streamdown="mermaid-block"] > div:nth-child(2) {
+  position: absolute;
+  top: 0;
+  right: 0;
+  z-index: 1;
+  margin: 0;
+  width: auto;
+  opacity: 0;
+  transition: opacity 150ms ease-out;
+}
+.research-report [data-streamdown="mermaid-block"]:hover > div:nth-child(2),
+.research-report
+  [data-streamdown="mermaid-block"]:focus-within
+  > div:nth-child(2) {
+  opacity: 1;
+}
+.research-report [data-streamdown="mermaid-block"] > div:nth-child(3) {
+  display: flex;
+  justify-content: center;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+/* Mermaid sizes its SVG as 100% of a shrink-wrapped flex item, which resolves
+   to the 300px replaced-element default. Give the item the column's width. */
+.research-report [data-streamdown="mermaid-block"] div:has(> svg) {
+  width: 100%;
+}
+.research-report [data-streamdown="mermaid-block"] div:has(> svg) > svg {
+  height: auto;
+}

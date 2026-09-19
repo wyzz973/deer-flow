@@ -6,6 +6,20 @@ runtime. Read `../AGENTS.md` and the harness subagents guide for native executio
 The current architecture and workflow are described in `docs/deepresearch/ARCHITECTURE.md`
 at the repository root; update it with any change to nodes, events, contracts or storage.
 
+## Taking over, debugging or auditing a run
+
+`.agents/skills/deepresearch-engineering/` is the working skill for this module
+(any agent harness can read it; Codex loads `.agents/skills` natively, Claude Code
+via `ln -s ../../.agents/skills/deepresearch-engineering .claude/skills/`). It maps
+the module, lists what must not be done, and carries two offline scripts:
+`scripts/audit_run.py --run <id|prefix|page URL|thread|latest> [--baseline <run>]`
+turns a run's records into a fact sheet (time, tokens, prompt cache, tools,
+supplements, repairs, rule-based findings with the setting that changes each),
+and `scripts/show_call.py` opens or replays one model call. Both read the store
+through `Store` and `metrics.collect`; `tests/deepresearch/test_audit_skill.py`
+runs them against a synthetic store, so change them together with any table,
+record field or metrics key they read.
+
 ## Configuration independence
 
 DeerFlow is the engine; what research runs is DeepResearch configuration.
@@ -161,10 +175,48 @@ prompts, engine tools, compaction and budgets all live in the research profile
   `new_message_indexes`/`repeated_prefix` so the audit UI can show one turn's new
   input. Scrub known secret values, `Bearer` tokens and URL secret parameters;
   never store raw provider exceptions.
+- Requests are built for prompt-prefix caching (providers reuse a prompt only
+  from its first token on; on a slow self-hosted model a hit also skips that
+  prefill). Three rules, each pinned by a test:
+  1. A role's conversation only appends. `model_budget_config` turns the engine's
+     `verification.receipts_enabled` off in the private config unless
+     `tool_receipt_ledger` is set: `ToolReceiptMiddleware` inserts its ledger
+     right after the system prompt and rewrites it every turn, which left
+     researcher loops with 4-5% cached input (3% reusable prefix; 77-82% without
+     it, measured on recorded runs). The switch also stops stamping, so
+     `observations.derived_receipts` rebuilds `r1..rN`/status from the archived
+     tool messages. Never add anything that edits or inserts before the newest
+     message of a running role.
+  2. Payloads read from what every call shares to what only this call has:
+     `instructions` first, run-level context, `sources`, then `unit`, with the
+     counters that change between steps (`search_budget`, `shared_run_budget`)
+     last; sections put `findings`/`evidence` before `section`; conversion sends
+     `{"task", "answer"}` in that order; a follow-up sends plan, report,
+     conversation, then the new `message`; a revision sends findings and
+     evidence, then the report, then the request; planning leads with everything
+     a deployment keeps constant. `structured_task` puts `output_schema` right
+     after `instructions` when they lead, and leaves both last in long writer
+     tasks where the instruction must sit next to the point of generation.
+     `recent_messages` moves a conversation window's head once per ten
+     messages, not every turn. `tests/deepresearch/test_prompt_cache.py` states
+     the property on the text a model receives (shared prefix of two calls). `digest` sorts keys, so reordering never
+     changes a cache key.
+  3. Nothing that changes per call goes into a system prompt.
+  `LocalCallbacks` records `prefix_messages`/`prefix_chars` per model call (shared
+  leading messages with the previous request of the same engine node) and metrics
+  report `prefix_reuse_ratio` overall and per node: the ceiling a prefix cache
+  could serve, independent of provider usage reporting. `session_overrides`
+  adds the conversation's id (the native thread id, or a digest per direct call
+  and its retries) as `extra_body[session_param]` / `default_headers[session_header]`
+  only where a `ModelSpec` names them (OpenAI's own endpoint gets
+  `prompt_cache_key` unasked); `merged_overrides` merges dictionary fields with
+  the profile's own because the engine's `model_overrides` replaces whole fields. Low ceiling = our request
+  changed early; high ceiling with low `cache_read_ratio` = provider/gateway
+  (no prefix caching, no replica affinity, or an expired entry).
 - Compaction is research configuration: `compaction_config` builds the engine's
   summarization settings per role from `CompactionSpec` and the role model's
   declared context window, with `prompts.compaction` as the summary template
-  (it must keep opened URLs, verbatim quotes, dates and receipt ids). The host's
+  (it must keep opened URLs, verbatim quotes and dates). The host's
   chat summarization thresholds never apply to research.
   The engine keeps a subagent's leading system prompt out of compaction
   (`_leading_system_messages` in `summarization_middleware.py`); without that a
@@ -176,6 +228,67 @@ prompts, engine tools, compaction and budgets all live in the research profile
   plan edit and a follow-up that needs new research both re-enter `rewrite`,
   which merges the change into the previous request and writes the
   acknowledgement. `plan.brief` is the rewritten request.
+
+- Every model-calling node is tunable on its own (`config.NodeSpec`, `nodes:`):
+  rewrite, plan, research, conversion, outline, section, summary, revision and
+  follow_up. `models.model_for` resolves the model (a researcher's own role model,
+  then `nodes.research`; for the fixed roles the node first, then the role),
+  `native.node_of` names the node from role and task, and sampling parameters are
+  applied by `models.with_node` to the execution's private model profile, so the
+  engine's factory applies them and metrics keep the model's real name. Only
+  `rewrite` and `summary` can be disabled. Record `config_node` on every model
+  call: `metrics.breakdown.by_node` (calls, tokens, latency, truncated answers,
+  contract retries) is what tuning is judged by. `json_mode` is optional and only
+  for direct calls; the contract is always requested in prompt text as well.
+- Model gateways that only speak Chat Completions are a first-class target:
+  never require JSON mode, structured output or the Responses API. For
+  `provider: openai` with a non-OpenAI `base_url`, `chat_completions.ChatCompletionsModel`
+  sends `max_tokens` (LangChain always renames it to `max_completion_tokens`,
+  which such gateways ignore or reject) and `engine_model` turns `stream_usage`
+  on (LangChain switches it off once `base_url` is set, leaving no usage at all).
+- What a step may cite is decided once, where the evidence is gathered, and
+  travels with it (`RawEvidence.citable`). `report_policy.results_citable` is the
+  single rule for search results: citable when the operator says so or when no
+  enabled source has `role: read`. A step without a read tool gets
+  `prompts.research_records` / `conversion_records` and the findings-only
+  contract, its search results become one evidence record each, references say
+  "search excerpt; the original was not opened", and `require_original` becomes a
+  stated limitation instead of `NO_EVIDENCE`. Never tell a researcher to open a
+  page when it has no tool that can.
+- MCP: `McpServerSpec.allowed_tools` is an allowlist checked at load time and
+  again in `McpManager.tool`. Both `kind: mcp` sources and `type: mcp` providers
+  account for their calls through `channels.SearchBudget`; the inner MCP
+  invocation runs with `callbacks: []` so the research callbacks neither record
+  it a second time nor charge the tool budget twice. `mcp.connection_failure`
+  unwraps the client's exception group into auth/timeout/network/server without
+  echoing transport text. Header and environment values may interpolate
+  `${ENV}` and `${secret:NAME}`; interpolated values are redacted like whole references.
+- Time is a budget that winds research down (`store.research_seconds_left`,
+  `report_time_reserve`): a step gets a tool-stop time and a hard timeout
+  (`research.unit.deadline`), source calls are bounded by the time left, a step
+  that cannot start degrades with `RESEARCH_TIME_SPENT`, supplementing stops and
+  the report is still written. The run-wide timeout is the ceiling plus one
+  report reserve. Budgets are per task: a follow-up after the report archives
+  `usage` into `usage_history` and starts from zero.
+- `validator` decides `NO_EVIDENCE` and saturation from citable evidence that a
+  finding refers to, never from the size of the pool. `open-questions` gaps earn
+  one supplement per planned step, `supplement_gap_codes` chooses which gap kinds
+  are chased at all, and supplements are matched to their step by `depends_on`.
+- Writer output is normalized before it is validated: reasoning that ends with a
+  lone `</think>`, near-miss markers (`normalize_markers`), a code fence left open
+  by a cut-off answer (`close_fences`), any link or image that does not point
+  inside the document, control characters. Labels the outline model writes are
+  cleaned with `plain_text` before assembly, and `runner.reader_caveats` makes
+  sure a report written after failed or cut-short steps always says so.
+- `profile.guard` is the boundary of the settings API whoever is signed in: no
+  Skill file paths, no stdio MCP servers, no custom model classes and no literal
+  credentials in headers or environment. Those belong in the operator's file.
+  `profile.masked` hides literal credential values from users who cannot edit.
+- Naming: the intranet deployment (slow gateway model, MCP-only search without
+  originals) is why these features exist, but it is not a variant. No
+  deployment-specific folders, templates, identifiers or example values; extend
+  the generic templates (`deepresearch.example.yaml`, `examples/deepresearch/offline/`,
+  `examples/deepresearch/mcp-sources.fragment.yaml`).
 
 Regression commands, from `backend/`:
 
@@ -268,12 +381,53 @@ authentication, local-model quality or end-to-end deployment readiness.
   in `audit`; the outline merges at most five reader-facing caveats. Historical AST
   reports remain readable; `render.docx_report` exports them.
 
+- Budgets wind research down instead of ending it. A research step is told how
+  many searches it may make (`max_searches_per_unit`, in its payload); when the
+  allowance or the run's tool ceiling is gone, `channels.SearchBudget` answers
+  the model with a stop instruction, so the step writes its notes rather than
+  raising `BUDGET_EXHAUSTED`. The allowance is enforced by the tool, not by
+  the model's compliance; a search claims its slot before awaiting the ledger,
+  because searches from one model turn run concurrently. Page reads never count against the step
+  allowance — only an opened page is citable, and charging reads left a live
+  run with no page read and `NO_EVIDENCE` — they count toward the run-wide tool
+  ceiling only. A stop reply carries the `BUDGET_STOP` artifact and
+  `research_observations` skips it: the instruction is never evidence. Source
+  tools account for their own calls — the model callback must not reserve them
+  again. Model tokens keep a report reserve (`store.report_reserve`). Each
+  research step gets a share of what research may still spend (left ÷ steps
+  running now, less a conversion margin) through the native
+  `TokenBudgetMiddleware` (`native.model_budget_config`): warned at half, stopped
+  at the share, which strips tool calls so the step ends with its notes. The
+  step's conversion may draw on the report reserve — its research is already
+  paid for. A research call that would still spend the reserve fails with the
+  non-fatal `RESEARCH_BUDGET_SPENT`, the step degrades, supplementation stops
+  (`store.research_spent`: a step already failed to reserve, or less than a
+  turn is left) and the writer still has capacity. Only a batch that failed for
+  other reasons, or a run with no citable evidence at all, still fails.
+- A research-phase model call reserves its input plus `RESEARCH_TURN_OUTPUT`
+  (4096), not the whole `max_output_tokens`: a research turn is a tool call or a
+  short note, and reserving the full cap made a 120k budget look spent at half of
+  real use. Report calls (`phase` synthesis/follow_up) still reserve the full cap.
+  Reported usage replaces the estimate; when a provider reports no usage, the
+  unreserved remainder of the cap is charged after the call, so unknown spend
+  stays conservative.
 - `dispatch` degrades a non-fatal unit failure (for example a native timeout)
   into a zero-confidence placeholder with a disclosed limitation,
   `unit_failures` and `research.unit.failed`. `FATAL_UNIT_ERRORS`, non-`Exception`
   errors, `OSError`/`sqlite3.Error`, and a batch where every unit failed still
   fail the run; a result already committed for the unit is reused as success.
   Keep example research-role timeouts at 600 s; long reads are normal.
+- Evidence is derived from open-web payloads, so build it through validation
+  (`observations.derive`), never `model_copy`, which skips it: an over-long
+  title or empty text otherwise reaches the store and only fails later, in
+  `evidence_merge`, taking a completed unit with it. Display metadata (titles,
+  publisher, excerpt, plan and step labels) is bounded by the contract rather
+  than rejected; locators, ids, claims and briefs stay strict.
+- `evidence_merge` revalidates stored results through `evidence.valid_result`:
+  records the current schema cannot keep are dropped with the fields that
+  rejected them (`research.evidence.dropped`), findings keep the references that
+  survive, and a finding left without any reference goes with them. A
+  structurally invalid result still fails the run.
 - A unit result holds at most `RAW_EVIDENCE_LIMIT` records. `bound_evidences`
   keeps referenced evidence, read pages and tool records, and trims surplus
   discovery links (then superseded envelopes) with `research.evidence.trimmed`.
@@ -316,6 +470,12 @@ authentication, local-model quality or end-to-end deployment readiness.
   A graph operation_id distinguishes an unapplied command from one already in a
   checkpoint. Recovery replays only unapplied input. Cached follow-up decisions
   and a message-scoped cycle marker prevent repeated cycle advancement.
+- A stopped or failed follow-up leaves its published report in place, and the
+  conversation goes on: `conversation.message` accepts a message for a
+  `CANCELLED`/`FAILED` run that has a report, clears `cancel_requested` and
+  starts a new task budget. Without a report it raises `RUN_STOPPED` (409, not
+  recoverable); `RUN_BUSY` stays reserved for runs that are executing. The
+  frontend mirrors this in `composerAccepts({status, hasReport})`.
 - Report publication commits its immutable version, conversation projection,
   terminal run state and completion event in one SQLite transaction. A stable
   publication cache key fences node replay. Reconcile completed unit projections

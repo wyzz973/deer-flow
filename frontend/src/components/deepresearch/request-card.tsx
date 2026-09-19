@@ -36,23 +36,24 @@ export function ResearchRequestCard({
       <CollapsibleTrigger asChild>
         <button
           type="button"
-          className="text-muted-foreground hover:text-foreground inline-flex items-center gap-1.5 text-sm transition-colors"
+          // A footnote to the turn, not a card: the plan and the report lead.
+          className="hover:text-foreground inline-flex items-center gap-1.5 text-[13px] leading-5 text-(--dr-text-tertiary) transition-colors motion-reduce:transition-none"
           aria-label={open ? "收起研究请求" : "查看改写后的研究请求"}
         >
-          <Wand2 className="size-3.5" />
+          <Wand2 className="size-3" />
           <span>
             {message.rewrite?.revision ? "已更新研究请求" : "已改写研究请求"}
           </span>
           <ChevronDown
             className={cn(
-              "size-3.5 transition-transform motion-reduce:transition-none",
+              "size-3 transition-transform motion-reduce:transition-none",
               open && "rotate-180",
             )}
           />
         </button>
       </CollapsibleTrigger>
       <CollapsibleContent>
-        <div className="border-border/70 bg-muted/20 mt-2 rounded-xl border p-3">
+        <div className="bg-card mt-2 rounded-[16px] border border-(--dr-line) p-3">
           <div className="mb-2 flex items-center gap-2">
             <span className="text-foreground text-xs font-medium">
               研究请求

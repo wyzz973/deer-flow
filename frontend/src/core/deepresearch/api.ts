@@ -7,6 +7,7 @@ import type {
   LlmCallDetail,
   LlmCallSummary,
   McpServerSpec,
+  McpToolsResult,
   ModelProbe,
   ModelSpec,
   ProviderHealth,
@@ -104,9 +105,10 @@ export function researchApi(base = "") {
         client_message_id: messageId,
         plan_version: version,
       }),
-    trace: (id: string, after = 0) =>
+    // The server caps a page at 200; a shorter page is the end of the trace.
+    trace: (id: string, after = 0, limit = 200) =>
       json<{ items: ResearchEvent[]; next_cursor: number }>(
-        `/${encodeURIComponent(id)}/trace?after=${after}`,
+        `/${encodeURIComponent(id)}/trace?after=${after}&limit=${limit}`,
       ),
     async downloadTrace(id: string) {
       const res = await response(`/${encodeURIComponent(id)}/trace/export`);
@@ -170,15 +172,7 @@ export function researchApi(base = "") {
         mcp_servers: mcpServers,
       }),
     mcpTools: (name: string, server: McpServerSpec) =>
-      json<{
-        ok: boolean;
-        error?: string;
-        tools: {
-          name: string;
-          description: string;
-          arguments: Record<string, unknown>;
-        }[];
-      }>("/settings/mcp-tools", { name, server }),
+      json<McpToolsResult>("/settings/mcp-tools", { name, server }),
     providerHealth: () =>
       json<{ providers: ProviderHealth[] }>("/settings/health"),
     async downloadMetrics(id: string) {

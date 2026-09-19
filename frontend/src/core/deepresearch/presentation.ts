@@ -1,4 +1,11 @@
-import type { Report, Segment } from "./types";
+import {
+  reviewStatuses,
+  steerableStatuses,
+  type Report,
+  type ResearchMessage,
+  type Run,
+  type Segment,
+} from "./types";
 
 /** First non-blank text. Historical records use empty strings, which `??`
  * would keep, so blank labels fall back explicitly. */
@@ -94,6 +101,7 @@ export function formatPercent(ratio: number | null | undefined) {
 }
 
 const PHASE_LABELS: Record<string, string> = {
+  rewrite: "请求改写",
   planner: "规划",
   plan_review: "计划确认",
   dispatch: "研究",
@@ -113,6 +121,25 @@ export function phaseLabel(phase: string) {
   return PHASE_LABELS[phase] ?? phase;
 }
 
+const NODE_LABELS: Record<string, string> = {
+  rewrite: "请求改写",
+  plan: "研究计划",
+  research: "检索研究",
+  conversion: "笔记整理",
+  outline: "报告大纲",
+  section: "章节写作",
+  summary: "执行摘要",
+  revision: "报告改写",
+  follow_up: "追问分流",
+  compaction: "上下文压缩",
+  unknown: "未知",
+};
+
+/** Graph node of a metered model call (`breakdown.by_node`). */
+export function nodeLabel(node: string) {
+  return NODE_LABELS[node] ?? node;
+}
+
 /** Exact duration for the finished timeline, like "7m 55s". */
 export function formatDuration(seconds: number | null | undefined) {
   if (seconds == null || !Number.isFinite(seconds)) return "";
@@ -121,29 +148,15 @@ export function formatDuration(seconds: number | null | undefined) {
   return minutes ? `${minutes}m ${value % 60}s` : `${value}s`;
 }
 
-/** Headings of a Markdown report, outside fenced code, for the reader TOC. */
-export function reportHeadings(markdown: string) {
-  const headings: { level: number; text: string }[] = [];
-  let fence: string | null = null;
-  for (const line of markdown.split("\n")) {
-    const marker = /^\s{0,3}(`{3,}|~{3,})/.exec(line)?.[1];
-    if (marker) {
-      if (!fence) fence = marker;
-      else if (line.trim().startsWith(fence)) fence = null;
-      continue;
-    }
-    if (fence) continue;
-    const match = /^(#{2,3})\s+(.+?)\s*#*\s*$/.exec(line);
-    if (match)
-      headings.push({
-        level: match[1]!.length,
-        text: match[2]!
-          .replace(/\[(\d+)\]\(#[^)]*\)/g, "")
-          .replace(/[*_`]/g, "")
-          .trim(),
-      });
-  }
-  return headings;
+/** The section being read: the last heading at or above the reading line.
+ * `tops` are the headings' viewport offsets in document order. Before the
+ * first heading (the title block), the first section is the current one. */
+export function activeHeadingIndex(tops: number[], line: number) {
+  let active = 0;
+  tops.forEach((top, index) => {
+    if (top <= line) active = index;
+  });
+  return active;
 }
 
 type LiveState = {
@@ -182,6 +195,51 @@ export function liveStatus(
     default:
       return "正在研究…";
   }
+}
+
+/** A plan whose report exists leaves the conversation, like ChatGPT: the stats
+ * line and the report card take its place, and the plan stays in the activity
+ * panel. Not while it still has news: a follow-up that failed or was stopped
+ * keeps its error, retry or notice. The conversation drops a hidden plan's
+ * message entirely, so no empty turn is left behind. */
+export function planCardHidden(message: ResearchMessage, run: Run) {
+  const latest = message.plan?.plan_version === run.plan?.plan_version;
+  if (latest && (run.status === "FAILED" || run.status === "CANCELLED"))
+    return false;
+  return (
+    run.status === "COMPLETED" ||
+    Boolean(
+      run.conversation?.some(
+        (item) =>
+          item.kind === "report" && (item.cycle ?? 0) === (message.cycle ?? 0),
+      ),
+    )
+  );
+}
+
+/** What the conversation shows between a sent message and the next card.
+ * `thinking`: shimmer text only. `planning`: the plan is being written and no
+ * card for it is on screen yet, so a skeleton holds its place. A plan that is
+ * being revised keeps its own card (with a live status) and needs neither. */
+export function waitingPhase(
+  status: string,
+  conversation: ResearchMessage[],
+  planVersion?: number | null,
+): "thinking" | "planning" | null {
+  if (status === "RESPONDING") return "thinking";
+  if (status !== "CREATED" && status !== "PLANNING") return null;
+  const planShown = conversation.some(
+    (item) =>
+      item.kind === "plan" &&
+      planVersion != null &&
+      item.plan?.plan_version === planVersion &&
+      !conversation.some(
+        (other) =>
+          other.kind === "report" && (other.cycle ?? 0) === (item.cycle ?? 0),
+      ),
+  );
+  if (planShown) return null;
+  return status === "PLANNING" ? "planning" : "thinking";
 }
 
 /** Monotonic progress across research, supplementation and writing. */
@@ -262,6 +320,30 @@ export function reportSummaryLine(report: Report) {
   return `研究完成情况：${parts.join(" · ")}`;
 }
 
+/** Whether the conversation takes a message now, mirroring the server: a new
+ * research, a plan under review, a finished report (follow-up), or an update
+ * the owner opened on running research. A failed or stopped run takes none. */
+export function composerAccepts({
+  welcome,
+  status,
+  updating,
+  hasReport = false,
+}: {
+  welcome: boolean;
+  status: string;
+  updating: boolean;
+  /** A report was already published in this conversation. */
+  hasReport?: boolean;
+}) {
+  if (welcome) return true;
+  if (reviewStatuses.has(status) || status === "COMPLETED") return true;
+  // A follow-up that was stopped or failed leaves the report in place, and the
+  // backend accepts further messages about it. Without a report it answers
+  // RUN_STOPPED: that run is retried or replaced by a new research.
+  if ((status === "CANCELLED" || status === "FAILED") && hasReport) return true;
+  return updating && steerableStatuses.has(status);
+}
+
 /** Retry body: only an explicit limited-report choice is ever sent. */
 export function retryRequest(allowLimitedReport: boolean) {
   return allowLimitedReport ? { allow_limited_report: true } : {};
@@ -271,6 +353,9 @@ export function retryRequest(allowLimitedReport: boolean) {
  * (tables, links, emphasis); the preview keeps the words, not the syntax. */
 export function excerptPreview(text: string | null | undefined, limit = 360) {
   const plain = readableExcerpt(text)
+    .replace(/^\s*(?:`{3,}|~{3,})[^\n]*$/gm, "")
+    .replace(/^\s*(?:>\s*)+/gm, "")
+    .replace(/^\s*[-*+]\s+/gm, "")
     .replace(/!\[[^\]]*\]\([^)]*\)/g, "")
     .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
     .replace(/^\s*\|?(?:\s*:?-{3,}:?\s*\|?)+\s*$/gm, "")
@@ -282,6 +367,27 @@ export function excerptPreview(text: string | null | undefined, limit = 360) {
     .replace(/^\s*·\s*|\s*·\s*$/g, "")
     .trim();
   return plain.length > limit ? `${plain.slice(0, limit).trimEnd()}…` : plain;
+}
+
+/** Page identity, matching the server's: scheme, "www." and a trailing slash
+ * do not change the page; a query or a single-page-app fragment route does. */
+export function pageKey(url: string | null | undefined) {
+  if (!url) return "";
+  try {
+    const parts = new URL(url);
+    const host = parts.hostname.toLowerCase().replace(/^www\./, "");
+    if (!host) return url;
+    const port = parts.port && !["80", "443"].includes(parts.port);
+    const fragment = parts.hash.slice(1);
+    return [
+      host + (port ? `:${parts.port}` : ""),
+      parts.pathname.replace(/\/+$/, "") || "/",
+      parts.search.slice(1),
+      /^[/!]/.test(fragment) ? fragment : "",
+    ].join("\u0000");
+  } catch {
+    return url;
+  }
 }
 
 /** A short summary under a source title. Pages usually repeat their title at

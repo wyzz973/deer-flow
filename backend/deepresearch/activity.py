@@ -17,6 +17,10 @@ from .contracts import TERMINAL
 from .report import language
 
 NATIVE_ROLES = {"web_search": "search", "image_search": "search", "web_fetch": "read"}
+# A knowledge source (role: data) is queried like a search engine. Deployments
+# that only have knowledge tools would otherwise show "0 searches" for a research
+# that ran dozens of queries.
+QUERY_ROLES = {"search", "data"}
 HIDDEN_TOOLS = {"read_file", "ls", "glob", "grep", "write_file", "str_replace", "bash", "present_files"}
 WRITING = {"SYNTHESIZING", "CITATION_BINDING", "FINAL_VALIDATING", "RENDERING"}
 # Researchers sometimes narrate their own harness. Those sentences stay in the
@@ -92,7 +96,9 @@ def build(run, events, calls, roles, now=None):
         elif kind == "activity.tool.completed":
             call = {**data, **by_id.get(data.get("id"), {})}
             unit_id = call.get("unit_id")
-            if role(call) == "search":
+            if call.get("budget_stop"):
+                continue  # a refused search is not research activity
+            if role(call) in QUERY_ROLES:
                 query = call.get("query")
                 last = items[-1] if items else None
                 if last and last["kind"] == "search" and last.get("unit_id") == unit_id:
@@ -138,7 +144,7 @@ def build(run, events, calls, roles, now=None):
     # Progress counts the plan's own steps; supplementary research refines them.
     planned = {unit_id for unit_id, unit in units.items() if not unit.get("parent_gap_id")}
     finished = {item["unit_id"] for item in items if item["kind"] in {"step_done", "step_failed"} and item["unit_id"] in planned}
-    searches = sum(1 for call in calls if role(call) == "search")
+    searches = sum(1 for call in calls if role(call) in QUERY_ROLES and not call.get("budget_stop"))
     pages = {call.get("url") or call["id"] for call in calls if role(call) == "read" and call.get("status") == "success"}
     return {
         "status": status,
@@ -164,7 +170,7 @@ def current(status, items, calls, role):
         return {"kind": "note", "text": latest_note["text"]}
     if running:
         call = max(running, key=lambda value: value.get("started_at") or "")
-        if role(call) == "search":
+        if role(call) in QUERY_ROLES:
             return {"kind": "search", "query": call.get("query") or ""}
         if role(call) == "read":
             return {"kind": "read", "url": call.get("url") or "", "domain": _domain(call.get("url"))}

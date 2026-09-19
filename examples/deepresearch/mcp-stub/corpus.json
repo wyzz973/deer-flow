@@ -1,0 +1,184 @@
+[
+ {
+  "kind": "doc",
+  "id": "KB-1001",
+  "title": "向量数据库选型压测报告（2026Q2）",
+  "date": "2026-06-18",
+  "text": "平台组在 2026 年 6 月用 5000 万条 768 维向量对 Milvus 2.5、Qdrant 1.14、pgvector 0.8 做了压测。Milvus 在 HNSW 索引、recall@10=0.95 条件下 P99 延迟 38ms、单集群 QPS 4200；Qdrant 同条件 P99 延迟 27ms、QPS 3600；pgvector 在 16 核 PostgreSQL 16 上 P99 延迟 142ms、QPS 610。"
+ },
+ {
+  "kind": "doc",
+  "id": "KB-1002",
+  "title": "向量数据库选型压测报告：资源占用",
+  "date": "2026-06-18",
+  "text": "同一数据集下，Milvus 集群（3 个 querynode、2 个 datanode、etcd、MinIO、Pulsar）常驻内存合计 212GB；Qdrant 三节点集群常驻内存 96GB（开启标量量化后降到 41GB）；pgvector 单实例内存 64GB，索引构建耗时 7 小时 20 分钟。"
+ },
+ {
+  "kind": "doc",
+  "id": "KB-1003",
+  "title": "向量数据库选型压测报告：过滤检索",
+  "date": "2026-06-19",
+  "text": "带标量过滤（租户 ID + 时间范围）的混合检索中，Qdrant 的 payload 索引使 P99 延迟只上升 12%；Milvus 上升 35%；pgvector 借助 B-tree 联合过滤，在过滤后候选集小于 10 万时延迟反而优于两者，为 21ms。"
+ },
+ {
+  "kind": "doc",
+  "id": "KB-1010",
+  "title": "Milvus 生产集群运维年度总结（2025）",
+  "date": "2026-01-09",
+  "text": "2025 年搜索中台的 Milvus 生产集群共发生 7 次 P2 及以上故障，其中 4 次与 Pulsar/etcd 依赖组件有关；全年运维投入约 1.6 人年。升级 2.3 到 2.4 期间停写 3 小时 40 分钟。"
+ },
+ {
+  "kind": "doc",
+  "id": "KB-1011",
+  "title": "Qdrant 试点项目复盘（客服知识库）",
+  "date": "2026-04-22",
+  "text": "客服知识库在 2025 年 11 月到 2026 年 3 月用 Qdrant 三节点试点，数据量 1200 万条。期间无 P2 以上故障，运维投入约 0.3 人年；滚动升级 1.12 到 1.13 无停机。不足：缺少原生的多租户配额，需在网关层自建限流。"
+ },
+ {
+  "kind": "doc",
+  "id": "KB-1012",
+  "title": "pgvector 在推荐召回场景的使用评估",
+  "date": "2026-03-05",
+  "text": "推荐团队在既有 PostgreSQL 16 上用 pgvector 存 800 万条商品向量，优点是与业务表同库、事务一致、无需新增组件；缺点是超过 2000 万条后 HNSW 索引构建时间和内存不可接受，评估结论是只适合 2000 万条以下且已使用 PostgreSQL 的业务。"
+ },
+ {
+  "kind": "doc",
+  "id": "KB-1020",
+  "title": "向量检索成本核算（2026 年 5 月）",
+  "date": "2026-05-30",
+  "text": "按内部云单价核算：承载 5000 万向量时，Milvus 集群月成本约 8.6 万元，Qdrant（开启量化）约 3.1 万元，pgvector 独立实例约 2.4 万元但无法满足 QPS 要求；若数据量增长到 5 亿，Milvus 估算 41 万元/月，Qdrant 估算 26 万元/月。"
+ },
+ {
+  "kind": "doc",
+  "id": "KB-1021",
+  "title": "架构评审委员会决议 ARC-2026-014",
+  "date": "2026-07-02",
+  "text": "架构评审委员会 2026 年 7 月 2 日决议：新增向量检索需求默认采用 Qdrant；数据量预计超过 5 亿或需要 GPU 索引的业务可申请使用 Milvus；已在 PostgreSQL 上且数据量低于 2000 万的业务允许使用 pgvector。决议有效期至 2027 年 6 月，届时复审。"
+ },
+ {
+  "kind": "doc",
+  "id": "KB-1022",
+  "title": "Weaviate 评估结论（未进入压测）",
+  "date": "2026-05-12",
+  "text": "Weaviate 因为 2026 年 5 月评估时其多租户冷热分层特性仍依赖商业版，且内部没有 Go 技术栈的维护人员，未进入正式压测，仅做了功能对照。"
+ },
+ {
+  "kind": "doc",
+  "id": "KB-1030",
+  "title": "向量数据库许可证合规意见",
+  "date": "2026-05-20",
+  "text": "法务合规意见：Milvus 为 Apache-2.0，Qdrant 为 Apache-2.0，pgvector 为 PostgreSQL License，三者均可在内部生产环境使用和二次开发；Weaviate 为 BSD-3-Clause。若使用各厂商的托管云服务，需要另行走数据出境与供应商准入流程。"
+ },
+ {
+  "kind": "doc",
+  "id": "KB-1031",
+  "title": "Embedding 模型与维度规范",
+  "date": "2026-02-14",
+  "text": "统一 Embedding 服务默认输出 1024 维（bge-m3），历史业务使用 768 维。规范要求新业务统一 1024 维并开启标量量化；维度变化会使内存占用按比例上升，压测报告中的 768 维结论换算到 1024 维需乘以约 1.33。"
+ },
+ {
+  "kind": "doc",
+  "id": "KB-1032",
+  "title": "向量库备份与容灾要求",
+  "date": "2026-03-28",
+  "text": "SRE 要求向量库具备每日快照与跨机房恢复能力，RPO 不超过 24 小时，RTO 不超过 4 小时。Qdrant 的 snapshot 可直接落到对象存储；Milvus 需要借助 milvus-backup 工具；pgvector 复用现有 PostgreSQL 备份体系，无需新增方案。"
+ },
+ {
+  "kind": "wiki",
+  "id": "wiki-vector-onboarding",
+  "title": "向量检索接入指引",
+  "date": "2026-07-10",
+  "text": "新业务接入向量检索需先在平台门户提交容量评估单，平台组在 5 个工作日内给出选型建议。默认接入 Qdrant 共享集群，单业务配额为 3000 万向量、峰值 500 QPS，超出需申请独立集群。"
+ },
+ {
+  "kind": "wiki",
+  "id": "wiki-vector-sla",
+  "title": "向量检索平台 SLA",
+  "date": "2026-07-10",
+  "text": "Qdrant 共享集群承诺可用性 99.9%，P99 检索延迟不超过 60ms（top_k 不超过 50）；Milvus 专属集群可用性 99.5%。平台组 7×24 值班，P1 故障 15 分钟内响应。"
+ },
+ {
+  "kind": "wiki",
+  "id": "wiki-milvus-runbook",
+  "title": "Milvus 常见故障处理手册",
+  "date": "2026-02-20",
+  "text": "常见问题：etcd 磁盘满导致集群不可写；Pulsar backlog 堆积导致写入延迟；querynode OOM 需降低 segment 加载并行度。处理步骤见各小节，升级前必须先在预发集群演练。"
+ },
+ {
+  "kind": "wiki",
+  "id": "wiki-qdrant-runbook",
+  "title": "Qdrant 运维手册",
+  "date": "2026-06-25",
+  "text": "Qdrant 共享集群三节点、副本数 2。扩容通过增加节点后执行 shard 迁移完成，实测迁移 1200 万向量耗时 46 分钟，期间读请求无感知。已知限制：单 collection 的 payload 索引过多会拖慢写入。"
+ },
+ {
+  "kind": "wiki",
+  "id": "wiki-team-skills",
+  "title": "平台组技术栈与人员现状",
+  "date": "2026-06-01",
+  "text": "平台组共 6 人：熟悉 Rust/Go 的 2 人，熟悉 Java/Python 的 4 人；具备 Milvus 运维经验的 2 人，其中 1 人计划在 2026 年 Q4 转岗。PostgreSQL DBA 团队 3 人可支持 pgvector。"
+ },
+ {
+  "kind": "wiki",
+  "id": "wiki-data-growth",
+  "title": "搜索与推荐业务数据量预测",
+  "date": "2026-06-15",
+  "text": "业务规划给出的预测：客服知识库向量 2026 年底 2000 万条；商品向量 2026 年底 1.8 亿条、2027 年底 4 亿条；日志语义检索属探索项目，若立项预计 10 亿条以上。"
+ },
+ {
+  "kind": "wiki",
+  "id": "wiki-migration-guide",
+  "title": "从 Milvus 迁移到 Qdrant 的操作指引",
+  "date": "2026-07-18",
+  "text": "迁移采用双写 + 灰度切读：先按 collection 导出向量与标量字段，导入 Qdrant 后对比 recall，抽样 1 万条查询 recall 差异需小于 1%。搜索中台的首个迁移批次（3200 万向量）用时 3 周，其中双写观察期 10 天。"
+ },
+ {
+  "kind": "wiki",
+  "id": "wiki-security-baseline",
+  "title": "数据平台安全基线",
+  "date": "2026-04-08",
+  "text": "所有数据平台组件必须启用 TLS 与 API Key 或 mTLS 鉴权，禁止公网暴露。Qdrant 通过 API Key + 网关鉴权满足基线；Milvus 需启用 RBAC；pgvector 继承数据库账号体系。"
+ },
+ {
+  "kind": "ticket",
+  "id": "INC-2025-0871",
+  "title": "Milvus 集群写入不可用 2 小时 15 分钟",
+  "date": "2025-08-14",
+  "text": "原因：etcd 磁盘使用率达到 100%，compaction 未按期执行。影响：搜索中台索引更新中断 2 小时 15 分钟。改进项：增加 etcd 磁盘告警、每周自动 defrag。"
+ },
+ {
+  "kind": "ticket",
+  "id": "INC-2025-1130",
+  "title": "Milvus querynode 连续 OOM",
+  "date": "2025-11-03",
+  "text": "原因：大促前批量导入 6000 万向量，segment 并行加载超过内存上限。影响：检索成功率降到 91%，持续 47 分钟。改进项：导入限速、扩容 querynode 至 5 个。"
+ },
+ {
+  "kind": "ticket",
+  "id": "INC-2026-0212",
+  "title": "Qdrant 共享集群单节点磁盘告警",
+  "date": "2026-02-12",
+  "text": "原因：snapshot 保留策略未生效，本地快照占满磁盘的 85%。影响：无业务影响，提前处置。改进项：快照直接写对象存储，保留 7 天。"
+ },
+ {
+  "kind": "ticket",
+  "id": "CHG-2026-0455",
+  "title": "搜索中台 Milvus 到 Qdrant 首批迁移变更",
+  "date": "2026-07-21",
+  "text": "变更内容：迁移 3200 万商品向量至 Qdrant 独立集群，双写 10 天后切读。结果：切换后 P99 延迟由 41ms 降到 29ms，recall 对比差异 0.4%，月成本下降约 4.2 万元。"
+ },
+ {
+  "kind": "ticket",
+  "id": "INC-2026-0603",
+  "title": "pgvector 索引重建导致主库 CPU 打满",
+  "date": "2026-06-03",
+  "text": "原因：推荐团队在业务高峰期重建 HNSW 索引，主库 CPU 持续 100% 达 38 分钟，订单查询延迟上升。改进项：索引构建必须在只读副本或低峰窗口执行，并限制 maintenance_work_mem。"
+ },
+ {
+  "kind": "ticket",
+  "id": "CHG-2026-0390",
+  "title": "Qdrant 共享集群开启标量量化",
+  "date": "2026-05-08",
+  "text": "变更内容：对存量 collection 开启 int8 标量量化并保留原始向量在磁盘。结果：常驻内存由 96GB 降到 41GB，recall@10 由 0.957 降到 0.951，P99 延迟无显著变化。"
+ }
+]

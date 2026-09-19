@@ -21,9 +21,31 @@ models:
     max_tokens: 8192
     context_window: 128000
     supports_thinking: true       # research runs with thinking off; the provider switch is sent
+    # A model gateway that only speaks OpenAI Chat Completions:
+    #   provider: openai, base_url: https://llm-gateway.example/v1
+    #   stream_usage: null        # auto = on: token usage in streamed answers (false if the gateway rejects stream_options)
+    #   max_tokens_param: null    # auto = max_tokens for a non-OpenAI base_url (older protocol); or max_completion_tokens
+    #   session_param: null       # request field carrying the conversation id so the gateway can keep one
+    #   session_header: null      #   conversation on one replica (prefix caches are per replica), e.g.
+    #                             #   prompt_cache_key / user, x-session-affinity. null = send nothing.
+    #   top_p / temperature / extra: {extra_body: {...}}
 default_model: deepseek-flash     # used by every role without its own model
 rewrite_model: null               # request rewriting; null uses default_model
 extraction_model: null            # notes -> structured findings; null uses the role's model
+
+# Per-node model and call parameters. The workflow is
+#   rewrite -> plan -> research (parallel) -> conversion -> outline -> section (parallel) -> summary
+# plus revision and follow_up after the report. Unset fields inherit. Nodes that
+# return JSON (rewrite, plan, conversion, outline, follow_up) want a low temperature.
+nodes: {}
+#   rewrite:    {enabled: true, model: null, temperature: 0.2, max_tokens: 1500}   # enabled: false plans the user's own words
+#   plan:       {temperature: 0, max_tokens: 3000}
+#   research:   {temperature: 0.3, timeout_seconds: 1200}     # a researcher's own skills.<role>.model wins over this model
+#   conversion: {temperature: 0, output_retries: 3, json_mode: false}   # json_mode: response_format on gateways that support it
+#   outline:    {temperature: 0.1}
+#   section:    {temperature: 0.5, max_tokens: 6000}
+#   summary:    {enabled: true}                                # false: the outline's key conclusions open the report
+#   fields: enabled, model, temperature, top_p, max_tokens, timeout_seconds, output_retries, json_mode, extra_body
 
 # Research roles. deepresearch (planner) and report-synthesis (writer) are fixed;
 # every other entry is a researcher the planner can assign. Methodology comes from
@@ -51,6 +73,11 @@ skills:
 #   search: tavily serper brave exa bocha searxng jina_search duckduckgo http mcp
 #   read:   jina_reader tavily_extract firecrawl direct http mcp
 #   data:   ragflow lightrag http mcp
+#   enabled: false keeps a source configured but never offers it (web search
+#   switched off where only MCP tools may be used).
+# Without any enabled role: read source, search results and records are the
+# evidence: researchers get the research_records prompt and references say
+# "search excerpt; the original was not opened".
 sources:
   - name: internal-kb
     tool: knowledge_search
@@ -91,10 +118,14 @@ require_dual_source: true         # false when only internal or only external so
 
 # MCP servers used only by DeepResearch sources (type: mcp providers or kind: mcp sources).
 mcp_servers: {}
-#   company-kb:
-#     transport: http              # http | sse | stdio
+#   internal-kb:
+#     transport: http              # http | sse | stdio (stdio only here, never from the settings page)
 #     url: http://10.0.0.8:9000/mcp
-#     headers: {Authorization: secret:company-kb-token}
+#     headers:                     # a whole-value reference or interpolation inside the value
+#       Authorization: Bearer ${KB_TOKEN}
+#       Cookie: sid=${secret:kb-cookie}; lang=zh
+#     allowed_tools: [search]      # allowlist; null allows every tool a source or provider names
+# MCP sources in full: examples/deepresearch/mcp-sources.fragment.yaml
 
 # Engine tools roles may use besides sources. read_file continues long results the engine
 # moved to a file.
@@ -111,10 +142,37 @@ compaction:
   max_summary_input_tokens: 24000
   model: null                     # null: summarize with the role's own model
 
-max_concurrency: 3
+# Providers reuse a prompt only from its first token on. The engine can show a role
+# the ledger of its own tool calls, but it rewrites that ledger right after the system
+# prompt on every turn, which leaves a researcher loop without a reusable prefix
+# (measured: 4-5% cached input against ~70% without it). Evidence never depends on it.
+tool_receipt_ledger: false
+
+max_concurrency: 3                # research steps at once
+writer_concurrency: null          # report sections at once; null = max_concurrency
 max_active_runs: 8
 plan_countdown_seconds: 45
-max_output_tokens: 4096
+plan_min_units: 3                 # research steps the planner is asked for
+plan_max_units: 6
+max_output_tokens: 8192           # output cap of one call; nodes.<name>.max_tokens overrides it
+# Searches one research step may make; opening a page it found does not count.
+# The step is told its allowance; when it is used, search tools answer with a
+# stop instruction, so the researcher reads what it found and writes its notes
+# instead of ending the run with BUDGET_EXHAUSTED. Reads count toward
+# budget_ceiling.max_tool_calls only.
+max_searches_per_unit: 30
+# Soft time allowance of one research step: afterwards its tools answer with a
+# stop instruction and the researcher writes its notes. null: no allowance.
+max_seconds_per_unit: null
+# Findings one step hands to the writer (the converter is asked for the ones that matter).
+max_findings_per_unit: 12
+# Gaps that start another round of research. [] never supplements. Slow models:
+# [coverage, unsupported].
+supplement_gap_codes: [coverage, unsupported, missing-internal, missing-external, date, open-questions]
+# Time kept back from budget.max_elapsed_seconds for writing the report. Research
+# winds down when only this much is left; the run no longer fails at the ceiling.
+# null: a quarter of the ceiling, 120-900 seconds.
+report_time_reserve_seconds: null
 output_retries: 2
 trace_capture_content: true
 trace_max_chars: 16000
@@ -126,6 +184,10 @@ allow_limited_report: true
 cite_search_results: false
 max_synthesis_repairs: 1
 max_report_sections: 8
+# Scales the per-section and summary length targets. Measured on one question: 1.0 gave about
+# 29,000 characters, 0.45 about 18,000 (ChatGPT deep research: about 5,000 plus tables). Below 1,
+# a section far past its ceiling gets one shortening repair. Guidance, never a failure.
+report_length_scale: 1.0
 # Site icons for cited domains are fetched by the Gateway (public hosts only,
 # raster images only, cached). Set false without outbound access.
 favicons: true

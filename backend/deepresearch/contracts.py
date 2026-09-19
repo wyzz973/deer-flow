@@ -68,12 +68,30 @@ class SourceStrategy(Contract):
         return list(dict.fromkeys(values))
 
 
+def bounded(limit: int):
+    """Truncate display text from the open web instead of failing validation.
+
+    A page without a title is labeled by its URL, and a URL with a signed query
+    string can run to thousands of characters. Titles and publisher labels are
+    display metadata, so one such page must not fail a whole research run when
+    results are revalidated. Identity fields (url, source_uri, ids) stay strict.
+    """
+
+    def clamp(value):
+        if isinstance(value, str) and len(value) > limit:
+            return value[: limit - 1] + "…"
+        return value
+
+    return clamp
+
+
 class ResearchUnit(Contract):
     id: Identifier
     skill: Identifier
     # Short, user-facing step label shown on the plan card. The objective keeps
     # the detailed researcher instruction; historical plans have no title.
     title: str = Field(default="", max_length=80)
+    _title = field_validator("title", mode="before")(bounded(80))
     objective: str = Field(min_length=3, max_length=4000)
     priority: int = Field(default=10, ge=0, le=1000)
     source_strategy: SourceStrategy = Field(default_factory=SourceStrategy)
@@ -124,6 +142,7 @@ class ResearchPlan(Contract):
     goal: str = Field(min_length=3, max_length=12000)
     # A short plan title for the card and report defaults.
     title: str = Field(default="", max_length=120)
+    _title = field_validator("title", mode="before")(bounded(120))
     # The rewritten research brief: focus areas, time anchor, source
     # preferences, evidence distinctions and expected report structure. It is
     # the shared specification for researchers and the report writer.
@@ -179,23 +198,6 @@ def safe_http_url(value: str | None) -> str | None:
     return value
 
 
-def bounded(limit: int):
-    """Truncate display text from the open web instead of failing validation.
-
-    A page without a title is labeled by its URL, and a URL with a signed query
-    string can run to thousands of characters. Titles and publisher labels are
-    display metadata, so one such page must not fail a whole research run when
-    results are revalidated. Identity fields (url, source_uri, ids) stay strict.
-    """
-
-    def clamp(value):
-        if isinstance(value, str) and len(value) > limit:
-            return value[: limit - 1] + "…"
-        return value
-
-    return clamp
-
-
 class RawEvidence(Contract):
     raw_id: Identifier
     title: str = Field(min_length=1, max_length=1000)
@@ -213,10 +215,20 @@ class RawEvidence(Contract):
     provenance: Literal["document", "tool_output", "observed_source", "fetched_document"] = "document"
     source_id: str | None = None
     document_hash: str | None = None
+    # Decided where the evidence was gathered: a search result is citable when
+    # the step that found it had no tool to open originals. Later stages
+    # (gap review, writing, final validation) read this instead of deciding
+    # again from deployment-wide settings, which disagreed for a role limited
+    # to an internal search tool in a deployment that also had a web reader. None:
+    # decide from provenance and the source's role (results saved earlier).
+    citable: bool | None = None
 
     _url = field_validator("url")(safe_http_url)
     _title = field_validator("title", mode="before")(bounded(1000))
     _publisher = field_validator("publisher", mode="before")(bounded(200))
+    # An excerpt is already an excerpt: keeping a longer one bounded loses less
+    # than dropping the record. Empty text stays a failure — there is nothing to cite.
+    _snippet = field_validator("snippet", mode="before")(bounded(20000))
 
     @model_validator(mode="after")
     def locator_required(self):
@@ -294,6 +306,7 @@ class Evidence(Contract):
     provenance: Literal["document", "tool_output", "observed_source", "fetched_document"] = "document"
     source_id: str | None = None
     document_hash: str | None = None
+    citable: bool | None = None  # see RawEvidence.citable
 
 
 class BoundFinding(Contract):

@@ -125,7 +125,7 @@ def build_router(service, *, local_demo=False, demo_origins=None):
         try:
             return public(await awaitable)
         except ResearchError as exc:
-            conflict = exc.code in {"RUN_BUSY", "PLAN_VERSION", "NOT_RETRYABLE", "IDEMPOTENCY_CONFLICT", "CONFIG_CHANGED"}
+            conflict = exc.code in {"RUN_BUSY", "RUN_STOPPED", "PLAN_VERSION", "NOT_RETRYABLE", "IDEMPOTENCY_CONFLICT", "CONFIG_CHANGED"}
             status = 503 if exc.code == "SERVICE_STOPPING" else 409 if conflict else 429 if exc.code == "CAPACITY" else 422
             raise HTTPException(status, {"code": exc.code, "message": str(exc), "recoverable": exc.recoverable}) from None
 
@@ -171,13 +171,19 @@ def build_router(service, *, local_demo=False, demo_origins=None):
         from .secrets import SECRETS, references
 
         current = await asyncio.to_thread(profile.editable_view, service.settings)
+        defaults = await asyncio.to_thread(profile.editable_view, service.operator)
         stored = await service.store.profile()
+        admin = bool(getattr(request.state, "research_admin", False))
+        if not admin:
+            # Every signed-in user can read how research is configured, but not
+            # a credential someone typed into a header or a URL.
+            current, defaults = profile.masked(current), profile.masked(defaults)
         return {
             "version": service.profile_version,
-            "editable": bool(getattr(request.state, "research_admin", False)),
+            "editable": admin,
             "error": service.profile_error,
             "settings": current,
-            "defaults": await asyncio.to_thread(profile.editable_view, service.operator),
+            "defaults": defaults,
             "overridden": sorted(((stored or {}).get("overrides") or {}).keys()),
             "updated_at": (stored or {}).get("updated_at"),
             "operator": {
@@ -237,6 +243,9 @@ def build_router(service, *, local_demo=False, demo_origins=None):
             spec = ModelSpec.model_validate(body.model)
         except ValidationError as exc:
             raise HTTPException(422, validation_detail(exc)) from None
+        if spec.provider == "custom" and spec.use not in {model.use for model in service.operator.models}:
+            # Probing imports and instantiates the class.
+            raise HTTPException(422, {"code": "SETTINGS_INVALID", "message": "自定义模型类只能在运维配置文件里引入"})
         candidate = service.settings.model_copy(update={"models": [spec], "default_model": spec.name})
         return await probe_model(spec.name, timeout=120, settings=candidate)
 
@@ -250,11 +259,19 @@ def build_router(service, *, local_demo=False, demo_origins=None):
             servers = {name: McpServerSpec.model_validate(value) for name, value in (body.mcp_servers or {}).items()} if body.mcp_servers is not None else service.settings.mcp_servers
         except ValidationError as exc:
             raise HTTPException(422, validation_detail(exc)) from None
+        for name, server in servers.items():
+            operator_defined(name, server)
         provider = next((item for item in source.providers if item.id == body.provider_id), None)
         if provider is None:
             raise HTTPException(404, "Provider not found in the submitted source")
         candidate = service.settings.model_copy(update={"mcp_servers": servers})
         return await test_provider(source, provider, candidate, query=body.query, url=body.url)
+
+    def operator_defined(name, spec):
+        """Listing or testing a stdio server starts its command: only the operator's own may run."""
+        known = service.operator.mcp_servers.get(name)
+        if spec.transport == "stdio" and (known is None or known.model_dump(mode="json") != spec.model_dump(mode="json")):
+            raise HTTPException(422, {"code": "SETTINGS_INVALID", "message": "stdio MCP 服务会在网关主机上启动进程，只能在运维配置文件里定义；设置页请使用 http 或 sse 服务"})
 
     @router.post("/settings/mcp-tools")
     async def list_mcp_tools(body: McpToolsRequest, owner=Depends(administrator)):
@@ -265,11 +282,25 @@ def build_router(service, *, local_demo=False, demo_origins=None):
             spec = McpServerSpec.model_validate(body.server)
         except ValidationError as exc:
             raise HTTPException(422, validation_detail(exc)) from None
+        operator_defined(body.name, spec)
+        from .mcp import connection_failure
+
         try:
             tools = await MANAGER.tools(body.name, spec, refresh=True)
-        except Exception as exc:
-            return {"ok": False, "error": type(exc).__name__, "tools": []}
-        return {"ok": True, "tools": [{"name": tool.name, "description": (tool.description or "")[:1000], "arguments": getattr(tool, "args", {}) or {}} for tool in tools]}
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:  # the MCP client reports connection errors as an ExceptionGroup
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            # Say whether the server refused the credentials (an expired cookie or
+            # token) or could not be reached; never echo the transport error text.
+            failure = connection_failure(body.name, exc)
+            return {"ok": False, "error": type(exc).__name__, "kind": failure.kind, "message": str(failure), "tools": []}
+        allowed = spec.allowed_tools
+        return {
+            "ok": True,
+            "tools": [{"name": tool.name, "description": (tool.description or "")[:1000], "arguments": getattr(tool, "args", {}) or {}, "allowed": allowed is None or tool.name in allowed} for tool in tools],
+        }
 
     @router.get("/settings/health")
     async def provider_health(owner=Depends(principal)):
@@ -302,7 +333,11 @@ def build_router(service, *, local_demo=False, demo_origins=None):
 
     @router.get("/{run_id}")
     async def get_run(run=Depends(owned)):
-        return public(run)
+        # The event position is read before the state it describes, so a page
+        # that streams from it never misses a change: opening a running
+        # research does not replay its whole event history.
+        seq = await service.store.last_event_seq(run["run_id"])
+        return {**public(await service.store.get(run["run_id"]) or run), "last_event_seq": seq}
 
     @router.post("/{run_id}/plan/approve", status_code=202)
     async def approve(body: PlanDecision, request: Request, run=Depends(owned)):

@@ -22,7 +22,7 @@
 - 普通 Chat Completions 回复通过独立、有限重试的输出整理进入研究契约，不要求 JSON mode。
 - 本地 Trace、完整的模型调用审计与轮转日志支持调查，不依赖 LangSmith 或其他遥测服务。
 
-详细说明：[设计与原生能力复用](docs/deepresearch/NATIVE_RUNTIME.md) · [逐步评审记录](docs/deepresearch/REUSE_AUDIT.md) · [API](docs/deepresearch/API.md) · [公司 Agent 交接](docs/deepresearch/HANDOFF.md)
+详细说明：[设计与原生能力复用](docs/deepresearch/NATIVE_RUNTIME.md) · [逐步评审记录](docs/deepresearch/REUSE_AUDIT.md) · [API](docs/deepresearch/API.md) · [Agent 交接](docs/deepresearch/HANDOFF.md) · [接手与运行审计技能](.agents/skills/deepresearch-engineering/SKILL.md)
 
 配置说明：[模型配置](docs/deepresearch/MODEL_CONFIGURATION.md) · [DeerFlow 宿主配置](docs/deepresearch/DEERFLOW_CONFIGURATION.md) · [研究配置](docs/deepresearch/RESEARCH_CONFIGURATION.md)。
 不联网的环境（本地模型、内网知识库）从 [离线开发交接](docs/deepresearch/OFFLINE_AGENT_GUIDE.md) 开始，模板在 `examples/deepresearch/offline/`。
@@ -114,16 +114,39 @@ request_secret_headers:
 
 这里存的是环境变量名/映射，不是真实凭据。凭据只进入原生 executor 的 runtime context；不要把宿主登录 Cookie 自动转发到另一个业务系统。
 
+研究自己的 MCP 服务在研究配置的 `mcp_servers` 里定义，请求头与环境变量只写引用，可以在值里插值，并用 `allowed_tools` 限定研究能调用的工具：
+
+```yaml
+mcp_servers:
+  kb:
+    transport: http
+    url: https://YOUR-INTERNAL-MCP/mcp
+    headers:
+      Authorization: Bearer ${MCP_TOKEN}          # 网关进程的环境变量
+      Cookie: sid=${secret:kb-cookie}; lang=zh    # 设置页保存的只写密钥；请求自带同名凭据时只在该请求内覆盖
+    allowed_tools: [search_docs, search_wiki]     # 白名单；服务以后新增的工具在写进名单之前研究调不到
+```
+
+只用 MCP 工具、不允许网页搜索时：网页数据源写 `enabled: false`（或不配置）并设 `require_dual_source: false`。
+没有任何能打开原文的读取工具时，检索结果与知识库记录直接作为可引用证据，研究员不会被要求“先打开页面”，
+参考资料里这类引用标注“检索摘录，未读取原文”。完整写法见 `examples/deepresearch/mcp-sources.fragment.yaml`；
+`python -m deepresearch.doctor --probe-mcp` 会连接每个服务、列出工具并核对白名单（鉴权失败会明确说是凭据被拒绝）。
+
 ## 研究设置（管理员）
 
 研究页面右上角的齿轮进入 `/workspace/deepresearch/settings`：
 
-- **模型**：增删研究模型、选默认/改写/整理模型、填单价；“测试连接”用表单里当前的配置真实发一次普通请求和一次工具调用。
+- **模型**：增删研究模型、选默认/改写/整理模型、填单价；“测试连接”用表单里当前的配置真实发一次普通请求、一次工具调用和一次“只返回 JSON”的请求。
+  只支持 OpenAI Chat Completions 协议的模型网关用“OpenAI 兼容接口”加 `base_url` 即可：研究不依赖 JSON mode 或 Responses API，
+  输出上限参数名与流式用量默认自动适配。
+- **节点调参**：链路是“改写 → 计划 → 并行检索研究 → 笔记整理 → 大纲 → 并行章节写作 → 执行摘要”，每个节点可以单独指定模型、
+  温度、top_p、输出上限、超时、修复次数；输出 JSON 的节点建议温度 0–0.3，改写与摘要可以关闭。
 - **研究角色**：增删研究员，改角色说明、模型、系统提示词、方法论正文、可用工具白名单、步数与超时。
 - **提示词**：研究流程发给模型的每一条指令都能改，按阶段分组、可搜索、可逐条恢复默认。
-- **数据源与搜索**：数据源及其供应商链（顺序、启用、密钥、参数），每个供应商可单独测试并显示健康状态与冷却。
-- **MCP 服务**：研究自己的 MCP 服务，可“连接并列出工具”。
-- **运行参数**：并发、倒计时、输出上限、章节数、审计开关、上下文压缩策略、默认引擎工具；部署上限只读展示。
+- **数据源与搜索**：数据源及其供应商链（顺序、启用、密钥、参数），每个数据源有启用开关，每个供应商可单独测试并显示健康状态与冷却。
+- **MCP 服务**：研究自己的 MCP 服务，可“连接并列出工具”并勾选工具白名单。stdio 服务会在网关主机上启动进程，只能写在配置文件里。
+- **运行参数**：研究与写作并发、倒计时、计划步骤数范围、每步检索次数/软时限/发现条数、哪些缺口触发补研、报告预留时间、
+  报告长度系数、输出上限、章节数、审计开关、上下文压缩策略、默认引擎工具；部署上限只读展示。
 - **密钥与历史**：保存只写密钥（用 `secret:名字` 引用）、查看凭据解析状态、查看与回滚历史版本。
 
 保存会生成新版本，之后**新建**的研究使用；每个研究任务保存创建时的完整配置快照，进行中的研究不受影响。
@@ -152,7 +175,11 @@ request_secret_headers:
 预估费用与预算使用、模型与工具调用（次数、失败原因、延迟、重复调用）、读取失败最多的站点、每个研究单元的消耗与被引用页面数、
 子 Agent（完成、失败、并行度、每次执行的耗时与 Token）以及效率指标（每条引用的 Token、费用和计算时长，读取页面到引用的转化，
 格式转换与失败执行的 Token 占比，缓存复用）。
-“导出指标”下载 JSONL，包含汇总与每条原始记录。
+“按节点”表列出每个可调节点的模型、调用数、Token、P50/P95 延迟、被截断次数（该调大这个节点的输出上限）与格式重试次数
+（该降低温度或换模型），调参以它为依据。“导出指标”下载 JSONL，包含汇总与每条原始记录。
+
+预算是“收尾”而不是“到点失败”：每步检索次数、工具总数、模型 Token 和执行时间用完时，研究员被要求用已有内容写笔记，
+研究停止补研并照常写出带局限说明的报告；只有完全没有可引用的发现时才失败。预算按任务计，报告完成后的追问从零开始计。
 
 在研究配置中填写模型单价后才显示费用（单价不影响已有任务的恢复；真实验收时写在数据目录的 `research.yaml`，重启网关生效）：
 

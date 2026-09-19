@@ -63,6 +63,10 @@ def test_display_metadata_from_the_web_is_bounded_not_rejected(result):
     assert len(evidence.title) == 1000 and evidence.title.endswith("…") and evidence.title.startswith("https://example.com/image.png")
     assert len(evidence.publisher) == 200
     assert evidence.url == url  # the locator itself is never silently altered
+    # An over-long excerpt is bounded; empty text has nothing to cite and is refused.
+    assert len(RawEvidence(raw_id="raw-long", title="t", url="https://example.com/a", origin="external", source_name="external-web", publisher="p", snippet="正" * 30000).snippet) == 20000
+    with pytest.raises(ValidationError):
+        RawEvidence(raw_id="raw-empty", title="t", url="https://example.com/a", origin="external", source_name="external-web", publisher="p", snippet="   ")
     # A result carrying such evidence still merges.
     body = result.model_dump(mode="json")
     body["raw_evidences"].append({**evidence.model_dump(mode="json"), "raw_id": "raw-long"})
@@ -242,3 +246,81 @@ def test_historical_ast_reports_still_export_to_word(result):
     doc = Document(BytesIO(docx_report(value)))
     text = "\n".join(p.text for p in doc.paragraphs)
     assert "可验证结论[1]" in text and "演示模式" in text and "参考资料" in text
+
+
+def test_a_single_unusable_evidence_record_never_fails_the_whole_unit():
+    """Evidence is derived from open-web payloads and may predate a schema rule.
+
+    evidence_merge revalidates every stored result, so one record the current
+    contract rejects used to fail the entire research. Such records are dropped
+    with their reason, findings keep the references that survive, and a finding
+    left without any reference goes with them.
+    """
+    from deepresearch.evidence import valid_result
+
+    def record(raw_id, **overrides):
+        return {
+            "raw_id": raw_id,
+            "title": "可用来源",
+            "url": "https://example.com/" + raw_id,
+            "origin": "external",
+            "source_name": "external-web",
+            "source_level": "L2",
+            "publisher": "example",
+            "snippet": "正文片段",
+            "provenance": "fetched_document",
+            **overrides,
+        }
+
+    body = {
+        "unit_id": "u1",
+        "confidence": 0.6,
+        "raw_evidences": [
+            record("keep1"),
+            record("longtitle", title="https://example.com/x?jwt=" + "e" * 1800),
+            record("credentials", url="https://user:secret@example.com/page"),
+            record("emptytext", snippet="   "),
+            record("keep2"),
+        ],
+        "findings": [
+            {"claim": "结论一", "raw_evidence_refs": ["keep1", "emptytext"], "confidence": 0.7},
+            {"claim": "只靠被丢弃的证据", "raw_evidence_refs": ["credentials"], "confidence": 0.5},
+        ],
+    }
+    result, dropped = valid_result(body)
+    # A long title is display metadata and is truncated, not dropped.
+    kept = [item.raw_id for item in result.raw_evidences]
+    assert kept == ["keep1", "longtitle", "keep2"]
+    assert [item["raw_id"] for item in dropped] == ["credentials", "emptytext"]
+    assert {field for item in dropped for field in item["fields"]} == {"url", "snippet"}
+    assert [finding.raw_evidence_refs for finding in result.findings] == [["keep1"]]
+    assert result.findings[0].claim == "结论一"
+
+
+def test_a_structurally_broken_result_still_fails_loudly():
+    from pydantic import ValidationError
+
+    from deepresearch.evidence import valid_result
+
+    with pytest.raises(ValidationError):
+        valid_result({"unit_id": "不是标识符 ", "confidence": 2.5, "raw_evidences": [], "findings": []})
+
+
+def test_display_labels_a_model_overshoots_are_bounded_not_rejected():
+    """A step label that runs a few characters long must not throw away a plan.
+
+    Titles are labels for the plan card; claims and briefs stay strict so the
+    conversion retry can give the model precise feedback instead of silently
+    cutting research content.
+    """
+    plan = ResearchPlan.model_validate(
+        {
+            "goal": "比较方案",
+            "title": "标" * 400,
+            "research_units": [{"id": "u1", "skill": "technical-route", "title": "查" * 300, "objective": "对比运维成本"}],
+        }
+    )
+    assert len(plan.title) == 120 and plan.title.endswith("…")
+    assert len(plan.research_units[0].title) == 80
+    with pytest.raises(ValidationError):  # research content is never silently cut
+        ResearchPlan.model_validate({"goal": "比" * 20000, "research_units": [{"id": "u1", "skill": "s", "objective": "o"}]})

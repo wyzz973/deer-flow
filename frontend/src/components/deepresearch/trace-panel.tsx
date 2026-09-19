@@ -17,6 +17,11 @@ import { spanDepth, traceSpans } from "@/core/deepresearch/trace-model";
 import type { ResearchEvent } from "@/core/deepresearch/types";
 import { cn } from "@/lib/utils";
 
+const TRACE_PAGE = 200;
+// One load stops here even if the trace goes on: every span becomes a row and
+// a timeline mark. “加载后续事件” continues from the cursor.
+const TRACE_LOAD_CAP = 5000;
+
 export function ResearchTraceInspector({
   api,
   runId,
@@ -36,6 +41,7 @@ export function ResearchTraceInspector({
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [more, setMore] = useState(false);
   const cursor = useRef(0),
     fetching = useRef(false),
     pending = useRef(false),
@@ -56,11 +62,19 @@ export function ResearchTraceInspector({
     try {
       do {
         pending.current = false;
-        const page = await api.trace(runId, cursor.current);
-        if (!alive.current) return;
-        cursor.current = page.next_cursor;
-        setEvents((old) => [...old, ...page.items]);
-        setError("");
+        // A finished run has no later refresh: read to the end of the trace,
+        // not just its first page.
+        for (let loaded = 0; ; ) {
+          const page = await api.trace(runId, cursor.current, TRACE_PAGE);
+          if (!alive.current) return;
+          cursor.current = page.next_cursor;
+          if (page.items.length) setEvents((old) => [...old, ...page.items]);
+          setError("");
+          loaded += page.items.length;
+          const full = page.items.length >= TRACE_PAGE;
+          setMore(full);
+          if (!full || loaded >= TRACE_LOAD_CAP) break;
+        }
       } while (pending.current && alive.current);
     } catch (e) {
       if (alive.current) setError(String(e));
@@ -148,9 +162,12 @@ export function ResearchTraceInspector({
                     : s.kind === kind,
                 )
                 .map((s) => (
+                  // Thousands of marks must not sit in the tab order; the
+                  // span list below reaches every one of them by keyboard.
                   <button
                     key={s.id}
                     type="button"
+                    tabIndex={-1}
                     title={`${s.name} · ${s.duration ?? "?"} ms`}
                     aria-label={`定位 ${s.name}`}
                     className={cn(
@@ -177,6 +194,7 @@ export function ResearchTraceInspector({
         <div className="text-muted-foreground flex justify-between">
           <span>
             {spans.length} 个事件 · {((end - first) / 1000).toFixed(1)}s
+            {more && " · 还有更多"}
           </span>
           <button
             type="button"
@@ -255,7 +273,7 @@ export function ResearchTraceInspector({
             void load();
           }}
         >
-          加载后续事件
+          {more ? "还有更多事件，继续加载" : "加载后续事件"}
         </Button>
       </div>
       {current && (

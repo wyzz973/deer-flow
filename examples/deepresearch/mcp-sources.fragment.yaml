@@ -5,11 +5,16 @@
 # come from request_secret_headers below.
 mcp_servers:
   your-internal-mcp:
-    transport: http                 # http | streamable_http | sse | stdio
+    transport: http                 # http | streamable_http | sse | stdio (stdio only in this file, never from the settings page)
     url: https://YOUR-INTERNAL-MCP/mcp
-    headers:
-      Cookie: secret:research_cookie
+    headers:                        # a whole-value reference, or interpolation inside the value
+      Cookie: sid=${secret:research_cookie}; lang=zh
       X-Csrf-Token: secret:research_csrf
+      # Authorization: Bearer ${MCP_TOKEN}      # an environment variable of the Gateway
+    # Allowlist: only these tools of the server can be bound by sources and providers,
+    # checked when the configuration loads and again when a tool is resolved. A tool
+    # the server adds later is unreachable until it is listed. null: no restriction.
+    allowed_tools: [search, tickets.search]
     timeout_seconds: 60
     description: Internal knowledge base
 
@@ -38,6 +43,18 @@ sources:
     role: data
     origin: internal
     level: L2
+
+# Research with MCP tools only: leave out web sources, or keep them configured
+# and switched off with `enabled: false`, and set `require_dual_source: false`.
+# When no enabled source has `role: read` (nothing can open an original page),
+# search results and records are the evidence: researchers get the
+# `research_records` prompt instead of "open the page first", every result is
+# cited on its own, and references say "search excerpt; the original was not
+# opened". A provider-based source (1) gives one citation per record with its
+# own title and link; a `kind: mcp` source (2) is cited as one whole output per call.
+#
+#   python -m deepresearch.doctor --config deepresearch.local.yaml --probe-mcp
+# connects to every server, lists its tools and checks the tools research uses.
 
 # Per-request credentials. The Gateway reads these request headers into named
 # credentials; a request's value overrides the saved `secret:` of the same name for

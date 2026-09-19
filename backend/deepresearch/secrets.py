@@ -18,6 +18,8 @@ import re
 import threading
 
 NAME = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
+# A reference inside a longer value: "Bearer ${KB_TOKEN}", "sid=${secret:kb-cookie}; lang=zh".
+INTERPOLATION = re.compile(r"\$\{(secret:[A-Za-z0-9_.-]{1,80}|[A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 class SecretBox:
@@ -61,10 +63,13 @@ class SecretBox:
 
     def expand(self, value, request: dict | None = None):
         """Resolve references inside header or environment mappings."""
-        if isinstance(value, str) and value.startswith(("$", "secret:")):
+        if isinstance(value, str) and value.startswith(("$", "secret:")) and not value.startswith("${"):
             return self.resolve(value, request) or ""
         if isinstance(value, str):
-            return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", lambda match: os.environ.get(match.group(1), ""), value)
+            # "${NAME}" is an environment variable and "${secret:NAME}" a saved or
+            # per-request secret, so a header can carry a scheme or a cookie name
+            # around the credential: "Bearer ${secret:kb-token}".
+            return INTERPOLATION.sub(lambda match: self.resolve(match.group(1) if match.group(1).startswith("secret:") else "$" + match.group(1), request) or "", value)
         if isinstance(value, dict):
             return {key: self.expand(item, request) for key, item in value.items()}
         if isinstance(value, list):
@@ -83,8 +88,11 @@ SECRETS = SecretBox()
 def references(value):
     """Credential references anywhere in a configuration fragment."""
     found = set()
-    if isinstance(value, str) and value.startswith(("$", "secret:")):
+    if isinstance(value, str) and value.startswith(("$", "secret:")) and not value.startswith("${"):
         found.add(value)
+    elif isinstance(value, str):
+        # Interpolated credentials are redacted like whole-value references.
+        found |= {name if name.startswith("secret:") else "$" + name for name in INTERPOLATION.findall(value)}
     elif isinstance(value, dict):
         for item in value.values():
             found |= references(item)

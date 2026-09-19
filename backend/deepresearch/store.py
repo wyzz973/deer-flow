@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -17,6 +18,97 @@ from .contracts import ResearchError, utcnow
 
 def dumps(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+# Tokens a report needs at the least. A measured three-step report took eight
+# calls (outline, six sections, summary) and about 145k tokens; a compact one
+# about half. Less than this cannot hold even the parallel section calls.
+REPORT_RESERVE_FLOOR = 60000
+
+
+def report_reserve(run) -> int:
+    """Tokens kept back so a run that spends its research budget can still write.
+
+    A fifth of the ceiling, never less than REPORT_RESERVE_FLOOR and never more
+    than half; an unlimited ceiling reserves nothing.
+    """
+    ceiling = (run.get("budget") or {}).get("max_model_tokens")
+    if not ceiling:
+        return 0
+    return min(ceiling // 2, max(ceiling // 5, REPORT_RESERVE_FLOOR))
+
+
+# Output tokens reserved per call before its reported usage replaces the
+# estimate: a research turn is a tool call or a short note, and a report call
+# (outline, one section, the summary) measured at most about 5k.
+RESEARCH_TURN_OUTPUT = 4096
+REPORT_CALL_OUTPUT = 8192
+
+
+def research_tokens_left(run) -> int | None:
+    """Model tokens research may still spend before the report reserve, or None."""
+    ceiling = (run.get("budget") or {}).get("max_model_tokens")
+    if ceiling is None:
+        return None
+    return max(0, ceiling - report_reserve(run) - (run.get("usage") or {}).get("model_tokens", 0))
+
+
+def research_spent(run) -> bool:
+    """Whether research can no longer afford a turn, so supplementing is futile.
+
+    A balance that cannot cover a turn (its output plus a prompt of similar
+    size) is spent, and so is a run where a step already failed to reserve one:
+    the next step's prompt is no smaller.
+    """
+    if "RESEARCH_BUDGET_SPENT" in (run.get("unit_failures") or {}).values():
+        return True
+    left = research_tokens_left(run)
+    return left is not None and left < 2 * RESEARCH_TURN_OUTPUT
+
+
+def elapsed_seconds(run) -> float:
+    """Execution time charged so far, including the drive that is running now.
+
+    ``usage.elapsed_seconds`` only grows when a drive ends; ``drive_started_at``
+    (wall clock, set by the service) covers the one in progress. Time spent
+    waiting for the owner to confirm a plan is never charged.
+    """
+    spent = (run.get("usage") or {}).get("elapsed_seconds", 0) or 0
+    started = run.get("drive_started_at")
+    return spent + (max(0.0, time.time() - started) if isinstance(started, (int, float)) else 0.0)
+
+
+def report_time_reserve(run, settings=None) -> float:
+    """Seconds of the time budget kept back for writing the report."""
+    ceiling = (run.get("budget") or {}).get("max_elapsed_seconds")
+    if not ceiling:
+        return 0.0
+    configured = getattr(settings, "report_time_reserve_seconds", None)
+    reserve = configured if configured is not None else min(900, max(120, ceiling // 4))
+    return float(min(reserve, ceiling // 2))
+
+
+def research_seconds_left(run, settings=None) -> float | None:
+    """Seconds research may still take before the report reserve, or None when unlimited.
+
+    The time budget winds research down the way the token budget does: steps
+    are told to wrap up, supplementing stops and the report is still written.
+    Ending the whole run at the ceiling threw away everything a slow model had
+    already researched.
+    """
+    ceiling = (run.get("budget") or {}).get("max_elapsed_seconds")
+    if ceiling is None:
+        return None
+    return max(0.0, ceiling - report_time_reserve(run, settings) - elapsed_seconds(run))
+
+
+# A research step needs at least this long to do anything useful.
+MIN_UNIT_SECONDS = 20
+
+
+def research_time_spent(run, settings=None) -> bool:
+    left = research_seconds_left(run, settings)
+    return left is not None and left < MIN_UNIT_SECONDS
 
 
 class Store:
@@ -182,13 +274,28 @@ class Store:
 
         return await self.mutate(run_id, append)
 
-    async def reserve(self, run_id, tool_calls=0, model_tokens=0):
+    async def reserve(self, run_id, tool_calls=0, model_tokens=0, purpose="report"):
+        """Account a model or tool call against the run budget.
+
+        Research keeps a reserve so the report can still be written: a
+        ``purpose="research"`` call stops at the ceiling minus that reserve and
+        reports ``RESEARCH_BUDGET_SPENT``, which degrades its own step instead
+        of ending the run. Writing the report may use the whole ceiling.
+        """
+
         def change(run):
             if run.get("cancel_requested") or run.get("status") == "CANCELLED":
                 raise ResearchError("RUN_CANCELLED", "研究已取消，不再启动新调用", recoverable=False)
+            reserve = report_reserve(run) if purpose == "research" else 0
             for key, delta, maximum in [("tool_calls", tool_calls, "max_tool_calls"), ("model_tokens", model_tokens, "max_model_tokens")]:
                 ceiling = run["budget"][maximum]
-                if ceiling is not None and run["usage"][key] + delta > ceiling:
+                if ceiling is None:
+                    run["usage"][key] += delta
+                    continue
+                keep = reserve if key == "model_tokens" else 0
+                if run["usage"][key] + delta > max(0, ceiling - keep):
+                    if keep and run["usage"][key] + delta <= ceiling:
+                        raise ResearchError("RESEARCH_BUDGET_SPENT", "研究预算已用尽，剩余额度留给报告写作", recoverable=False)
                     raise ResearchError("BUDGET_EXHAUSTED", f"预算已用尽: {maximum}", recoverable=False)
                 run["usage"][key] += delta
 
@@ -206,6 +313,9 @@ class Store:
             return event
 
         return await self.call(op)
+
+    async def last_event_seq(self, run_id):
+        return await self.call(lambda db: db.execute("SELECT COALESCE(MAX(seq),0) FROM research_event WHERE run_id=?", (run_id,)).fetchone()[0])
 
     async def events(self, run_id, after=0, limit=200):
         return await self.call(lambda db: [json.loads(row[0]) for row in db.execute("SELECT body FROM research_event WHERE run_id=? AND seq>? ORDER BY seq LIMIT ?", (run_id, after, limit))])

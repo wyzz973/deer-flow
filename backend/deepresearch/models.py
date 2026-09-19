@@ -19,6 +19,23 @@ THINKING = {
     "vllm": {"extra_body": {"chat_template_kwargs": {"enable_thinking": True}}},
     "anthropic": {"thinking": {"type": "enabled", "budget_tokens": 2048}},
 }
+CHAT_COMPLETIONS = "deepresearch.chat_completions:ChatCompletionsModel"
+
+
+def legacy_token_param(spec):
+    """Whether this model is sent ``max_tokens`` instead of ``max_completion_tokens``."""
+    if spec.provider != "openai":
+        return False
+    if spec.max_tokens_param is not None:
+        return spec.max_tokens_param == "max_tokens"
+    from urllib.parse import urlsplit
+
+    host = (urlsplit(spec.base_url or "").hostname or "").lower()
+    return bool(host) and not host.endswith("openai.com") and not host.endswith("openai.azure.com")
+
+
+# Providers whose client understands ``stream_usage`` (OpenAI-compatible chat completions).
+STREAM_USAGE_PROVIDERS = {"openai", "vllm", "deepseek"}
 
 
 def engine_model(spec):
@@ -28,7 +45,7 @@ def engine_model(spec):
         **spec.extra,
         "name": spec.name,
         "display_name": spec.display_name or spec.name,
-        "use": spec.use if spec.provider == "custom" else MODEL_PROVIDERS[spec.provider],
+        "use": spec.use if spec.provider == "custom" else CHAT_COMPLETIONS if legacy_token_param(spec) else MODEL_PROVIDERS[spec.provider],
         "model": spec.model,
         "supports_thinking": spec.supports_thinking,
         "timeout": spec.timeout_seconds,
@@ -39,9 +56,15 @@ def engine_model(spec):
         raise ResearchError("MODEL_AUTH_REQUIRED", f"研究模型 {spec.name} 的 API Key 未设置（{spec.api_key}）", recoverable=False)
     if key:
         body["api_key"] = key
-    for field, value in (("base_url", spec.base_url), ("max_tokens", spec.max_tokens), ("context_window", spec.context_window), ("temperature", spec.temperature)):
+    for field, value in (("base_url", spec.base_url), ("max_tokens", spec.max_tokens), ("context_window", spec.context_window), ("temperature", spec.temperature), ("top_p", spec.top_p)):
         if value is not None:
             body[field] = value
+    # LangChain's OpenAI client stops asking for usage in streamed answers as
+    # soon as base_url is set, and research streams every call: a model
+    # gateway would then report no tokens at all, every call would be charged at
+    # its full output cap and cost metrics would stay empty.
+    if spec.stream_usage is not None or (spec.provider in STREAM_USAGE_PROVIDERS and "stream_usage" not in body):
+        body["stream_usage"] = True if spec.stream_usage is None else spec.stream_usage
     if spec.supports_thinking and spec.provider in THINKING:
         body.setdefault("when_thinking_enabled", THINKING[spec.provider])
     return ModelConfig.model_validate(body)
@@ -136,7 +159,84 @@ def _has_answer(message) -> bool:
     return bool(getattr(message, "tool_calls", None) or getattr(message, "tool_call_chunks", None))
 
 
-def model_for(settings, spec=None, agent=None):
-    """The model a role uses: its own, the research default, a legacy host binding, then the first research model."""
+def model_for(settings, spec=None, agent=None, node=None):
+    """The model a call uses.
+
+    A researcher's own model is the most specific choice, then the node's. For
+    the fixed roles a node (plan, outline, section ...) is more specific than
+    the role, which serves several nodes. Then the research default, a legacy
+    host binding and the first research model.
+    """
     agent_model = getattr(agent, "model", None)
-    return (spec.model if spec else None) or settings.default_model or (agent_model if agent_model and agent_model != "inherit" else None) or (settings.models[0].name if settings.models else None)
+    node_model = settings.node(node).model if node else None
+    role_model = spec.model if spec else None
+    chosen = (role_model or node_model) if node == "research" else (node_model or role_model)
+    return chosen or settings.default_model or (agent_model if agent_model and agent_model != "inherit" else None) or (settings.models[0].name if settings.models else None)
+
+
+def node_overrides(settings, node):
+    """Sampling and request parameters a node adds to its model profile."""
+    spec = settings.node(node) if node else None
+    if spec is None:
+        return {}
+    updates = {name: value for name, value in (("temperature", spec.temperature), ("top_p", spec.top_p)) if value is not None}
+    if spec.extra_body:
+        updates["extra_body"] = dict(spec.extra_body)
+    return updates
+
+
+def node_output_cap(settings, node):
+    """Output tokens one call of this node may write."""
+    spec = settings.node(node) if node else None
+    return (spec.max_tokens if spec and spec.max_tokens else None) or settings.max_output_tokens
+
+
+# Request fields that are dictionaries: an override adds keys to the profile's
+# own instead of replacing them (for example the provider's thinking switch).
+MERGED_FIELDS = ("extra_body", "default_headers")
+
+
+def merged_overrides(profile, *overrides):
+    """Several override sets as one, with dictionary fields merged key by key."""
+    extras = (profile.model_extra or {}) if profile is not None else {}
+    updates = {}
+    for item in overrides:
+        for key, value in (item or {}).items():
+            if key in MERGED_FIELDS:
+                current = updates.get(key, extras.get(key))
+                value = {**(current if isinstance(current, dict) else {}), **value}
+            updates[key] = value
+    return updates
+
+
+def with_node(profile, *overrides):
+    """A copy of an engine model profile with a node's parameters applied."""
+    updates = merged_overrides(profile, *overrides)
+    return profile.model_copy(update=updates) if updates else profile
+
+
+def official_openai(spec):
+    from urllib.parse import urlsplit
+
+    host = (urlsplit(spec.base_url or "").hostname or "").lower()
+    return spec.provider == "openai" and (not host or host.endswith("openai.com"))
+
+
+def session_overrides(settings, model_name, session):
+    """Request additions that let a gateway keep one conversation on one replica.
+
+    ``session`` identifies a thread of requests that share a growing prefix: a
+    role execution, or the bounded retries of one direct call. It is a digest,
+    never a user, run or credential value.
+    """
+    spec = next((model for model in settings.models if model.name == model_name), None)
+    if spec is None or not session:
+        return {}
+    param = spec.session_param or ("prompt_cache_key" if official_openai(spec) else None)
+    updates = {}
+    # Only OpenAI-compatible clients take extra_body; others get the header alone.
+    if param and spec.provider in STREAM_USAGE_PROVIDERS | {"custom"}:
+        updates["extra_body"] = {param: session}
+    if spec.session_header:
+        updates["default_headers"] = {spec.session_header: session}
+    return updates

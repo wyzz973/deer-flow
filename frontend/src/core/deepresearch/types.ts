@@ -75,6 +75,9 @@ export type ReportStats = {
 export type Citation = Evidence & {
   number: number;
   domain?: string;
+  /** What the citation rests on: the page itself, a tool record, or only what
+   * a search tool showed. Reports from before the field omit it. */
+  basis?: "page" | "record" | "search excerpt";
   evidence_ids?: string[];
   excerpts?: { evidence_id: string; text: string }[];
 };
@@ -134,6 +137,8 @@ export type Run = {
   auto_start_at?: string | null;
   auto_start_paused?: boolean;
   server_time?: string;
+  /** Newest event when this snapshot was read; the stream continues from it. */
+  last_event_seq?: number;
   /** Client-only monotonic receipt time; never sent back or persisted. */
   client_received_at?: number;
   cycle?: number;
@@ -311,13 +316,6 @@ export const steerableStatuses = new Set([
   "RESEARCH_COMPLETE",
   "SYNTHESIZING",
 ]);
-export function mergeEvents(
-  old: ResearchEvent[],
-  incoming: ResearchEvent,
-): ResearchEvent[] {
-  if (old.some((e) => e.seq === incoming.seq)) return old;
-  return [...old, incoming].sort((a, b) => a.seq - b.seq).slice(-100);
-}
 
 export type LatencySummary = {
   count: number;
@@ -342,6 +340,45 @@ export type MetricGroup = {
   tool_calls: number;
   tool_errors: number;
   tool_ms: number;
+};
+/** Model work of one graph node (GET /metrics `breakdown.by_node`). */
+export type NodeMetric = {
+  /** rewrite, plan, research, conversion, outline, section, summary,
+   * revision, follow_up, compaction or unknown. */
+  node: string;
+  models: string[];
+  model_calls: number;
+  model_errors: number;
+  /** Successful calls whose provider reported no usage. */
+  unreported_usage: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  reasoning_tokens: number;
+  total_tokens: number;
+  max_input_tokens: number | null;
+  avg_output_tokens: number | null;
+  /** Cached share of this node's input tokens, as the provider reported it. */
+  cache_read_ratio?: number | null;
+  /** Share of this node's prompt text that repeated the previous request of
+   * its thread: the ceiling a prefix cache could serve. Null when every
+   * request opened a new thread. */
+  prefix_reuse_ratio?: number | null;
+  /** Answers cut off by the output cap (`finish_reason: length`). */
+  truncated: number;
+  /** Extra attempts after JSON or citation validation failed. */
+  retries: number;
+  model_ms: number;
+  latency_ms: LatencySummary;
+  cost: number | null;
+};
+/** Usage of a task that already ended in this conversation. */
+export type ClosedTaskUsage = {
+  cycle: number | null;
+  closed_at: string | null;
+  model_tokens: number | null;
+  tool_calls: number | null;
+  elapsed_seconds: number | null;
 };
 export type AgentRunMetric = {
   id: string;
@@ -410,6 +447,8 @@ export type ResearchMetrics = {
     unreported_calls: number | null;
     estimated_unreported: number | null;
     cache_read_ratio: number | null;
+    /** Ceiling of what a prefix cache could serve; see MetricNode. */
+    prefix_reuse_ratio?: number | null;
   };
   cost: {
     currency: string | null;
@@ -501,6 +540,8 @@ export type ResearchMetrics = {
     tool_calls_used: number | null;
     max_elapsed_seconds: number | null;
     elapsed_used: number | null;
+    /** Budgets are per task: a follow-up after the report opens a new one. */
+    earlier_tasks?: ClosedTaskUsage[];
   };
   report: {
     versions: number;
@@ -535,6 +576,8 @@ export type ResearchMetrics = {
     by_model: MetricGroup[];
     by_unit: MetricGroup[];
     by_cycle: MetricGroup[];
+    /** Absent from a gateway older than per-node metrics. */
+    by_node?: NodeMetric[];
   };
 };
 
@@ -639,8 +682,19 @@ export type ModelSpec = {
   max_tokens?: number | null;
   context_window?: number | null;
   temperature?: number | null;
+  top_p?: number | null;
   timeout_seconds?: number;
   max_retries?: number;
+  /** Token usage in streamed answers; null lets the server decide per provider. */
+  stream_usage?: boolean | null;
+  /** Request field that carries the conversation id so a gateway can keep one
+   * conversation on one replica (prefix caches are per replica); null sends
+   * none, except prompt_cache_key on OpenAI's own endpoint. */
+  session_param?: string | null;
+  /** Header that carries the same id, e.g. x-session-affinity. */
+  session_header?: string | null;
+  /** Name of the output-cap parameter; null lets the server decide per base_url. */
+  max_tokens_param?: "max_tokens" | "max_completion_tokens" | null;
   supports_thinking?: boolean;
   extra?: Record<string, unknown>;
 };
@@ -679,6 +733,8 @@ export type SourceSpec = {
   name: string;
   origin: Origin;
   kind?: "channel" | "mcp" | "native";
+  /** A disabled source stays configured but is never offered to research. */
+  enabled?: boolean;
   tool: string;
   role: "search" | "read" | "data";
   level?: "L1" | "L2" | "L3" | "L4";
@@ -700,6 +756,42 @@ export type McpServerSpec = {
   timeout_seconds?: number;
   enabled?: boolean;
   description?: string;
+  /** Tools research may call on this server; null allows any tool a source names. */
+  allowed_tools?: string[] | null;
+};
+export type McpToolsResult = {
+  ok: boolean;
+  error?: string;
+  kind?: string;
+  message?: string;
+  tools: {
+    name: string;
+    description: string;
+    arguments: Record<string, unknown>;
+    allowed?: boolean;
+  }[];
+};
+export type NodeName =
+  | "rewrite"
+  | "plan"
+  | "research"
+  | "conversion"
+  | "outline"
+  | "section"
+  | "summary"
+  | "revision"
+  | "follow_up";
+/** Model and call parameters of one workflow node; unset fields inherit. */
+export type NodeSpec = {
+  enabled: boolean;
+  model: string | null;
+  temperature: number | null;
+  top_p: number | null;
+  max_tokens: number | null;
+  timeout_seconds: number | null;
+  output_retries: number | null;
+  json_mode: boolean;
+  extra_body: Record<string, unknown>;
 };
 export type CompactionSpec = {
   enabled: boolean;
@@ -726,11 +818,24 @@ export type EditableSettings = {
   max_concurrency: number;
   plan_countdown_seconds: number;
   max_output_tokens: number;
+  max_searches_per_unit: number | null;
+  max_seconds_per_unit: number | null;
+  max_findings_per_unit: number;
+  report_time_reserve_seconds: number | null;
+  plan_min_units: number;
+  plan_max_units: number;
+  supplement_gap_codes: string[];
+  writer_concurrency: number | null;
+  /** Only nodes that differ from full inheritance have a key. */
+  nodes: Partial<Record<NodeName, NodeSpec>>;
   output_retries: number;
   allow_limited_report: boolean;
   cite_search_results: boolean;
   max_synthesis_repairs: number;
   max_report_sections: number;
+  /** Multiplies the per-section and summary length targets (0.2–3.0).
+   * Optional: a gateway from before the field does not send it. */
+  report_length_scale?: number;
   trace_capture_content: boolean;
   llm_audit: boolean;
   pricing: Record<
@@ -790,6 +895,16 @@ export type SettingsView = {
     }[];
     engine_tools: { name: string; description: string }[];
     fixed_roles: string[];
+    /** Workflow nodes in the order a research passes through them. */
+    nodes: {
+      name: NodeName;
+      label: string;
+      description: string;
+      model_fallback: string;
+      advice: string;
+      optional: boolean;
+    }[];
+    gap_codes: { code: string; description: string }[];
     prompts: {
       key: string;
       stage: string;
