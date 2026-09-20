@@ -13,8 +13,9 @@ at the repository root; update it with any change to nodes, events, contracts or
 via `ln -s ../../.agents/skills/deepresearch-engineering .claude/skills/`). It maps
 the module, lists what must not be done, and carries two offline scripts:
 `scripts/audit_run.py --run <id|prefix|page URL|thread|latest> [--baseline <run>]`
-turns a run's records into a fact sheet (time, tokens, prompt cache, tools,
-supplements, repairs, rule-based findings with the setting that changes each),
+turns a run's records into a fact sheet and one offline HTML page (timeline; time,
+tokens, tools and searches per stage, node and step; prompt cache; cost and yield of
+each research round; rule-based findings with the setting that changes each),
 and `scripts/show_call.py` opens or replays one model call. Both read the store
 through `Store` and `metrics.collect`; `tests/deepresearch/test_audit_skill.py`
 runs them against a synthetic store, so change them together with any table,

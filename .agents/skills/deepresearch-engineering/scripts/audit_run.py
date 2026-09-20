@@ -13,10 +13,13 @@ Python, from anywhere inside the repository:
 
     backend/.venv/bin/python .agents/skills/deepresearch-engineering/scripts/audit_run.py --list
     backend/.venv/bin/python .agents/skills/deepresearch-engineering/scripts/audit_run.py --run 244cd6d5
-    ... --run <id|prefix|page URL|thread id|latest> [--baseline <run>] [--data-dir DIR] [--config research.yaml] [--out DIR]
+    ... --run <id|prefix|page URL|thread id|latest> [--baseline <run>] [--data-dir DIR] [--config research.yaml] [--out DIR] [--report FILE]
 
-Nothing is written to the research store; output goes to ``--out`` (default
-``<repo>/.deerflow/deepresearch/audits``, which git ignores).
+It writes ``audit-<run8>.json`` (the facts), ``audit-<run8>.md`` (the same facts
+as a sheet to read) and ``audit-<run8>.html`` (the same facts as one offline
+page with the timeline and charts; the written audit report is shown on top
+once it exists). Nothing is written to the research store; output goes to
+``--out`` (default ``<repo>/.deerflow/deepresearch/audits``, which git ignores).
 """
 
 from __future__ import annotations
@@ -134,8 +137,19 @@ async def load(database, run_id, pricing):
         "agent_runs": await store.agent_runs(run_id),
         "events": await store.activity_events(run_id),
         "unit_results": await store.unit_results(run_id),
+        "spans": await store.span_timings(run_id),
+        "evidence": evidence_pool(database, run_id),
         "snapshot": snapshot,
     }
+
+
+def evidence_pool(database, run_id):
+    """The merged evidence pool: which steps saw each record the report may cite."""
+    try:
+        with read_only(database) as db:
+            return {key: json.loads(body) for key, body in db.execute("SELECT id, body FROM research_evidence WHERE run_id=?", (run_id,))}
+    except sqlite3.Error:
+        return {}
 
 
 def exchanges(database, run_id):
@@ -202,6 +216,7 @@ def threads(model_calls):
                 "first_input": metered[0]["input_tokens"] if metered else None,
                 "last_input": metered[-1]["input_tokens"] if metered else None,
                 "max_input": max((call["input_tokens"] for call in metered), default=None),
+                "inputs": [call["input_tokens"] for call in metered],
                 "input_tokens": sum(call.get("input_tokens") or 0 for call in calls),
                 "output_tokens": sum(call.get("output_tokens") or 0 for call in calls),
                 "cache_read_tokens": sum(call.get("cache_read_tokens") or 0 for call in calls),
@@ -251,6 +266,321 @@ def failed_tool_time(tool_calls):
             entry["seconds"] += (call.get("duration_ms") or 0) / 1000
             entry["error_types"][call.get("error_type") or "ToolReturnedError"] += 1
     return [{"tool": tool, "calls": item["calls"], "seconds": round(item["seconds"], 1), "avg_seconds": round(item["seconds"] / item["calls"], 1), "error_types": dict(item["error_types"])} for tool, item in groups.items()]
+
+
+def seconds_of(value):
+    return when(value).timestamp() if value else None
+
+
+def step_rounds(units):
+    """Research round of each step: 0 for the plan, n for the supplements of the n-th gap round."""
+    by_id = {unit["id"]: unit for unit in units}
+
+    def depth(unit, seen=()):
+        if not unit.get("parent_gap_id"):
+            return 0
+        named = re.match(r"S(\d+)-", unit["id"])
+        if named:
+            return int(named.group(1))
+        parent = by_id.get((unit.get("depends_on") or [None])[0])
+        return 1 + (depth(parent, (*seen, unit["id"])) if parent and parent["id"] not in seen else 0)
+
+    return {unit["id"]: depth(unit) for unit in units}
+
+
+def tool_waits(model_calls, tool_calls):
+    """What failed tool calls cost on the clock rather than as a sum.
+
+    The tools of one turn run together and the model continues when the slowest
+    returns, so a single 35-second timeout holds a turn whose other calls took
+    two. Every batch is measured as it ran, and again with each failed call
+    answered in that tool's median successful time - what a working provider
+    would have cost. The difference is time a step spent waiting for nothing.
+    """
+    answered = defaultdict(list)
+    for call in tool_calls:
+        if call.get("status") == "success" and call.get("duration_ms"):
+            answered[call.get("tool_name")].append(call["duration_ms"] / 1000)
+    typical = {tool: sorted(values)[len(values) // 2] for tool, values in answered.items()}
+    turns = defaultdict(list)
+    for call in model_calls:
+        if call.get("execution_id") and call.get("ended_at"):
+            turns[call["execution_id"]].append(seconds_of(call["ended_at"]))
+    batches = defaultdict(lambda: defaultdict(list))
+    for call in tool_calls:
+        if call.get("execution_id") and call.get("started_at"):
+            start = seconds_of(call["started_at"])
+            turn = sum(1 for end in turns.get(call["execution_id"], ()) if end <= start)
+            batches[call["execution_id"]][turn].append((start, (call.get("duration_ms") or 0) / 1000, call))
+    rows = []
+    for execution, groups in batches.items():
+        waited = without = 0.0
+        delayed = failed = 0
+        for calls in groups.values():
+            begin = min(start for start, _, _ in calls)
+            actual = max(start + seconds for start, seconds, _ in calls) - begin
+            repaired = max(start + (min(seconds, typical.get(call.get("tool_name"), 0.0)) if call.get("status") == "error" else seconds) for start, seconds, call in calls) - begin
+            waited, without = waited + actual, without + repaired
+            delayed += actual - repaired >= 1
+            failed += sum(call.get("status") == "error" for _, _, call in calls)
+        first = next(iter(groups.values()))[0][2]
+        rows.append(
+            {
+                "execution_id": execution,
+                "node": node_of(first),
+                "unit_id": first.get("unit_id"),
+                "batches": len(groups),
+                "delayed_batches": delayed,
+                "failed_calls": failed,
+                "wait_seconds": round(waited, 1),
+                "wait_seconds_without_failures": round(without, 1),
+                "lost_seconds": round(waited - without, 1),
+            }
+        )
+    return sorted(rows, key=lambda row: -row["lost_seconds"])
+
+
+def finish_time(durations, slots):
+    """When the last of ``durations`` ends if they start in order on ``slots`` workers."""
+    free = [0.0] * max(1, slots)
+    for seconds in durations:
+        free.sort()
+        free[0] += seconds
+    return max(free)
+
+
+def research_rounds(data, waits, concurrency):
+    """Each research round (the plan, then every supplement round): what it cost and what it gave the report.
+
+    A supplement round is only worth its minutes if the report cites what it
+    found, so cost (time, tokens, tool calls) stands next to yield (findings,
+    cited evidence, sources first seen in that round).
+    """
+    run = data["run"]
+    units = run.get("units") or []
+    rounds = step_rounds(units)
+    lost = {row["unit_id"]: row["lost_seconds"] for row in waits if row["node"] == "research"}
+    results = {item["result"].get("unit_id"): item["result"] for item in data["unit_results"] if isinstance(item.get("result"), dict)}
+    spans = {}
+    for item in data["agent_runs"]:
+        if item.get("unit_id") in rounds and item.get("config_node") in (None, "research") and item.get("started_at"):
+            start, end = seconds_of(item["started_at"]), seconds_of(item.get("ended_at")) or seconds_of(item["started_at"]) + (item.get("duration_ms") or 0) / 1000
+            known = spans.get(item["unit_id"])
+            spans[item["unit_id"]] = (min(start, known[0]), max(end, known[1])) if known else (start, end)
+    citations = citation_rounds(run, data.get("evidence") or {}, rounds)
+    cited = cited_findings(units, results, rounds, citations)
+    rows = []
+    for number in sorted(set(rounds.values())):
+        members = [unit["id"] for unit in units if rounds[unit["id"]] == number]
+        calls = [call for call in data["model_calls"] if call.get("unit_id") in members]
+        tools = [call for call in data["tool_calls"] if call.get("unit_id") in members]
+        timed = sorted((spans[unit] for unit in members if unit in spans), key=lambda span: span[0])
+        ends = [seconds_of(call["ended_at"]) for call in calls if call.get("ended_at")]
+        wall = (max([end for _, end in timed] + ends) - timed[0][0]) if timed else None
+        ordered = sorted((unit for unit in members if unit in spans), key=lambda unit: spans[unit][0])
+        slots = concurrency or len(ordered) or 1
+        as_run = finish_time([spans[unit][1] - spans[unit][0] for unit in ordered], slots)
+        repaired = finish_time([max(0.0, spans[unit][1] - spans[unit][0] - lost.get(unit, 0.0)) for unit in ordered], slots)
+        rows.append(
+            {
+                "round": number,
+                "units": members,
+                "wall_seconds": round(wall, 1) if wall is not None else None,
+                # An estimate: the round replayed on the same number of workers without the waiting that failed calls caused.
+                "estimated_wall_seconds_without_failed_calls": round(wall * repaired / as_run, 1) if wall and as_run else None,
+                "model_calls": len(calls),
+                "input_tokens": sum(call.get("input_tokens") or 0 for call in calls),
+                "output_tokens": sum(call.get("output_tokens") or 0 for call in calls),
+                "cache_read_tokens": sum(call.get("cache_read_tokens") or 0 for call in calls),
+                "tool_calls": len(tools),
+                "tool_errors": sum(call.get("status") == "error" for call in tools),
+                "searches": sum(call.get("role") == "search" for call in tools),
+                "reads": sum(call.get("role") == "read" for call in tools),
+                "findings": sum(len(results.get(unit, {}).get("findings") or []) for unit in members),
+                "open_questions": sum(len(results.get(unit, {}).get("open_questions") or []) for unit in members),
+                "cited_findings": sum(cited[unit] for unit in members) if cited is not None else None,
+                "evidence_first_seen": citations["pool"].get(number, 0) if citations else None,
+                "cited_evidence_first_seen": citations["evidence"].get(number, 0) if citations else None,
+                "cited_sources_first_seen": citations["sources"].get(number, 0) if citations else None,
+            }
+        )
+    return rows
+
+
+def citation_rounds(run, evidence, rounds):
+    """The round that first saw each evidence record, for the pool and for what the report cites."""
+    marks = (run.get("report") or {}).get("citation_map") or {}
+    if not evidence or not marks:
+        return None
+    first = {}
+    for key, record in evidence.items():
+        seen = [rounds[unit] for unit in record.get("unit_ids") or [] if unit in rounds]
+        if seen:
+            first[key] = min(seen)
+    sources = {}
+    for key, number in marks.items():
+        if key in first:
+            sources[number] = min(first[key], sources.get(number, first[key]))
+    return {"pool": dict(Counter(first.values())), "evidence": dict(Counter(first[key] for key in marks if key in first)), "sources": dict(Counter(sources.values())), "cited_ids": sorted(key for key in marks if key in first)}
+
+
+def cited_findings(units, results, rounds, citations):
+    """Findings per step that the report cites, from the product's own evidence merge.
+
+    Findings point at a step's raw records; only the merge maps those to the
+    ids a report cites. The merge is deterministic (same ordered input, same
+    ids), so it is replayed round by round; ``None`` when it cannot be (records
+    the current contract rejects, another cycle's pool) rather than a guess.
+    """
+    if not citations:
+        return None
+    try:
+        from deepresearch.evidence import merge_results, valid_result
+
+        pool, findings = None, []
+        for number in sorted(set(rounds.values())):
+            batch = [valid_result(results[unit["id"]])[0] for unit in units if rounds[unit["id"]] <= number and unit["id"] in results]
+            pool, findings, _ = merge_results(batch, pool)
+        marked = set(citations["cited_ids"])
+        if not marked <= set(pool):
+            return None
+        counts = Counter(finding["unit_id"] for finding in findings if marked & set(finding["evidence_ids"]))
+        return {unit["id"]: counts.get(unit["id"], 0) for unit in units}
+    except Exception:  # noqa: BLE001 - an audit reports "not measured" instead of failing on a record it cannot replay
+        return None
+
+
+def phase_view(summary, tool_calls):
+    """Every workflow stage with its time, tokens and tool use side by side."""
+    metered = {row.get("key"): row for row in summary["breakdown"].get("by_phase") or []}
+    roles = defaultdict(Counter)
+    for call in tool_calls:
+        entry = roles[call.get("phase")]
+        entry[call.get("role") or "other"] += 1
+        entry[(call.get("role") or "other") + "_errors"] += call.get("status") == "error"
+    rows, seen = [], set()
+    for phase in summary["time"].get("phases") or []:
+        name = phase["phase"]
+        seen.add(name)
+        row = metered.get(name, {})
+        rows.append(
+            {
+                "phase": name,
+                "seconds": phase.get("seconds"),
+                "runs": phase.get("runs"),
+                "errors": phase.get("errors"),
+                "model_calls": row.get("model_calls") or 0,
+                "model_seconds": round((row.get("model_ms") or 0) / 1000, 1),
+                "input_tokens": row.get("input_tokens"),
+                "output_tokens": row.get("output_tokens"),
+                "cache_read_tokens": row.get("cache_read_tokens"),
+                "tool_calls": row.get("tool_calls") or 0,
+                "tool_errors": row.get("tool_errors") or 0,
+                "tool_seconds": round((row.get("tool_ms") or 0) / 1000, 1),
+                "searches": roles[name]["search"],
+                "failed_searches": roles[name]["search_errors"],
+                "reads": roles[name]["read"],
+                "failed_reads": roles[name]["read_errors"],
+            }
+        )
+    return rows
+
+
+def search_view(tool_calls):
+    """Searching and reading per step, and how long an answered and a failed search take."""
+    steps = defaultdict(Counter)
+    answered, failed = [], []
+    for call in tool_calls:
+        role, entry = call.get("role") or "other", steps[call.get("unit_id")]
+        entry[role] += 1
+        if call.get("status") == "error":
+            entry[role + "_errors"] += 1
+        if role == "search" and call.get("duration_ms"):
+            (failed if call.get("status") == "error" else answered).append(call["duration_ms"] / 1000)
+    edges = (2, 5, 10, 20, 30)
+    labels = ["<2s", "2–5s", "5–10s", "10–20s", "20–30s", "≥30s"]
+
+    def histogram(values):
+        counts = [0] * len(labels)
+        for value in values:
+            counts[sum(value >= edge for edge in edges)] += 1
+        return counts
+
+    def middle(values, part):
+        return round(sorted(values)[min(len(values) - 1, int(len(values) * part))], 1) if values else None
+
+    return {
+        "by_step": [{"unit_id": unit, "searches": entry["search"], "failed_searches": entry["search_errors"], "reads": entry["read"], "failed_reads": entry["read_errors"]} for unit, entry in steps.items()],
+        "latency_buckets": labels,
+        "answered_searches": histogram(answered),
+        "failed_searches": histogram(failed),
+        "answered_p50_seconds": middle(answered, 0.5),
+        "answered_p90_seconds": middle(answered, 0.9),
+    }
+
+
+def tool_log(tool_calls, origin):
+    """Every tool call in order: the page shows it per step, an auditor greps it."""
+    rows = []
+    for call in sorted(tool_calls, key=lambda item: item.get("started_at") or ""):
+        attempts = " ".join(f"{item.get('provider')}:{item.get('status')}" + (f"/{item['kind']}" if item.get("kind") else "") for item in call.get("attempts") or [])
+        rows.append(
+            {
+                "at": round(seconds_of(call["started_at"]) - origin, 1) if call.get("started_at") and origin else None,
+                "unit_id": call.get("unit_id"),
+                "tool": call.get("tool_name"),
+                "role": call.get("role"),
+                "status": call.get("status"),
+                "seconds": round((call.get("duration_ms") or 0) / 1000, 1),
+                "error_type": call.get("error_type"),
+                "attempts": attempts,
+                "target": " ".join(str(call.get("query") or call.get("url") or "").split())[:200],
+                "output_chars": call.get("output_chars"),
+            }
+        )
+    return rows
+
+
+def timeline(data, rounds, origin):
+    """Offsets in seconds from the run's creation: workflow stages, then every role with its model and tool calls."""
+    if not origin:
+        return None
+    stages = []
+    for span in data.get("spans") or []:
+        if span.get("kind") == "node" and span.get("at"):
+            end = seconds_of(span["at"]) - origin
+            stages.append({"name": span.get("name"), "start": round(end - (span.get("duration_ms") or 0) / 1000, 1), "end": round(end, 1), "status": span.get("status")})
+    models, tools = defaultdict(list), defaultdict(list)
+    for call in data["model_calls"]:
+        if call.get("execution_id") and call.get("started_at") and call.get("duration_ms"):
+            start = seconds_of(call["started_at"]) - origin
+            models[call["execution_id"]].append([round(start, 1), round(start + call["duration_ms"] / 1000, 1)])
+    for call in data["tool_calls"]:
+        if call.get("execution_id") and call.get("started_at"):
+            start = seconds_of(call["started_at"]) - origin
+            tools[call["execution_id"]].append([round(start, 1), round(start + (call.get("duration_ms") or 0) / 1000, 1), call.get("role") or "other", call.get("status") != "error"])
+    roles = []
+    for item in sorted(data["agent_runs"], key=lambda entry: entry.get("started_at") or ""):
+        if not item.get("started_at"):
+            continue
+        key = item.get("execution_id") or item.get("id")
+        start = seconds_of(item["started_at"]) - origin
+        end = seconds_of(item["ended_at"]) - origin if item.get("ended_at") else start + (item.get("duration_ms") or 0) / 1000
+        roles.append(
+            {
+                "execution_id": key,
+                "node": item.get("config_node"),
+                "unit_id": item.get("unit_id"),
+                "round": rounds.get(item.get("unit_id")),
+                "start": round(start, 1),
+                "end": round(end, 1),
+                "status": item.get("status"),
+                "model": models.get(key, []),
+                "tools": tools.get(key, []),
+            }
+        )
+    finish = max([stage["end"] for stage in stages] + [role["end"] for role in roles], default=0)
+    return {"origin": data["run"].get("created_at"), "end": round(finish, 1), "stages": sorted(stages, key=lambda stage: stage["start"]), "roles": roles}
 
 
 def repeat_calls(model_calls):
@@ -455,6 +785,17 @@ def settings_view(snapshot):
 # --------------------------------------------------------------------------
 # Findings: what deserves attention, with the setting that changes it
 # --------------------------------------------------------------------------
+def lost_on_the_clock(facts):
+    lost = round(sum(row["lost_seconds"] for row in facts.get("tool_waits") or []))
+    if lost < 30:
+        return ""
+    rounds = [row for row in facts.get("rounds") or [] if row.get("wall_seconds") and row.get("estimated_wall_seconds_without_failed_calls")]
+    text = f" 按每轮工具批次重算：各步骤合计多等了 {lost} 秒"
+    if rounds:
+        text += "；推算" + "、".join(f"第 {row['round']} 轮 {round(row['wall_seconds'])} → {round(row['estimated_wall_seconds_without_failed_calls'])} 秒" for row in rounds) + "（失败的调用按该工具成功调用的中位耗时返回）"
+    return text + "。"
+
+
 def findings(facts):
     summary, out = facts["summary"], []
 
@@ -557,7 +898,7 @@ def findings(facts):
                 "medium",
                 "failed-tool-time",
                 f"{row['tool']} 失败的 {row['calls']} 次调用花了 {row['seconds']} 秒（平均 {row['avg_seconds']} 秒/次）",
-                json.dumps(row["error_types"], ensure_ascii=False) + "；同一轮并行的其他工具即使早回来，也要等它。失败的搜索同样计入每步的 max_searches_per_unit。",
+                json.dumps(row["error_types"], ensure_ascii=False) + "；同一轮并行的其他工具即使早回来，也要等它。失败的搜索同样计入每步的 max_searches_per_unit。" + lost_on_the_clock(facts),
                 "平均耗时接近超时值说明是超时：在该数据源对应的供应商上设 timeout_seconds（sources[].providers[].timeout_seconds，默认 30；旧字段 tool_timeout_seconds 已不生效），并把更可靠的供应商排在前面。",
             )
     dead = [row for row in tools.get("by_provider") or [] if row.get("attempts", 0) >= 3 and not row.get("answered")]
@@ -598,6 +939,28 @@ def findings(facts):
             f"补研了 {len(supplements)} 个步骤，耗时约 {seconds} 秒",
             "触发原因：" + json.dumps(dict(codes), ensure_ascii=False),
             "慢模型下把 supplement_gap_codes 收到 [coverage, unsupported]，或把预算的 max_iterations 设为 0/1；open-questions 几乎总会触发。",
+        )
+        later = [row for row in facts.get("rounds") or [] if row["round"] > 0]
+        sources = sum(row["cited_sources_first_seen"] or 0 for row in facts.get("rounds") or [])
+        if later and sources and all(row["cited_sources_first_seen"] is not None for row in later):
+            gained, wall = sum(row["cited_sources_first_seen"] for row in later), sum(row["wall_seconds"] or 0 for row in later)
+            share = wall / (time.get("active_seconds") or wall or 1)
+            add(
+                "medium" if share >= 0.25 and gained / sources < 0.5 * share else "info",
+                "supplement-yield",
+                f"补研轮用了 {round(wall)} 秒（活跃时长的 {share:.0%}），报告引用的来源里 {gained}/{sources} 个是补研轮才第一次读到的",
+                "；".join(f"第 {row['round']} 轮：发现 {row['findings']} 条（被引用 {fmt(row['cited_findings'])}），未解问题 {row['open_questions']} 条，被引用的新证据 {row['cited_evidence_first_seen']} 条" for row in facts["rounds"]),
+                "产出占比远低于时间占比时补研不值：收紧 supplement_gap_codes。产出相当时它是篇幅换时间的选择。未解问题补研后没有减少，说明补研在追研究员自己列的问题，不一定是用户要的内容——对照请求检查报告是否真的交付了（见 references/audit-report.md）。",
+            )
+    cap = (facts.get("settings") or {}).get("max_findings_per_unit")
+    capped = [unit["unit_id"] for unit in proc["units"] if cap and unit["findings"] >= cap]
+    if cap and len(capped) >= max(2, len(proc["units"]) // 2):
+        add(
+            "low",
+            "findings-capped",
+            f"{len(capped)}/{len(proc['units'])} 个步骤的发现数顶到了 max_findings_per_unit={cap}",
+            "、".join(capped[:8]),
+            "上限生效时，笔记里多出来的结论不会交给写作。打开该步最后一轮研究调用和对应的 conversion 调用，对比笔记与发现；“逐项对比”这类每项一条结论的请求需要更大的上限，或把步骤拆细。",
         )
     stopped = [unit for unit in proc["units"] if unit["stop_reason"]]
     starved = [unit for unit in stopped if unit["stop_reason"] == "token_capped" and not unit["findings"]]
@@ -702,10 +1065,18 @@ def build(database, run_id, data):
         "repeat_calls": repeat_calls(data["model_calls"]),
         "admission_waits": admission_waits(data["agent_runs"], data["model_calls"]),
         "failed_tool_time": failed_tool_time(data["tool_calls"]),
+        "tool_waits": tool_waits(data["model_calls"], data["tool_calls"]),
+        "phases": phase_view(summary, data["tool_calls"]),
+        "search": search_view(data["tool_calls"]),
         "prompt_cache": {"prefix_breaks": prefix_breaks(database, run_id, records)},
         "process": process(data),
         "_model_calls": data["model_calls"],
     }
+    origin = seconds_of(run.get("created_at"))
+    concurrency = (facts["settings"] or {}).get("max_concurrency") or summary["agents"].get("max_parallel")
+    facts["rounds"] = research_rounds(data, facts["tool_waits"], concurrency)
+    facts["timeline"] = timeline(data, step_rounds(run.get("units") or []), origin)
+    facts["tool_log"] = tool_log(data["tool_calls"], origin)
     loops = [row for row in facts["threads"] if row["turns_checked"]]
     facts["prompt_cache"]["provider_check"] = {"turns_checked": sum(row["turns_checked"] for row in loops), "turns_served_from_cache": sum(row["turns_served_from_cache"] for row in loops)}
     facts["findings"] = findings(facts)
@@ -761,7 +1132,29 @@ def render(facts, baseline=None):
     parts += ["## 2. 时间去哪了", ""]
     parts.append(table(["总时长", "活跃", "等待(用户/停机)", "模型", "工具", "排队"], [[fmt(time.get(key), "s") for key in ("wall_seconds", "active_seconds", "waiting_seconds", "model_seconds", "tool_seconds", "queue_seconds")]]))
     parts += ["", "模型、工具时长是各调用之和，并行时会超过活跃时长。", "", "按阶段：", ""]
-    parts.append(table(["阶段", "秒", "次数", "错误"], [[phase["phase"], fmt(phase["seconds"]), phase.get("runs"), phase.get("errors")] for phase in time.get("phases", [])]))
+    parts.append(
+        table(
+            ["阶段", "秒", "次数", "错误", "模型调用", "模型秒", "输入", "输出", "缓存命中", "工具调用", "工具错误", "搜索(失败)", "阅读(失败)"],
+            [
+                [
+                    row["phase"],
+                    fmt(row["seconds"]),
+                    row.get("runs"),
+                    row.get("errors"),
+                    row["model_calls"],
+                    fmt(row["model_seconds"]),
+                    fmt(row["input_tokens"]),
+                    fmt(row["output_tokens"]),
+                    pct(ratio(row["cache_read_tokens"] or 0, row["input_tokens"])) if row["input_tokens"] else "—",
+                    row["tool_calls"],
+                    row["tool_errors"],
+                    f"{row['searches']}({row['failed_searches']})",
+                    f"{row['reads']}({row['failed_reads']})",
+                ]
+                for row in facts["phases"]
+            ],
+        )
+    )
     parts += ["", "按节点：", ""]
     speed = {row["node"]: row for row in facts["output_speed"]}
     parts.append(
@@ -916,6 +1309,20 @@ def render(facts, baseline=None):
         parts += ["", "失败的工具调用耗时：" + "；".join(f"{row['tool']} {row['calls']} 次 / {row['seconds']} 秒（平均 {row['avg_seconds']} 秒）" for row in facts["failed_tool_time"])]
     if tools.get("failing_domains"):
         parts += ["", "读取失败最多的站点：" + json.dumps(tools["failing_domains"], ensure_ascii=False)]
+    search = facts["search"]
+    parts += ["", f"搜索耗时分布（成功 P50 {fmt(search['answered_p50_seconds'], 's')} / P90 {fmt(search['answered_p90_seconds'], 's')}）：", ""]
+    parts.append(table(["", *search["latency_buckets"]], [["成功", *search["answered_searches"]], ["失败", *search["failed_searches"]]]))
+    waits = [row for row in facts["tool_waits"] if row["node"] == "research"]
+    if waits:
+        parts += [
+            "",
+            "等工具的时间（一轮里并行的工具要等最慢的一个；“去掉失败”把失败的调用换成该工具成功调用的中位耗时，差值就是白等的时间）：",
+            "",
+            table(
+                ["步骤", "工具批次", "被失败拖住的批次", "失败调用", "等工具秒", "去掉失败后", "白等秒"],
+                [[row["unit_id"] or "", row["batches"], row["delayed_batches"], row["failed_calls"], row["wait_seconds"], row["wait_seconds_without_failures"], row["lost_seconds"]] for row in waits],
+            ),
+        ]
     parts.append("")
 
     parts += ["## 6. 研究与写作过程", ""]
@@ -937,6 +1344,37 @@ def render(facts, baseline=None):
             ],
         ),
     ]
+    if facts.get("rounds"):
+        parts += [
+            "",
+            "研究轮次的成本与产出（第 0 轮是计划的步骤，之后每轮是一次补研；“首次读到”按证据第一次出现的轮次归属，“推算”是去掉失败调用造成的等待后按同样并发重排的时长）：",
+            "",
+            table(
+                ["轮", "步骤", "墙钟秒", "推算(无失败调用)", "模型调用", "输入", "输出", "命中率", "工具(错误)", "搜索", "阅读", "发现", "被引用的发现", "未解问题", "首次读到的证据", "其中被引用", "首次读到的引用来源"],
+                [
+                    [
+                        row["round"],
+                        len(row["units"]),
+                        fmt(row["wall_seconds"]),
+                        fmt(row["estimated_wall_seconds_without_failed_calls"]),
+                        row["model_calls"],
+                        fmt(row["input_tokens"]),
+                        fmt(row["output_tokens"]),
+                        pct(ratio(row["cache_read_tokens"], row["input_tokens"])),
+                        f"{row['tool_calls']}({row['tool_errors']})",
+                        row["searches"],
+                        row["reads"],
+                        row["findings"],
+                        fmt(row["cited_findings"]),
+                        row["open_questions"],
+                        fmt(row["evidence_first_seen"]),
+                        fmt(row["cited_evidence_first_seen"]),
+                        fmt(row["cited_sources_first_seen"]),
+                    ]
+                    for row in facts["rounds"]
+                ],
+            ),
+        ]
     waits = [row for row in facts["admission_waits"] if row["wait_seconds"] >= 5]
     if waits:
         parts += ["", "引擎准入排队（角色提交到第一次模型调用之间；已包含在上表的秒数里）：" + "；".join(f"{row['unit_id']} {row['wait_seconds']}s" for row in waits[:12])]
@@ -1118,6 +1556,7 @@ def main(argv=None):
     parser.add_argument("--data-dir", action="append", default=[], help="Directory (or research.sqlite3) to search; default: every store under <repo>/.deerflow/deepresearch")
     parser.add_argument("--config", type=Path, help="Research YAML whose pricing is used for cost estimates")
     parser.add_argument("--out", type=Path, help="Output directory (default: <repo>/.deerflow/deepresearch/audits, which git ignores)")
+    parser.add_argument("--report", type=Path, help="The written audit report (Markdown) to show at the top of the HTML page (default: 审计报告-<run8>.md in the output directory, when it exists)")
     parser.add_argument("--repo", type=Path, help="Repository root, when it cannot be found from the script or the working directory")
     parser.add_argument("--list", action="store_true", help="List the runs in the discovered stores and exit")
     args = parser.parse_args(argv)
@@ -1159,8 +1598,20 @@ def main(argv=None):
     name = "audit-" + facts["identity"]["run_id"][:8]
     (out / f"{name}.json").write_text(json.dumps({"run": facts, "baseline": baseline}, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
     (out / f"{name}.md").write_text(render(facts, baseline), encoding="utf-8")
+    # The page shows the same facts; the auditor's written report, once it exists, leads it.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    previous, sys.dont_write_bytecode = sys.dont_write_bytecode, True  # also when this module was imported rather than run
+    try:
+        from audit_html import render_html
+    finally:
+        sys.dont_write_bytecode = previous
+
+    written = args.report or out / f"审计报告-{facts['identity']['run_id'][:8]}.md"
+    report = written.read_text(encoding="utf-8") if written.is_file() else None
+    (out / f"{name}.html").write_text(render_html(facts, baseline, compare(baseline, facts) if baseline else None, report), encoding="utf-8")
     print(f"facts : {out / (name + '.json')}")
     print(f"sheet : {out / (name + '.md')}")
+    print(f"page  : {out / (name + '.html')}" + ("" if report else f"  (write {written.name} next to it and run again to put the conclusions on the page)"))
     print(f"status: {facts['identity']['status']} · findings: " + (", ".join(f"{item['severity']}:{item['code']}" for item in facts["findings"]) or "none"))
     return 0
 

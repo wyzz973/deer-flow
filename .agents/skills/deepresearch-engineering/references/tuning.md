@@ -11,7 +11,9 @@
 | 模型秒占大头，输入 Token 巨大、命中率低 | prefill | “上下文与缓存”一节 |
 | 底稿有 `engine-queue`：步骤的第一次模型调用比它的开始晚几十秒到几分钟 | 引擎准入排队 | 引擎配置的 `subagent_runtime.max_running`（宿主默认 3）小于研究的并发。调到不小于 `max(max_concurrency, writer_concurrency)` 并重启网关；等过 `queue_timeout_seconds`（默认 300）的角色会直接失败。这段等待不在“排队秒”里。`python -m deepresearch.doctor` 会报告不匹配；验收启动器会自动抬高它 |
 | 排队秒高（研究侧） | 并发不够 | `max_concurrency`、`writer_concurrency`（模型服务与检索供应商扛得住才调；并发越高，免费搜索越容易被限流） |
-| 步骤多、补研多 | 工作量本身 | “工作量”一节 |
+| 步骤多、补研多 | 工作量本身 | “工作量”一节。补研值不值看底稿的 `supplement-yield`：补研轮的时间占比对比它带来的被引用来源占比 |
+| `failed-tool-time` 里“各步骤合计多等了 N 秒” | 失败的工具调用（多数是超时）拖住了整轮 | “检索”一节；底稿给出去掉它们后每轮大约多久 |
+| `findings-capped`：多数步骤的发现数等于 `max_findings_per_unit` | 交给写作的结论被上限截断 | “逐项对比”类请求调大 `max_findings_per_unit`，或在计划里把步骤拆细 |
 | 重试、修复、截断多 | 返工 | “返工”一节 |
 
 ## 工作量

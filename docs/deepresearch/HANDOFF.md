@@ -343,6 +343,9 @@ observations / report_policy / prompts / store 预算 / service 驱动），三�
   - `scripts/audit_run.py --run <id|前缀|页面 URL|thread|latest> [--baseline <run>]`：从研究库生成审计底稿（时间、Token、Agent 循环的上下文增长、
     提示词缓存的供应商逐轮核对与前缀断点、工具与供应商、引擎准入排队、失败工具调用的耗时、补研与重做调用、规则发现及对应设置）；
     带 `--baseline` 时另给两次运行的设置差异、指标对比、同一问题其他运行的自然波动。数字来自产品自己的 `metrics.collect`。
+    同一份事实输出三种形态：`audit-<run8>.md`（底稿）、`.json`、`.html`（`scripts/audit_html.py` 渲染的单文件离线页面：时间线、各阶段 / 节点 / 步骤的时间、Token、
+    工具与搜索情况，逐条工具调用可筛选；同目录有 `审计报告-<run8>.md` 时结论显示在页面顶部）。2026-09-20 增加两项分析：失败工具调用在时钟上的代价
+    （按每轮并行批次重算，推算每轮研究去掉失败调用后的时长）、每个研究轮次的成本与产出（补研轮第一次读到的证据有多少被报告引用）。
   - `scripts/show_call.py`：列出并打开任意一次模型调用（默认只显示相对上一轮新增的消息）、导出成可重放的 Chat Completions 请求体、`--tools` 列出工具调用与各供应商的尝试。
   - 两个脚本经只读连接读库（不拿写锁、不建表、不写字节码），输出默认写到已被 git 忽略的 `.deerflow/deepresearch/audits/`。
     `tests/deepresearch/test_audit_skill.py` 用合成研究库跑它们并断言库文件一个字节不变：改表、记录字段或指标键时要连脚本一起改。
@@ -828,7 +831,7 @@ python3 ../scripts/pnpm.py test    # 1363 passed（新增 32 条：llm-calls / s
 ## 10. 文档索引
 
 - 接手、调试、测试与**运行审计**的技能：[`.agents/skills/deepresearch-engineering/`](../../.agents/skills/deepresearch-engineering/SKILL.md)。
-  `scripts/audit_run.py --run <id|URL|latest> [--baseline <run>]` 从研究数据库生成审计底稿（时间、Token、缓存、工具、补研与修复、规则发现与对应设置），
+  `scripts/audit_run.py --run <id|URL|latest> [--baseline <run>]` 从研究数据库生成审计底稿和一张离线 HTML 页面（时间线、各阶段的时间 / Token / 工具与搜索、缓存、补研轮的成本与产出、规则发现与对应设置），
   `scripts/show_call.py` 打开或重放一次模型调用；审计报告模板与读数陷阱在 `references/audit-report.md`。
 
 | 文档 | 状态与用途 |
