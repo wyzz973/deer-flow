@@ -1,6 +1,6 @@
 # DeepResearch 交接文档
 
-更新时间：2026-09-19。本文面向继续开发本项目的工程师或 Agent，记录当前状态、验收证据、运行方式、
+更新时间：2026-09-21。本文面向继续开发本项目的工程师或 Agent，记录当前状态、验收证据、运行方式、
 风险和下一步。架构与工作流细节见 [ARCHITECTURE.md](ARCHITECTURE.md)，接口契约见 [API.md](API.md)。
 本文不是产品宣传，也不是全量安全认证。
 
@@ -16,7 +16,7 @@
 | 更早的基线 | `5fa0299c` `feat(deepresearch): unify native research chat and harden workflow recovery` |
 | 功能状态 | 交互、工作流、报告与前端改造完成；五次真实 DeepSeek 研究端到端完成；配置与 DeerFlow 解耦（研究自己的模型、数据源与供应商故障切换、MCP、角色、提示词、上下文压缩）、请求改写节点、设置页、LLM 调用审计均已完成并真实验收 |
 | 离线开发 | 不联网的本地 Agent 从 [OFFLINE_AGENT_GUIDE.md](OFFLINE_AGENT_GUIDE.md) 开始；配置见 [MODEL_CONFIGURATION.md](MODEL_CONFIGURATION.md)、[DEERFLOW_CONFIGURATION.md](DEERFLOW_CONFIGURATION.md)、[RESEARCH_CONFIGURATION.md](RESEARCH_CONFIGURATION.md)；模板在 `examples/deepresearch/offline/` |
-| 最近一轮 | 2026-09-19：全模块代码审查与修复、按节点调参、仅 MCP / 无原文研究、模型网关兼容、时间预算收尾，见第 3.6 节与第 4 节末尾 |
+| 最近一轮 | 2026-09-21：直接暴露的 MCP 工具读到的页面可被引用（修复只用 MCP 检索时的 `NO_EVIDENCE`，第 3.7 节）；研究步骤接续调度与编辑计划时保留依赖（第 3.8 节）；运行审计的离线 HTML 页面与两项新分析（第 3.6 节技能部分）。此前 2026-09-19：全模块代码审查与修复、按节点调参、仅 MCP / 无原文研究、模型网关兼容、时间预算收尾，见第 3.6 节与第 4 节末尾 |
 | 本次回归 | 见第 6 节 |
 | 未验证 | 干净克隆部署、生产构建、目标环境的 MCP 与 SSO、真实手机视口、报告事实逐条核验；远端 CI 以 GitHub Actions 结果为准 |
 
@@ -365,6 +365,67 @@ observations / report_policy / prompts / store 预算 / service 驱动），三�
      `API.md` 的创建示例原来写的正是会失败的那组小预算，已加说明。
   4. `metrics.summarize` 里 `status` 被供应商循环的局部变量覆盖，汇总与 `python -m deepresearch.metrics` 的 status 列把已完成的运行显示成 `cache` / `ok`。已改名并加测试。
 
+## 3.7 本轮完成的工作（2026-09-21）：直接暴露的 MCP 工具读到的页面可以被引用
+
+**现象（用户在只有 MCP 工具的环境里遇到）**：研究员检索、读取都正常，研究结束时报 `NO_EVIDENCE`“研究没有取得任何有可引用证据支持的发现”。
+
+**根因**：`kind: mcp` 的数据源把 MCP 工具原样交给模型，工具不会产出我们自己的 `deerflow.web_page.v1` 等 artifact。`observations.py` 只认这些 artifact，
+于是 MCP 读取工具打开的页面只剩一条匿名的整段工具输出，页面里的链接降级成“发现的来源”（不可引用）。整段输出按 `role: read` 本来可引用，
+但转换节点看到的条目只有 `{raw_id, receipt_id, tool_call_id, tool_name, origin}`，**没有地址也没有标题**；研究笔记按 URL 引用页面，对不上。
+强模型按调用顺序猜（同题真实运行 `956c1ae2`：能完成，但 21 条引用都没有链接，16 条带数字的结论里 5 条引用的证据里找不到这些数字）；
+弱一些的模型猜出不存在的 ID，结论被逐条裁掉（`research.output.pruned`），全部裁完就是 `NO_EVIDENCE`。
+
+**修复**（模型看到的工具 schema 与返回都不变，证据在执行后识别）：
+
+- `sources.opened_pages`：`role: read` 的直通工具，被打开的地址取自**调用自己的参数**（`url`/`uri`/`link`/`urls`，或任何取值为绝对 URL 的参数），
+  标题与正文用 `extract.document` 从返回里找；登记为 `fetched_document`，引用带地址。一次打开多个 URL 时逐页登记；按文档 ID 打开的内部文档
+  以 `mcp://<数据源>/<ID>` 标识，读几次都是一条引用；少于 40 字符的返回不算页面（与供应商路径的 `_page` 一致）。
+- `role: search` / `data` 的直通工具：结构化返回按形状逐条成为记录（`extract.records(from_text=False)`）；记录覆盖了答案 ≥80% 的文字时只引用记录，
+  否则整段返回仍可引用（形状只识别了一部分、正文被截断时不丢内容）。纯文本返回里的链接仍是“发现的来源”。
+- `extract.py`：穿透适配层和服务端的包装（真实运行里发现 MCP 适配层把字符串答案包成 `structured_content: {"result": "<JSON 字符串>"}`，标题与正文在两层之下）；
+  `document()` 多返回 `readable`；供应商路径（`providers.mcp`）原来会在这种情况下拿转义后的 JSON 当页面正文，一并修了；
+  中文片段按信息量计长（25 个汉字的句子不再被当成标签丢掉）；补了几个常见字段名（`desc`、`passage`、`page_content`、`web_url`、`doc_url`）。
+- 转换节点看到的整段输出条目带上标题（“数据源名: 查询词”）；引用摘录的核对同时对照页面自己的正文（JSON 里的同一句话是转义的，永远对不上）。
+- 技能：审计规则 `findings-pruned`，`references/debugging.md` 的 `NO_EVIDENCE` 定位路径。
+
+**验证**：`tests/deepresearch/test_mcp_passthrough.py`（12 项：Markdown / 转义 JSON 信封 / 适配层包装 / 内容块 / 部分正文 / 多 URL / 文档 ID / 搜索记录 / 无标题片段 / 引用摘录 /
+端到端 `runner.research`，端到端那项在修复前得到 0 条发现）。真实运行：MCP 桩新增直通的 `find_pages` + `open_page`（`research-overlay-passthrough.yaml`），
+同题、同模型，旧代码（临时 worktree）与新代码各一次：
+
+| | 旧代码 `956c1ae2` | 新代码 `1d8426f7` |
+| --- | --- | --- |
+| 状态 | COMPLETED（强模型靠调用顺序猜） | COMPLETED |
+| 引用 / 带链接 | 21 / 0，标题是“mcp-fetch: <url>” | 14 / 14，标题是页面标题 |
+| 引用的证据类型 | `tool_output`（转义 JSON 原文） | `fetched_document`（可读正文） |
+| 带数字的结论里，引用的证据不含这些数字 | 5 / 16 | 1 / 17 |
+
+只有 MCP 搜索、没有读取工具（`489c56b1`）：COMPLETED，16 条引用里 10 条是带标题和链接的单条结果（此后加了“记录覆盖答案则只引用记录”，未再真实复跑）。
+没有在浏览器里看这几份报告；用户环境里的弱模型上的 `NO_EVIDENCE` 是由单测复现的，真实运行复现的是同一根因在强模型上的表现。
+
+## 3.8 本轮完成的工作（2026-09-21）：研究步骤接续调度
+
+**现象（用户反馈）**：并发设为 3、计划 5 步，前两步完成后只剩一步在跑，剩下两步却要等它结束才开始。
+
+**根因**：`workflow.dispatch` 按“波次”调度——把当前依赖已满足的步骤一次 `gather`，整波结束后才计算下一波。计划里没有依赖时 5 步同时入队、
+由信号量放行，接续是正常的；只要有步骤带 `depends_on`（规划器有时会给，本机 45 次多步骤运行里 5 次），它就得等当前整波里最慢的那个，
+哪怕它依赖的步骤早就完成了。旧运行 `8b16f9ef` 里 `type-and-format` 只依赖 100 秒时完成的 `rules-coverage`，却在整波结束后的 115 秒才开始。
+
+**修复**：改成逐个完成逐个调度（`asyncio.wait(FIRST_COMPLETED)`）：步骤在依赖都结束且有空位时立刻开始，并发上限仍由信号量保证。失败语义保持原样，
+只是从“按波判断”改成“按运行判断”：单个步骤失败且已有步骤成功（或已有发现）→ 立刻降级为占位结果，依赖它的步骤继续；能跑的全部失败且一无所获 → 运行失败、
+重试时重跑；全部是预算收尾类错误 → 继续写报告；致命错误 → 不再启动新步骤，等运行中的步骤结束（结果已持久化）后失败。提前退出（取消、停止、存储错误）时
+取消并等待所有在跑的步骤真正结束，保持原来 `gather` 的 drain 语义。
+
+**验证**：`test_workflow.py` 新增 3 项（接续调度在修复前超时失败；失败步骤之后的接续；致命错误不再启动新步骤且已完成的不重跑），全量连跑 8 次无偶发失败。
+真实运行 `062ec4f8`（MCP 桩，5 步、3 并发，规划器给出第 4、5 步依赖第 1、2 步）：`cost-comparison` 在 `quota-sla` 完成的同一时刻（23.3 秒）开始，
+此时另两步还在运行（23.8 / 25.8 秒结束）；`onboarding-guide` 在它依赖的 `scaling-migration` 完成时（25.8 秒）开始。各步时长接近，差距只有 2.5 秒，但事件顺序是确定的。
+
+**顺带发现并已修复：编辑计划时手工加的依赖被丢掉。** `POST /plan/edit` 提交的计划要经规划模型规范化，而规划提示词要求“尽量不要依赖”，模型把用户加的
+`depends_on` 全删了（真实运行 `a2570913`：v2 计划的依赖为空）。步骤之间谁依赖谁是用户的决定，不该重新规划：`runner.keep_declared_dependencies` 在规范化之后
+按步骤 ID 把用户声明的依赖放回去（被删掉的步骤上的依赖随它一起去掉；放回后若成环则保留模型的结果），规划提示词第 7 条也补了“完整计划且没有 revision 时保留
+units、id、顺序与 depends_on”。用文字提的修改（`revision`）仍由模型决定。只有结构化 API 客户端走这条路，页面用的是 `plan/pause` + 消息。
+真实验证 `de4e545c`：编辑后 v2 为 `cost-model ← quota-sla`、`security-baseline ← scale-out`；运行中 `security-baseline` 在 `scale-out` 完成的同一时刻（25.3 秒）开始，
+此时 `quota-sla` 还要再跑 7 秒（32.2 秒结束，`cost-model` 随即开始）。这也是接续调度更清楚的一次实证。
+
 ## 4. 真实验收
 
 使用 DeepSeek `deepseek-v4-flash`、原生 `web_search` / `web_fetch`（Jina 无 key 模式），非演示 Runner。
@@ -677,6 +738,22 @@ DEEPRESEARCH_E2E_FRONTEND_PORT=3200 DEEPRESEARCH_E2E_REUSE_BACKEND=1 DEEPRESEARC
 未运行：`make test-blocking-io`、`make test-live`、前端生产构建。远端 CI 结果见 GitHub Actions 的 “DeepResearch full-stack checks”。单元测试使用伪造提供方，只证明适配与生命周期行为，
 不能代替真实研究与浏览器验收。
 
+### 2026-09-21 回归
+
+从 `backend/`（改动只涉及 `backend/deepresearch`、`tests/deepresearch`、技能脚本、MCP 桩与文档；前端没有改动，未重跑前端）：
+
+```sh
+uv run --no-sync python -m pytest ../tests/deepresearch -q        # 281 passed（新增 test_mcp_passthrough.py 12 项、test_workflow.py 3 项、test_runner.py 1 项、test_audit_skill.py 3 项；全量连跑 8 次无偶发失败）
+uv run --no-sync python -m pytest ../tests/deepresearch tests/test_subagent_executor.py tests/test_summarization_middleware.py \
+  tests/test_context_compaction.py tests/test_web_fetch_paging.py -q   # 494 passed
+uv run --no-sync python -m pytest tests/test_agent_guidance_check.py -q   # 11 passed、1 failed：仍是 subagents/AGENTS.md 41,088 > 40,960 的宿主已有问题
+uv run --no-sync ruff check deepresearch ../tests/deepresearch ../.agents/skills/deepresearch-engineering/scripts
+uv run --no-sync ruff format --check deepresearch ../tests/deepresearch ../.agents/skills/deepresearch-engineering/scripts ../examples/deepresearch/mcp-stub
+```
+
+真实运行（MCP 桩 + `deepseek-v4-flash`，不限预算）：`956c1ae2`（旧代码对照）、`1d8426f7`、`489c56b1`、`062ec4f8`、`de4e545c`，结论见第 3.7、3.8 节。
+旧代码对照是在临时 `git worktree`（HEAD）里起的网关，用完已删除。审计页面在浏览器里看过浅色、深色与 390px 宽度；这几份研究报告本身只核对了接口返回，没有在浏览器里看。
+
 ### 2026-09-19 回归
 
 从 `backend/`：
@@ -783,8 +860,17 @@ python3 ../scripts/pnpm.py test    # 1363 passed（新增 32 条：llm-calls / s
 - `kind: mcp` 直挂数据源的引用仍是“整次调用一条证据”，标题为“数据源名: 查询词”；要逐条引用需用 `type: mcp` 供应商。
 - 前端的 ChatGPT 对标改造依据的是截图量取值（ChatGPT 的卡片渲染在跨域 iframe 里，读不到计算样式），圆环缓动、spinner 转速等动效参数是近似值。
 
+- **直接暴露的 MCP 工具（第 3.7 节）**：弱模型上的 `NO_EVIDENCE` 是由单元测试复现的，真实运行复现的是同一根因在强模型上的表现（按调用顺序猜、归属错误）；
+  没有在用户的内网 MCP 上验证。识别靠形状：一次打开多个 URL 而返回是纯文本时识别不出逐页内容，整段返回仍可引用但没有链接；读取工具的地址参数若既不是 URL 也不在
+  常见 ID 参数名里，取第一个字符串参数当标识。`role` 填错（把能打开原文的工具填成 `search`）时，读到的内容只是“发现”，这一点程序不替用户判断。
+  “记录覆盖答案 ≥80% 则只引用记录”加在最后一次真实运行之后，只有单元测试。
+- **规划提示词默认值改了一句**（第 7 条）。旧运行的审计里 `prompts_differing_from_current_defaults` 会出现 `plan`，不代表用户改过提示词。
+- **依赖中的步骤在页面上没有“等待某步骤”的状态**，只显示为未开始；接续调度后等待变短，但被依赖的步骤很慢时用户仍看不出它在等谁。
+
 ## 8. 建议下一步
 
+0a. 在内网用真实 MCP 复验第 3.7 节：数据源的 `role` 如实填写后跑一次研究，用技能的 `audit_run.py` 看有没有 `findings-pruned`，
+   打开 conversion 调用确认 `observed_calls` 里读取的页面带 `url` 与 `title`；遇到识别不了的返回形状，把脱敏后的样例加进 `test_mcp_passthrough.py` 再改 `extract.py`。
 0. 用真实的模型网关与内部 MCP 跑一次完整研究：先 `python -m deepresearch.doctor --probe-model <模型> --probe-mcp`
    （看 `json_contract`、`usage`、输出速度与 MCP 工具清单），再按“指标 → 按节点”里的被截断、格式重试与 P95 延迟调 `nodes`；
    很慢时依次尝试：`supplement_gap_codes: [coverage, unsupported]`、`plan_max_units` 3–4、`report_length_scale` 0.5、关闭 `nodes.summary` / `nodes.rewrite`。
@@ -822,6 +908,11 @@ python3 ../scripts/pnpm.py test    # 1363 passed（新增 32 条：llm-calls / s
 - 不要在运行中的角色对话里"往前面插消息"或改写已有消息（包括打开 `tool_receipt_ledger`、在系统提示词里放日期/预算/计数）：
   供应商只复用从第一个 token 起相同的前缀，开头变一个字后面全部重算。改了请求构造后看指标里的"可复用前缀"，研究节点应在 80% 以上。
 - 任务载荷里新增字段时按"所有调用相同 → 本次运行相同 → 只有本次调用才有 → 每次都变的计数"的顺序放，不要随手加在最前面。
+- 不要把研究步骤改回“按波次”调度（对一批就绪步骤 `gather`）：带依赖的步骤会等整波里最慢的那个，空着的并发位白白闲置。现在是完成一个调度一个，
+  失败判断按整次运行做；提前退出时必须取消并等待在跑的步骤（drain），不要只 `cancel()` 不 `await`。
+- 直接暴露的工具（`kind: mcp`、宿主工具）**模型看到的 schema 与返回一律不改**；证据在执行后从调用参数和返回里识别（`sources.opened_pages`、`extract.records`）。
+  页面地址只取自调用自己的参数，不取自模型的笔记，也不猜。新增返回形状时改 `extract.py` 并加测试，不要在 `observations.py` 里写某个服务的字段名。
+- 写并发相关的测试不要断言“谁先结束”：步骤在到达 `runner.research` 之前有几次存储 await，顺序不确定。用事件让慢步骤等到“该发生的事发生了”再结束，断言它看到的状态。
 - 指标中的 `null` 表示没有测量，不要当成 0 汇总；新增指标时，历史数据缺字段也要返回 `null`。
 - `request_key`、`error_type` 只用于统计分组，不要据此改变研究流程；`request_key` 是脱敏后参数的哈希，不要改成保存参数原文。
 - 指标写入必须吞掉自身异常，只记日志；不要让观测代码的故障让研究失败。

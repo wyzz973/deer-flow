@@ -246,55 +246,86 @@ def build_workflow(settings, store, runner, checkpointer):
                     await store.mutate(run["run_id"], lambda r: r["unit_statuses"].update({unit.id: "FAILED"}))
                     raise
 
+        def fatal_error(error):
+            # Storage failures are infrastructure, not a research step.
+            if not isinstance(error, Exception) or isinstance(error, (OSError, sqlite3.Error)):
+                return True
+            return isinstance(error, ResearchError) and error.code in FATAL_UNIT_ERRORS
+
+        async def disclose(unit, error):
+            """A failed step becomes a stated gap, so steps that build on it and the report can go on."""
+            cycle = run.get("cycle", 0)
+            committed = await store.unit(run["run_id"], f"{cycle}:{unit.id}", digest(unit.model_dump(mode="json")))
+            if committed is not None:
+                # The research committed before a later bookkeeping error.
+                results[unit.id] = committed
+                await store.mutate(run["run_id"], lambda r, uid=unit.id: r["unit_statuses"].update({uid: "COMPLETED"}))
+                await store.event(run["run_id"], "research.unit.completed", completion(run, unit, committed), key=f"unit-done-{cycle}-{unit.id}")
+                return
+            # Never persist a free-form exception text: it may echo credentials.
+            code = error.code if isinstance(error, ResearchError) else "EXECUTION_FAILED"
+            placeholder = ResearchResult(unit_id=unit.id, confidence=0, limitations=[f"研究步骤“{unit.title or unit.id}”未能完成（{code}），相关内容可能不完整。"]).model_dump(mode="json")
+            await store.mutate(run["run_id"], lambda r, uid=unit.id, value=code: r.setdefault("unit_failures", {}).update({uid: value}))
+            await store.save_unit(run["run_id"], f"{cycle}:{unit.id}", digest(unit.model_dump(mode="json")), placeholder)
+            await store.event(run["run_id"], "research.unit.failed", {"unit_id": unit.id, "title": unit.title, "code": code, "cycle": cycle}, key=f"unit-failed-{cycle}-{unit.id}")
+            results[unit.id] = placeholder
+
+        # A step starts as soon as what it needs is done and a slot is free. Steps
+        # used to run in waves (everything ready now, then everything that became
+        # ready): with three slots and five steps, two of them depending on steps
+        # that had finished, both slots idled until the slowest sibling ended.
         pending = [u for u in units if u.id not in results]
-        while pending:
-            ready = sorted([u for u in pending if set(u.depends_on).issubset(results)], key=lambda u: (u.priority, u.id))
-            if not ready:
-                raise ResearchError("DEPENDENCY_BLOCKED", "研究依赖无法继续", recoverable=False)
-            outcomes = await asyncio.gather(*(execute(unit) for unit in ready), return_exceptions=True)
-            failures = []
-            for unit, outcome in zip(ready, outcomes, strict=True):
-                if isinstance(outcome, BaseException):
-                    failures.append((unit, outcome))
-                else:
-                    uid, result = outcome
-                    results[uid] = result
-            if failures:
-                errors = [error for _, error in failures]
-
-                def fatal_error(error):
-                    # Storage failures are infrastructure, not a research step.
-                    if not isinstance(error, Exception) or isinstance(error, (OSError, sqlite3.Error)):
-                        return True
-                    return isinstance(error, ResearchError) and error.code in FATAL_UNIT_ERRORS
-
-                fatal = next((error for error in errors if fatal_error(error)), None)
-                # Losing every step to a spent research budget is a wind-down,
-                # not a broken run: earlier evidence still becomes a report.
-                spent = all(isinstance(error, ResearchError) and error.code in WIND_DOWN_ERRORS for error in errors)
-                # A whole batch timing out in a later round must not discard the
-                # findings earlier steps already committed.
-                gathered = any(result.get("findings") for result in results.values())
-                if fatal is not None or (len(failures) == len(ready) and not spent and not gathered):
-                    # All successful siblings are already durable; retry dispatch reuses them.
-                    raise fatal or errors[0]
-                cycle = run.get("cycle", 0)
-                for unit, error in failures:
-                    committed = await store.unit(run["run_id"], f"{cycle}:{unit.id}", digest(unit.model_dump(mode="json")))
-                    if committed is not None:
-                        # The research committed before a later bookkeeping error.
-                        results[unit.id] = committed
-                        await store.mutate(run["run_id"], lambda r, uid=unit.id: r["unit_statuses"].update({uid: "COMPLETED"}))
-                        await store.event(run["run_id"], "research.unit.completed", completion(run, unit, committed), key=f"unit-done-{cycle}-{unit.id}")
+        running, undecided, succeeded, fatal = {}, [], False, None
+        try:
+            while pending or running or undecided or fatal is not None:
+                if fatal is None:
+                    ready = sorted([u for u in pending if set(u.depends_on).issubset(results)], key=lambda u: (u.priority, u.id))
+                    for unit in ready:
+                        running[asyncio.create_task(execute(unit))] = unit
+                    pending = [u for u in pending if u not in ready]
+                if not running:
+                    if fatal is not None:
+                        # All successful siblings are already durable; retry dispatch reuses them.
+                        raise fatal
+                    if undecided:
+                        # Everything that could run has failed and nothing was learned. Losing
+                        # every step to a spent research budget is a wind-down, not a broken
+                        # run: earlier evidence still becomes a report. Anything else fails
+                        # the run, and a later retry runs the steps again.
+                        if not all(isinstance(error, ResearchError) and error.code in WIND_DOWN_ERRORS for _, error in undecided):
+                            raise undecided[0][1]
+                        for unit, error in undecided:
+                            await disclose(unit, error)
+                        undecided = []
                         continue
-                    # Never persist a free-form exception text: it may echo credentials.
-                    code = error.code if isinstance(error, ResearchError) else "EXECUTION_FAILED"
-                    placeholder = ResearchResult(unit_id=unit.id, confidence=0, limitations=[f"研究步骤“{unit.title or unit.id}”未能完成（{code}），相关内容可能不完整。"]).model_dump(mode="json")
-                    await store.mutate(run["run_id"], lambda r, uid=unit.id, value=code: r.setdefault("unit_failures", {}).update({uid: value}))
-                    await store.save_unit(run["run_id"], f"{cycle}:{unit.id}", digest(unit.model_dump(mode="json")), placeholder)
-                    await store.event(run["run_id"], "research.unit.failed", {"unit_id": unit.id, "title": unit.title, "code": code, "cycle": cycle}, key=f"unit-failed-{cycle}-{unit.id}")
-                    results[unit.id] = placeholder
-            pending = [u for u in pending if u.id not in results]
+                    raise ResearchError("DEPENDENCY_BLOCKED", "研究依赖无法继续", recoverable=False)
+                done, _ = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    unit = running.pop(task)
+                    error = asyncio.CancelledError() if task.cancelled() else task.exception()
+                    if error is None:
+                        uid, result = task.result()
+                        results[uid] = result
+                        succeeded = True
+                    elif fatal_error(error):
+                        # Nothing new starts; steps under way finish and stay durable.
+                        fatal = fatal or error
+                    else:
+                        undecided.append((unit, error))
+                # One failed step among working ones is a disclosed gap. While every
+                # step so far has failed the decision waits: steps that build on a
+                # failed one stay blocked until it is known whether the run goes on.
+                if fatal is None and undecided and (succeeded or any(result.get("findings") for result in results.values())):
+                    for unit, error in undecided:
+                        await disclose(unit, error)
+                    undecided = []
+        finally:
+            # Leaving early (cancelled, stopped, a storage error) must not leave steps
+            # running behind the workflow's back; wait until they have really ended.
+            for task in running:
+                task.cancel()
+            if running:
+                await asyncio.gather(*running, return_exceptions=True)
         return {"results": [results[u.id] for u in units], "status": "RESEARCHING"}
 
     async def merge(s):

@@ -316,3 +316,33 @@ def test_a_step_stopped_by_the_engine_explains_itself_in_the_report_language():
     assert "研究额度" in zh and "token_capped" not in zh
     assert "research budget" in stop_limitation("token_capped", "en")
     assert "something_new" in stop_limitation("something_new", "zh")
+
+
+@pytest.mark.asyncio
+async def test_dependencies_the_owner_set_in_an_edited_plan_survive_normalisation(settings, tmp_path, monkeypatch):
+    # Found in a real run: the planner is told to avoid dependencies, so the model that
+    # normalises an edited plan returned it without the depends_on the owner had added.
+    from deepresearch.contracts import ResearchPlan, ResearchUnit
+
+    store = Store(tmp_path / "runner.sqlite")
+    await store.start()
+    runner = DeerFlowRunner(settings, store)
+    skill = next(iter(settings.researchers()))
+    run = {"run_id": "r", "query": "q", "constraints": [], "source_names": [], "budget": {"max_units": 8}}
+
+    def units(needs):
+        return [ResearchUnit(id=uid, skill=skill, objective=f"step {uid}", depends_on=deps) for uid, deps in needs.items()]
+
+    edited = ResearchPlan(goal="compare", research_units=units({"A": [], "B": [], "C": ["A"], "D": ["B"], "E": ["D"]})).model_dump(mode="json")
+
+    async def normalised(run, name, payload, schema, **kwargs):
+        # The model keeps A, B, C and E, drops D and every dependency.
+        return ResearchPlan(goal="compare", research_units=units({"A": [], "B": [], "C": [], "E": []}))
+
+    monkeypatch.setattr(runner, "_json", normalised)
+    plan = await runner.plan(run, edited)
+    # What the owner declared is back; a dependency on the removed step went with it.
+    assert {unit.id: unit.depends_on for unit in plan.research_units} == {"A": [], "B": [], "C": ["A"], "E": []}
+    # A revision in words is the model's to plan: nothing is forced onto it.
+    revised = await runner.plan(run, {"plan": edited, "revision": "去掉依赖"})
+    assert all(not unit.depends_on for unit in revised.research_units)

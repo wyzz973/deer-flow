@@ -9,13 +9,13 @@ at the repository root; update it with any change to nodes, events, contracts or
 ## Taking over, debugging or auditing a run
 
 `.agents/skills/deepresearch-engineering/` is the working skill for this module
-(any agent harness can read it; Codex loads `.agents/skills` natively, Claude Code
-via `ln -s ../../.agents/skills/deepresearch-engineering .claude/skills/`). It maps
+(Codex loads `.agents/skills` natively, Claude Code via
+`ln -s ../../.agents/skills/deepresearch-engineering .claude/skills/`). It maps
 the module, lists what must not be done, and carries two offline scripts:
 `scripts/audit_run.py --run <id|prefix|page URL|thread|latest> [--baseline <run>]`
-turns a run's records into a fact sheet and one offline HTML page (timeline; time,
-tokens, tools and searches per stage, node and step; prompt cache; cost and yield of
-each research round; rule-based findings with the setting that changes each),
+turns a run's records into a fact sheet and an offline HTML page (timeline; time,
+tokens and tools per stage, node and step; prompt cache; yield of each research
+round; rule findings with the setting that changes each),
 and `scripts/show_call.py` opens or replays one model call. Both read the store
 through `Store` and `metrics.collect`; `tests/deepresearch/test_audit_skill.py`
 runs them against a synthetic store, so change them together with any table,
@@ -70,12 +70,19 @@ prompts, engine tools, compaction and budgets all live in the research profile
   as a refused contract made research unusable on them. A reply whose only
   content is a tool call counts as an answer.
 - `observations.py` projects native ToolMessage/receipt envelopes after execution.
-  For MCP-bound and host-bound sources it must not inspect business payload
-  fields or replace the tool's input schema: the original tool object reaches the
-  native loop unchanged. Provider-backed sources are different by construction —
-  `channels.py` owns the model-facing schema, so `extract.py` reads provider
-  payloads deliberately and format-agnostically (JSON walk, Markdown links,
-  Title/URL blocks, HTML title) and emits the same artifacts a native tool would.
+  For MCP-bound (`kind: mcp`) and host-bound sources the original tool object
+  reaches the native loop unchanged: never replace its input schema or rewrite
+  what the model reads. Such a tool emits no artifact of ours, so evidence is
+  derived afterwards: a `read` tool's page becomes `fetched_document` with the
+  address from the call's own arguments (`sources.opened_pages`; an identifier
+  becomes `mcp://<source>/<id>`), structured `search`/`data` answers become
+  per-record evidence by shape (`extract.records`; the whole answer stays
+  citable unless records carry ≥80% of it). Without this, MCP-only research
+  ended with NO_EVIDENCE: the converter saw no URL to match the notes to.
+  Provider-backed sources own the
+  model-facing schema (`channels.py`), read payloads with the same `extract.py`
+  (JSON walk through wrappers such as `{"result": "<json>"}`, Markdown links,
+  Title/URL blocks, HTML title) and emit the artifacts themselves.
   Native completed executions are cached; individual tool calls are not replayed.
 - `trace.py` records bounded, redacted payloads and paired spans in the local
   event store. It has no telemetry-service dependency. Callbacks must remain
@@ -412,11 +419,18 @@ authentication, local-model quality or end-to-end deployment readiness.
   Reported usage replaces the estimate; when a provider reports no usage, the
   unreserved remainder of the cap is charged after the call, so unknown spend
   stays conservative.
-- `dispatch` degrades a non-fatal unit failure (for example a native timeout)
-  into a zero-confidence placeholder with a disclosed limitation,
-  `unit_failures` and `research.unit.failed`. `FATAL_UNIT_ERRORS`, non-`Exception`
-  errors, `OSError`/`sqlite3.Error`, and a batch where every unit failed still
-  fail the run; a result already committed for the unit is reused as success.
+- `dispatch` starts a unit once its `depends_on` are done and a
+  `max_concurrency` slot is free; never in waves (`gather` over the ready
+  set): a dependent then waits for the slowest sibling. A non-fatal unit
+  failure becomes a zero-confidence placeholder with a disclosed limitation,
+  `unit_failures` and `research.unit.failed` once any unit succeeded or
+  findings exist; its dependents go on.
+  `FATAL_UNIT_ERRORS`, non-`Exception` errors, `OSError`/`sqlite3.Error`
+  (nothing new starts, running units finish) and a run where every runnable
+  unit failed still fail the run; a committed result is reused as success.
+  Leaving early cancels and awaits running units.
+  `runner.keep_declared_dependencies` restores an explicit `plan/edit`'s
+  `depends_on` after normalisation.
   Keep example research-role timeouts at 600 s; long reads are normal.
 - Evidence is derived from open-web payloads, so build it through validation
   (`observations.derive`), never `model_copy`, which skips it: an over-long

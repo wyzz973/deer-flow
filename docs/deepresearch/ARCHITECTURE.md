@@ -189,7 +189,7 @@ flowchart LR
 | `rewrite` | `PLANNING` | 把整段对话改写成一条完整的研究请求 `ResearchRequest`（`user_query`、可选 `acknowledgement`、至多 3 个澄清问题），对标 ChatGPT 调用 Deep Research App 时的 `user_query`。修改计划或追问触发新研究时，从上一版请求出发合并本次修改并写确认话术。模型未按契约输出时退化为纯文本请求并发 `research.request.prose`（回复是残缺 JSON 时只取其中的 `user_query`）。`nodes.rewrite.enabled: false` 时不调用模型：直接用用户原话，修改计划时把改动追加到上一版请求 | `research.request.rewritten` | 写入 `request`；追加 `request-N` 对话消息（`kind: rewrite`） |
 | `planner` | `PLANNING` | 调用 `deepresearch` 角色把改写后的请求变成 `ResearchPlan`：研究简报 `brief`（即改写后的请求）、短标题、`plan_min_units`–`plan_max_units` 个带短标题的单元（只规划 `available_sources` 能回答的内容）、前提假设、报告风格、来源策略；计划不合规（未知角色、未知或已停用的数据源、超出单元上限）时带原因重试，最后一次由 `runner.fit_plan` 修正而不是失败；对话修改时写 `acknowledgement` 并设置 `auto_start`；`require_dual_source: false` 时由 `Settings.fit_origins` 去掉没有来源可用的 `required_origins` | `plan.created` / `plan.updated` | 缓存键 `plan:`；写入 `plan` 与 `units`；追加 `ack-N` 与 `plan-N` 对话消息 |
 | `plan_review` | 等待确认 | `auto_start` 时记录 `plan.auto_started`（`source=revision`）并直接批准；否则 `interrupt` 等待决策 | `plan.waiting_confirmation`（由服务写入）、`plan.auto_started` | 中断前无副作用，恢复时节点重跑 |
-| `dispatch` | `RESEARCHING` | 按依赖分批并行（`max_concurrency`）运行研究单元；已提交结果直接复用；非致命失败降级为占位结果；致命错误或整批失败使运行失败 | `research.unit.started` / `completed` / `failed` | `research_unit` 结果；`unit_statuses`、`unit_failures` |
+| `dispatch` | `RESEARCHING` | 并行（`max_concurrency`）运行研究单元：一个单元在它依赖的单元都结束、且有空位时立刻开始，不等同批里最慢的那个；已提交结果直接复用；非致命失败降级为占位结果；致命错误或整批失败使运行失败 | `research.unit.started` / `completed` / `failed` | `research_unit` 结果；`unit_statuses`、`unit_failures` |
 | `evidence_merge` | — | `merge_results` 按计划顺序把原始证据合并为稳定的 `E###`，生成 `BoundFinding` 与 lineage | `evidence.pool.updated` | `research_evidence`；`evidence_count` |
 | `validator` | `VALIDATING` | 计算可引用证据集合与缺口；无缺口则完成；只有 `supplement_gap_codes` 里的缺口类型会触发补研；补研预算（轮数、单元数、研究 Token、研究时间）耗尽或结果饱和时：没有任何发现引用到可引用证据则报 `NO_EVIDENCE`，否则默认带局限继续。饱和与 `NO_EVIDENCE` 都按“被发现引用的可引用证据数”判断，不看证据池大小 | `validator.passed` / `validator.gap_found` / `report.limitations.auto` | `research_gap`；`gaps`、`limitations` |
 | `supplement` | — | 按缺口严重度生成补研单元（`S<iter>-<hash>`，依赖原单元）；截断的缺口发出事件 | `research.supplement.deferred` | `units`、`iteration` |
@@ -207,7 +207,9 @@ flowchart LR
 `UNIT_MISMATCH`。非 `Exception`、`OSError` 与 `sqlite3.Error` 也视为致命。
 
 收尾类错误 `RESEARCH_BUDGET_SPENT`（研究 Token 用尽）与 `RESEARCH_TIME_SPENT`（研究时间用尽）不是故障：
-该单元降级，整批都是这类错误时运行继续并写报告。整批因其他非致命原因失败时，只有此前已有任何发现才继续，否则运行失败。
+该单元降级，所有单元都是这类错误时运行继续并写报告。失败的单元要等到“这次运行还走得下去”才降级成占位结果：只要有任何单元成功过、
+或此前已有发现，就立刻降级，依赖它的单元随即开始；如果能跑的单元全部失败、且什么都没得到，运行失败，稍后重试会重跑这些单元。
+出现致命错误时不再启动新单元，等正在运行的单元结束（它们的结果已持久化，重试时复用）后运行失败。
 
 其他错误（例如 `NATIVE_AGENT_TIMEOUT`、`RESULT_CONTRACT`）只让该单元失败：保存置信度为 0、
 写明“研究步骤未能完成”的占位结果，记录 `unit_failures` 与 `research.unit.failed`，依赖它的单元照常调度，
@@ -694,7 +696,7 @@ Gateway 依次尝试主机与上级站点的 `/favicon.ico`、首页声明的最
 - 新研究角度：新增 Skill 与 Agent，在配置中登记，planner 可选用（详见 [EXTENDING.md](EXTENDING.md)）。
 - 新来源：在研究配置的 `sources` 里声明 `origin`、`level` 和正确的 `role`，背后挂供应商：内置预设、`http`（自定义接口模板）
   或 `mcp`（`mcp_servers` 里某个服务的工具，建议配 `allowed_tools`）。不为 MCP 写返回字段映射：`extract.py` 按通用结构识别记录。
-  `kind: mcp` 把 MCP 工具原样暴露给研究员，每次调用整体作为一条证据。
+  `kind: mcp` 把 MCP 工具原样暴露给研究员；执行后从调用参数和返回里识别证据（读取工具打开的页面、结构化返回里的记录），识别不了时每次调用整体作为一条证据。
 - 自定义 Runner：`runner_factory` 指向管理员控制的工厂，需实现 `AgentRunner` 协议。
 - 企业访问控制：`access_policy` 指向 `callable(request, run) -> bool`。
 

@@ -14,7 +14,7 @@ Base: `/api/deepresearch`，由 DeerFlow Gateway 扩展路由提供。生产请�
 | POST | `/{id}/plan/pause` | 暂停指定版本的自动启动，进入 EDITING_PLAN |
 | POST | `/{id}/plan/resume` | 放弃编辑并恢复该计划的服务端倒计时 |
 | POST | `/{id}/messages` | 202，同一研究中的计划修改（修改后直接开始）、澄清回答、研究中的更新或报告追问 |
-| POST | `/{id}/plan/edit` | 202，规范化新计划并重新等待审核 |
+| POST | `/{id}/plan/edit` | 202，规范化新计划并重新等待审核；计划里声明的 `depends_on` 原样保留（被删掉的步骤上的依赖随之去掉） |
 | POST | `/{id}/plan/reject` | 202，拒绝计划 |
 | POST | `/{id}/cancel` | 取消；已完成报告不会被覆盖 |
 | POST | `/{id}/retry` | 202，恢复 recoverable FAILED，预算不重置（报告完成后的追问会开启新任务并重置用量，见“预算按任务计”） |

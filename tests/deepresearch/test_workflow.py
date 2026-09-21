@@ -394,3 +394,118 @@ async def test_every_step_losing_its_budget_still_ends_in_a_report(settings):
         assert run["report"]["citations"]
     finally:
         await service.stop()
+
+
+class Scheduled(DemoRunner):
+    """Steps with declared needs; ``before`` decides how each one behaves."""
+
+    needs = {"A": [], "B": [], "C": [], "D": ["A"], "E": ["B"]}
+
+    def __init__(self, settings, store):
+        super().__init__(settings, store)
+        self.started, self.finished, self.running, self.peak = [], [], 0, 0
+        self.started_before_slow_ended = set()
+        self.release_slow = asyncio.Event()
+
+    async def plan(self, run, proposed=None, request=None):
+        if proposed:
+            return await super().plan(run, proposed, request)
+        from deepresearch.contracts import ResearchPlan, ResearchUnit
+
+        skill = next(iter(self.settings.researchers()))
+        units = [ResearchUnit(id=uid, skill=skill, title=uid, objective=f"step {uid}", priority=index, depends_on=deps) for index, (uid, deps) in enumerate(self.needs.items())]
+        return ResearchPlan(goal=run["query"], title=run["query"], brief=run["query"], research_units=units)
+
+    async def before(self, unit):
+        if unit.id == "C":
+            # The slow step ends only once the steps behind the finished ones are under way.
+            await asyncio.wait_for(self.release_slow.wait(), 5)
+        if {"D", "E"} <= set(self.started):
+            self.release_slow.set()
+
+    async def research(self, run, unit, dependencies):
+        self.started.append(unit.id)
+        self.running += 1
+        self.peak = max(self.peak, self.running)
+        try:
+            await self.before(unit)
+            return await super().research(run, unit, dependencies)
+        finally:
+            if unit.id == "C":
+                self.started_before_slow_ended = set(self.started)
+            self.running -= 1
+            self.finished.append(unit.id)
+
+
+async def researched(settings, runner_class, query):
+    service = ResearchService(settings)
+    runner = runner_class(settings, service.store)
+    service.runner = runner
+    await service.start()
+    run = await service.create("u", CreateResearch(query=query), "k")
+    run = await settle(service, run["run_id"])
+    await service.decision(run["run_id"], 1, "approve")
+    return service, runner, await settle(service, run["run_id"])
+
+
+@pytest.mark.asyncio
+async def test_a_step_starts_when_what_it_needs_is_done_not_when_the_slowest_sibling_ends(settings):
+    # Three at a time, five planned: D and E used to wait for the whole first
+    # wave, so two free slots idled for as long as C kept running.
+    settings.max_concurrency = 3
+    service, runner, run = await researched(settings, Scheduled, "测试并发接续")
+    try:
+        assert run["status"] == "COMPLETED", run["error"]
+        # C ends only after D and E have started; in waves it timed out waiting for them.
+        assert {"D", "E"} <= runner.started_before_slow_ended, "D and E waited for C although what they need had finished"
+        # A step still waits for what it needs, and never more than three run at once.
+        assert runner.started.index("A") < runner.started.index("D") and runner.started.index("B") < runner.started.index("E")
+        assert runner.peak <= 3
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_steps_behind_a_failed_step_go_on_once_another_step_has_worked(settings):
+    class OneDown(Scheduled):
+        needs = {"A": [], "B": [], "D": ["A"]}
+
+        async def before(self, unit):
+            if unit.id == "A":
+                raise RuntimeError("upstream down")
+
+    service, runner, run = await researched(settings, OneDown, "测试失败步骤之后的接续")
+    try:
+        assert run["status"] == "COMPLETED", run["error"]
+        assert run["unit_failures"] == {"A": "EXECUTION_FAILED"} and run["unit_statuses"]["D"] == "COMPLETED"
+        assert runner.started.index("B") < runner.started.index("D")
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_an_error_that_stops_the_run_starts_nothing_new_and_lets_running_steps_finish(settings):
+    class Billing(Scheduled):
+        needs = {"A": [], "B": [], "D": ["B"]}
+        failed = asyncio.Event()
+
+        async def before(self, unit):
+            if unit.id == "A" and self.started.count("A") == 1:
+                self.failed.set()
+                raise ResearchError("MODEL_BILLING_REQUIRED", "模型服务要求处理余额或计费状态")
+            if unit.id == "B":
+                # Still running when A stops the run, and finished by the time the run fails.
+                await asyncio.wait_for(self.failed.wait(), 5)
+                await asyncio.sleep(0.05)
+
+    service, runner, run = await researched(settings, Billing, "测试终止性错误")
+    try:
+        assert run["status"] == "FAILED" and run["error"]["code"] == "MODEL_BILLING_REQUIRED"
+        assert "D" not in runner.started and runner.finished.count("B") == 1
+        await service.retry(run["run_id"])
+        run = await settle(service, run["run_id"])
+        assert run["status"] == "COMPLETED", run["error"]
+        # What finished before the failure is not researched again.
+        assert runner.started.count("B") == 1 and runner.started.count("A") == 2 and "D" in runner.started
+    finally:
+        await service.stop()

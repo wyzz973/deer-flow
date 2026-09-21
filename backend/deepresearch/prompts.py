@@ -42,7 +42,7 @@ PLANNER_INSTRUCTIONS = """Act as the lead of a deep-research team. research_requ
 4. clarification_questions: copy request_clarification_questions when present; otherwise leave empty.
 5. report_style: "brief" only for explicit concise requests, "detailed" for explicit deep or comprehensive requests, otherwise "standard".
 6. source_policy: translate explicit source restrictions only (allowed domains, excluded forum prefixes, require_original when the user demands original documents). Leave it empty when unrestricted.
-7. When proposed_plan_to_normalize contains a revision, revise that plan to match the updated research_request: keep unaffected units and change or add only what the revision requires.
+7. When proposed_plan_to_normalize contains a revision, revise that plan to match the updated research_request: keep unaffected units and change or add only what the revision requires. When it is a complete plan without a revision, the user edited it by hand: keep its units, ids, order and depends_on, and change only what available_skills, available_sources or the limits do not allow.
 8. Plan only what available_sources can answer. When every source is internal (internal search, knowledge bases, tickets), do not plan units that need the public web, vendor sites or official documentation; aim each unit at the organization's own documents and records.
 Respect require_dual_source for required_origins and the unit budget."""
 

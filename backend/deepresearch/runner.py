@@ -181,6 +181,27 @@ def fit_plan(plan, settings, max_units):
     return settings.fit_origins(plan)
 
 
+def keep_declared_dependencies(plan, proposed):
+    """Dependencies the owner set in an edited plan, put back after normalisation.
+
+    The planner is told to avoid dependencies, so the model that normalises an
+    explicit edit returned it without the ``depends_on`` the owner had added
+    (found in a real run). Which step builds on which is the owner's decision,
+    not something to re-plan: it is restored for every step that survived, and
+    a dependency on a removed step goes with that step.
+    """
+    declared = {unit.get("id"): unit.get("depends_on") or [] for unit in proposed.get("research_units") or [] if isinstance(unit, dict)}
+    kept = {unit.id for unit in plan.research_units}
+    restored = plan.model_copy(deep=True)
+    for unit in restored.research_units:
+        if unit.id in declared:
+            unit.depends_on = [uid for uid in declared[unit.id] if uid in kept and uid != unit.id]
+    try:
+        return ResearchPlan.model_validate(restored.model_dump(mode="json"))
+    except ValidationError:
+        return plan  # renamed steps can close a cycle the edit did not have
+
+
 SHORTEN = "Shorten it: keep the key judgment, at most one table and the cited facts that change the reader's decision; remove the rest. Keep the markers of what stays."
 
 # What the system itself knows went wrong: a failed or cut-short step. These
@@ -465,7 +486,7 @@ class DeerFlowRunner(SettingsBound):
         def fit(plan):
             return fit_plan(plan, settings, run["budget"]["max_units"])
 
-        return await self._json(
+        plan = await self._json(
             run,
             "deepresearch",
             # Two thirds of a planning task is the same for every request of a
@@ -491,6 +512,9 @@ class DeerFlowRunner(SettingsBound):
             validator=acceptable,
             repair=fit,
         )
+        # An explicit edit (a whole plan, no revision in words) is the owner's.
+        explicit = isinstance(proposed, dict) and "revision" not in proposed and proposed.get("research_units")
+        return keep_declared_dependencies(plan, proposed) if explicit else plan
 
     @asynccontextmanager
     async def _source_tools(self, run, sources, budget=None):
