@@ -2,7 +2,7 @@ import { afterEach, expect, it, rs } from "@rstest/core";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 
 import { ResearchPlanCard } from "@/components/deepresearch/plan-card";
-import { planCardHidden } from "@/core/deepresearch/presentation";
+import { planCardFolded } from "@/core/deepresearch/presentation";
 import type { ResearchMessage } from "@/core/deepresearch/types";
 
 import { makeRun } from "../../core/deepresearch/fixtures";
@@ -220,15 +220,21 @@ it("shows short step titles and live progress while research runs", () => {
   view.unmount();
 });
 
-it("leaves the conversation once the report exists, like ChatGPT; folds a superseded plan", () => {
+it("folds the finished plan so it can be reopened, and folds a superseded one", () => {
   const run = makeRun("done", "COMPLETED");
   const message = planMessage(run);
   const view = render(
     <ResearchPlanCard {...handlers} message={message} run={run} />,
   );
-  // The stats line and the report card take the plan's place: no folded strip.
-  expect(view.container.innerHTML).toBe("");
-  expect(planCardHidden(message, run)).toBe(true);
+  // The plan stays, folded under the report, and its steps are one click away.
+  expect(planCardFolded(message, run)).toBe(true);
+  const summary = screen.getByText(/研究计划 · Compare databases/);
+  const folded = summary.closest("details")!;
+  // Closed by default, and the steps it holds open to are its own.
+  expect(folded.open).toBe(false);
+  expect(folded.contains(screen.getByText("Compare concurrency"))).toBe(true);
+  fireEvent.click(summary);
+  expect(folded.open).toBe(true);
   view.rerender(
     <ResearchPlanCard
       {...handlers}
@@ -249,7 +255,7 @@ it("leaves the conversation once the report exists, like ChatGPT; folds a supers
     />,
   );
   expect(screen.getByText("研究已停止")).toBeTruthy();
-  expect(planCardHidden(message, { ...run, status: "CANCELLED" })).toBe(false);
+  expect(planCardFolded(message, { ...run, status: "CANCELLED" })).toBe(false);
   view.unmount();
 });
 
@@ -312,11 +318,11 @@ it("keeps a failed follow-up visible and retryable under the folded plan", () =>
       onRetry={(limited = false) => retries.push(limited)}
     />,
   );
-  // The plan itself is gone once a report exists …
+  // A failed follow-up shows its failure, not a folded plan …
   expect(screen.queryByText(/研究计划 · Compare databases/)).toBeNull();
   expect(view.container.querySelector("details")).toBeNull();
-  // … but the failure and the way out are not hidden with it.
-  expect(planCardHidden(message, run)).toBe(false);
+  // … and the way out is not folded away with it.
+  expect(planCardFolded(message, run)).toBe(false);
   expect(screen.getByRole("alert").textContent).toBe("模型超时");
   fireEvent.click(screen.getByRole("button", { name: "从检查点恢复" }));
   expect(retries).toEqual([false]);
@@ -344,7 +350,8 @@ it("keeps a failed follow-up visible and retryable under the folded plan", () =>
   );
   expect(screen.queryByRole("alert")).toBeNull();
   expect(screen.queryByRole("button", { name: "从检查点恢复" })).toBeNull();
-  expect(view.container.innerHTML).toBe("");
+  // Replaced by a newer plan, so it stays "updated" even though its cycle reported.
+  expect(screen.getByText(/计划已更新 · Compare databases/)).toBeTruthy();
   view.unmount();
 });
 
@@ -353,6 +360,7 @@ it("says a stopped follow-up was stopped instead of looking finished", () => {
   const view = render(
     <ResearchPlanCard {...handlers} message={message} run={run} />,
   );
+  // Stopped says so; it does not fold away into something that looks finished.
   expect(screen.queryByText(/研究计划 · Compare databases/)).toBeNull();
   expect(screen.getByRole("status").textContent).toContain("研究已停止");
   expect(screen.getByRole("status").textContent).toContain(
@@ -366,7 +374,7 @@ it("says a stopped follow-up was stopped instead of looking finished", () => {
   );
   expect(screen.queryByRole("status")).toBeNull();
   expect(screen.queryByRole("alert")).toBeNull();
-  expect(finished.container.innerHTML).toBe("");
+  expect(screen.getByText(/研究计划 · Compare databases/)).toBeTruthy();
   finished.unmount();
 });
 

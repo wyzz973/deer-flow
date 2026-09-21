@@ -16,7 +16,7 @@
 | 更早的基线 | `5fa0299c` `feat(deepresearch): unify native research chat and harden workflow recovery` |
 | 功能状态 | 交互、工作流、报告与前端改造完成；五次真实 DeepSeek 研究端到端完成；配置与 DeerFlow 解耦（研究自己的模型、数据源与供应商故障切换、MCP、角色、提示词、上下文压缩）、请求改写节点、设置页、LLM 调用审计均已完成并真实验收 |
 | 离线开发 | 不联网的本地 Agent 从 [OFFLINE_AGENT_GUIDE.md](OFFLINE_AGENT_GUIDE.md) 开始；配置见 [MODEL_CONFIGURATION.md](MODEL_CONFIGURATION.md)、[DEERFLOW_CONFIGURATION.md](DEERFLOW_CONFIGURATION.md)、[RESEARCH_CONFIGURATION.md](RESEARCH_CONFIGURATION.md)；模板在 `examples/deepresearch/offline/` |
-| 最近一轮 | 2026-09-21：日志记全（工具出入参、MCP 协议层、HTTP 供应商层）、整包导出与保留期清理（第 3.9 节）；直接暴露的 MCP 工具读到的页面可被引用（修复只用 MCP 检索时的 `NO_EVIDENCE`，第 3.7 节）；研究步骤接续调度与编辑计划时保留依赖（第 3.8 节）；运行审计的离线 HTML 页面与两项新分析（第 3.6 节技能部分）。此前 2026-09-19：全模块代码审查与修复、按节点调参、仅 MCP / 无原文研究、模型网关兼容、时间预算收尾，见第 3.6 节与第 4 节末尾 |
+| 最近一轮 | 2026-09-21：研究完成后计划卡折叠可回看（第 3.10 节）；日志记全（工具出入参、MCP 协议层、HTTP 供应商层）、整包导出与保留期清理（第 3.9 节）；直接暴露的 MCP 工具读到的页面可被引用（修复只用 MCP 检索时的 `NO_EVIDENCE`，第 3.7 节）；研究步骤接续调度与编辑计划时保留依赖（第 3.8 节）；运行审计的离线 HTML 页面与两项新分析（第 3.6 节技能部分）。此前 2026-09-19：全模块代码审查与修复、按节点调参、仅 MCP / 无原文研究、模型网关兼容、时间预算收尾，见第 3.6 节与第 4 节末尾 |
 | 本次回归 | 见第 6 节 |
 | 未验证 | 干净克隆部署、生产构建、目标环境的 MCP 与 SSO、真实手机视口、报告事实逐条核验；远端 CI 以 GitHub Actions 结果为准 |
 
@@ -472,6 +472,26 @@ units、id、顺序与 depends_on”。用文字提的修改（`revision`）仍�
 | 桩的 token / cookie 出现在导出里 | 0 次 |
 
 **没做的**（用户本轮只要整包导出）：`show_call.py` 的逐条打开、`GET /{id}/tools` 接口、前端「工具调用」页签。
+
+## 3.10 本轮完成的工作（2026-09-21）：研究完成后计划卡折叠而不是消失
+
+**现象（用户反馈）**：研究完成后计划卡直接消失了，想回看做了哪些步骤没有入口。
+
+**原来的行为**：对标 ChatGPT——报告出现后由“研究完成情况”统计行加报告卡取代计划卡。`presentation.planCardHidden` 判定隐藏，
+`plan-card.tsx` 返回 `null`，同时 `research-conversation.tsx` 把这条 plan 记录整个从消息列表里过滤掉（否则会留下一个空的回合）。
+计划只在“活动”面板里还能看到，会话里没有任何回到它的入口。
+
+**改成**：`planCardHidden` → `planCardFolded`，语义从“隐藏”变为“折叠”。完成后计划卡收成一行 `<details>`：
+`研究计划 · <标题>`，点开是全部步骤和各自的最终状态（完成 / 未完成）。会话不再过滤 plan 记录——卡片现在总会渲染出东西，不存在空回合。
+
+标签按**是否被替换**判断而不是按是否折叠：`latest ? "研究计划" : "计划已更新"`。这一点是端到端测试抓出来的——
+演示流程里用户改写过计划，旧版 v1 和新版 v2 都属于 cycle 0 且都有报告，按“是否折叠”判断会让两张卡都写“研究计划”，
+真正跑的是哪一版就分不出来了。失败和被停止的研究不受影响，仍然显示错误卡与“从检查点恢复”。
+
+**验证**：`plan-card.dom.test.tsx` 与 `presentation.test.ts` 改为断言折叠与展开（`<details>` 在 jsdom 里收起时内容仍在 DOM 中，
+所以断言的是 `open` 状态与内容归属，不是元素存在与否）；前端全量 1458 项通过；`pnpm check` 通过；
+浏览器端到端 `playwright.deepresearch.config.ts` 5 项通过（新增：点开折叠卡后步骤可见）。
+真实网关上用浏览器看过已完成、失败、已取消三种运行，以及深色模式。
 
 ## 4. 真实验收
 

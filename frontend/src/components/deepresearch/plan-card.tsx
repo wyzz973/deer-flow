@@ -8,7 +8,6 @@ import {
   countdownSeconds,
   firstText,
   liveStatus,
-  planCardHidden,
   researchProgress,
 } from "@/core/deepresearch/presentation";
 import {
@@ -294,11 +293,13 @@ export function ResearchPlanCard({
           研究已停止。已生成的报告仍可阅读和导出，也可以继续就这份报告提问或要求修改。
         </p>
       );
-    if (planCardHidden(message, run)) return null;
+    // Folded, not gone: the steps and how each one ended stay one click away.
+    // A plan the owner replaced says so even after its cycle reported, so the
+    // one that actually ran is the one labelled as the plan.
     return (
       <details className={cn(card, "max-w-xl px-4 py-3 text-sm")}>
         <summary className="text-muted-foreground cursor-pointer">
-          计划已更新 · {title}
+          {latest ? "研究计划" : "计划已更新"} · {title}
         </summary>
         {steps}
       </details>

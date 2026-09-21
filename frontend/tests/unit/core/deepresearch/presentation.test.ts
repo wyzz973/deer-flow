@@ -16,7 +16,7 @@ import {
   nodeLabel,
   pageKey,
   phaseLabel,
-  planCardHidden,
+  planCardFolded,
   reportMarkdown,
   readableExcerpt,
   reportSummaryLine,
@@ -403,19 +403,19 @@ describe("what the conversation shows while it waits", () => {
     );
   });
 
-  it("drops a plan from the conversation once its report exists, unless it still has news", () => {
+  it("folds a plan once its report exists, unless it still has news", () => {
     const reported = { ...run, conversation: [user, plan, report] };
-    expect(planCardHidden(plan, { ...reported, status: "COMPLETED" })).toBe(
+    expect(planCardFolded(plan, { ...reported, status: "COMPLETED" })).toBe(
       true,
     );
     // A legacy run has no conversation records, only a finished status.
-    expect(planCardHidden(plan, { ...run, status: "COMPLETED" })).toBe(true);
-    expect(planCardHidden(plan, { ...run, status: "RESEARCHING" })).toBe(false);
+    expect(planCardFolded(plan, { ...run, status: "COMPLETED" })).toBe(true);
+    expect(planCardFolded(plan, { ...run, status: "RESEARCHING" })).toBe(false);
     // A follow-up that failed or was stopped keeps its error and retry.
     for (const status of ["FAILED", "CANCELLED"])
-      expect(planCardHidden(plan, { ...reported, status })).toBe(false);
-    // Still hidden while the follow-up is planned or answered.
-    expect(planCardHidden(plan, { ...reported, status: "PLANNING" })).toBe(
+      expect(planCardFolded(plan, { ...reported, status })).toBe(false);
+    // Already folded while the follow-up is planned or answered.
+    expect(planCardFolded(plan, { ...reported, status: "PLANNING" })).toBe(
       true,
     );
   });

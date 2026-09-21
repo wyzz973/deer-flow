@@ -38,7 +38,6 @@ import {
   composerAccepts,
   firstText,
   formatElapsed,
-  planCardHidden,
   reportTitle,
   retryRequest,
   waitingPhase,
@@ -199,31 +198,25 @@ function ResearchView({
     .some((record) => record.kind === "rewrite");
   const messages = useMemo<Message[]>(
     () => [
-      ...records
-        // A plan replaced by its report leaves no empty turn behind.
-        .filter(
-          (record) =>
-            !(record.kind === "plan" && run && planCardHidden(record, run)),
-        )
-        .map(
-          (record) =>
-            ({
-              id: record.id,
-              type: record.role === "user" ? "human" : "ai",
-              content:
-                record.kind === "report"
-                  ? (record.report?.markdown ?? record.text)
-                  : record.text,
-              additional_kwargs: { research_message_id: record.id },
-            }) as Message,
-        ),
+      ...records.map(
+        (record) =>
+          ({
+            id: record.id,
+            type: record.role === "user" ? "human" : "ai",
+            content:
+              record.kind === "report"
+                ? (record.report?.markdown ?? record.text)
+                : record.text,
+            additional_kwargs: { research_message_id: record.id },
+          }) as Message,
+      ),
       // MessageList drops assistant messages without content before it asks
       // renderMessage, so the placeholder carries its accessible text.
       ...(pending
         ? [{ id: PENDING_ID, type: "ai", content: "正在思考…" } as Message]
         : []),
     ],
-    [records, pending, run],
+    [records, pending],
   );
   // MessageList and ChatBox consume this read-only view. Mutations go through
   // the research API, not invented SDK submit/history methods.

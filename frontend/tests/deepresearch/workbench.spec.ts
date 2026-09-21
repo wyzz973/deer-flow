@@ -52,11 +52,16 @@ for (const entry of ["/deepresearch-demo", "/workspace/deepresearch"]) {
       ),
     ).toBeVisible();
     await expect(page.locator('[aria-label="研究报告预览"]')).toBeVisible();
-    // The report takes the plan's place: no plan card or folded strip remains.
+    // The report leads and the live plan card is gone, but the plan itself folds
+    // to one line that reopens: the steps and how each ended stay reachable.
     await expect(page.locator('[aria-label="研究计划"]')).toHaveCount(0);
+    const folded = page.locator("summary").filter({ hasText: "研究计划 ·" });
+    await expect(folded).toHaveCount(1);
+    await folded.click();
     await expect(
-      page.locator("summary").filter({ hasText: "计划已更新" }),
-    ).toHaveCount(0);
+      page.locator("details", { has: folded }).locator("li"),
+    ).not.toHaveCount(0);
+    await folded.click();
     expect(page.url()).toContain(id);
 
     await page

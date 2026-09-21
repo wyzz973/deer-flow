@@ -105,6 +105,11 @@ search count, a progress bar, stop, and “更新”, which quotes the plan in t
 composer and sends a non-interrupting update. Editing uses the same quote bar;
 a sent revision starts immediately. Completed reports show the
 “研究完成情况” stats line, a report card, and a full-screen reader with a hover TOC.
+The plan itself folds above them (`planCardFolded`) to a one-line “研究计划 · 标题”
+that reopens to the steps and how each ended; a plan superseded before it
+reported folds as “计划已更新”. It used to be dropped from the conversation
+entirely, which left no way back to it. Never filter a plan record out of the
+message list: a card that renders something has no empty turn to avoid.
 The side panel tabs are “来源” and “活动 · elapsed”. Use `firstText` for plan/step
 labels because historical records store empty strings. Retries send
 `retryRequest(...)`: never persist a limited-report refusal the owner did not make.

@@ -197,12 +197,12 @@ export function liveStatus(
   }
 }
 
-/** A plan whose report exists leaves the conversation, like ChatGPT: the stats
- * line and the report card take its place, and the plan stays in the activity
- * panel. Not while it still has news: a follow-up that failed or was stopped
- * keeps its error, retry or notice. The conversation drops a hidden plan's
- * message entirely, so no empty turn is left behind. */
-export function planCardHidden(message: ResearchMessage, run: Run) {
+/** A plan whose report exists folds to one line: the stats line and the report
+ * card lead, and the plan is a click away when someone wants to see what was
+ * researched and how each step ended. It used to disappear, which left no way
+ * back to it in the conversation. Not folded while it still has news: a
+ * follow-up that failed or was stopped keeps its error, retry or notice. */
+export function planCardFolded(message: ResearchMessage, run: Run) {
   const latest = message.plan?.plan_version === run.plan?.plan_version;
   if (latest && (run.status === "FAILED" || run.status === "CANCELLED"))
     return false;
