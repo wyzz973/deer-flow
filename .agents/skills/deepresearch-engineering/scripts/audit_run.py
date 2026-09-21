@@ -711,6 +711,7 @@ def process(data):
         "search_limits": [event.get("data") for event in by_type["research.search.limited"]],
         "evidence_trimmed": [event.get("data") for event in by_type["research.evidence.trimmed"]],
         "output_retries": [event.get("data") for event in by_type["research.output.retry"]],
+        "pruned_outputs": [event.get("data") for event in by_type["research.output.pruned"]],
         "draft_repairs": dict(repairs),
         "deferred_supplements": [event.get("data") for event in by_type["research.supplement.deferred"]],
         "units": units,
@@ -952,6 +953,15 @@ def findings(facts):
                 "；".join(f"第 {row['round']} 轮：发现 {row['findings']} 条（被引用 {fmt(row['cited_findings'])}），未解问题 {row['open_questions']} 条，被引用的新证据 {row['cited_evidence_first_seen']} 条" for row in facts["rounds"]),
                 "产出占比远低于时间占比时补研不值：收紧 supplement_gap_codes。产出相当时它是篇幅换时间的选择。未解问题补研后没有减少，说明补研在追研究员自己列的问题，不一定是用户要的内容——对照请求检查报告是否真的交付了（见 references/audit-report.md）。",
             )
+    lost = [item for item in proc.get("pruned_outputs") or [] if item and (item.get("findings") or item.get("references"))]
+    if lost:
+        add(
+            "high" if run["status"] == "FAILED" else "medium",
+            "findings-pruned",
+            f"结果转换时裁掉了 {sum(item.get('findings') or 0 for item in lost)} 条结论、{sum(item.get('references') or 0 for item in lost)} 处引用：它们指向的证据不存在或不可引用",
+            "；".join(f"{item.get('unit_id')}：结论 {item.get('findings') or 0}、引用 {item.get('references') or 0}" for item in lost[:8]),
+            "研究员读到了内容，但转换节点没能把笔记对到可引用的证据上。打开该步的 conversion 调用看 observed_calls：条目没有 url / title（直接暴露的工具没被识别成页面或记录）、或只有“发现的链接”而搜索结果不可引用。检查数据源的 role 是否如实（能打开原文的是 read），没有读取工具时 cite_search_results 会自动生效；全部被裁掉时运行以 NO_EVIDENCE 结束。",
+        )
     cap = (facts.get("settings") or {}).get("max_findings_per_unit")
     capped = [unit["unit_id"] for unit in proc["units"] if cap and unit["findings"] >= cap]
     if cap and len(capped) >= max(2, len(proc["units"]) // 2):

@@ -54,7 +54,11 @@ def test_documents_keep_title_address_and_the_longest_text():
     jina = {"code": 200, "data": {"title": "Write-Ahead Logging", "url": "https://sqlite.org/wal.html", "content": "# WAL\n" + "text " * 50}}
     firecrawl = {"success": True, "data": {"markdown": "body " * 40, "metadata": {"title": "Firecrawl page", "sourceURL": "https://f.example"}}}
     openai_fetch = {"id": "doc-1", "title": "Quarterly report", "text": "Revenue grew " * 10, "url": "https://intranet.example/doc-1", "metadata": {"source": "kb"}}
-    assert extract.document(jina) == {"title": "Write-Ahead Logging", "url": "https://sqlite.org/wal.html", "text": jina["data"]["content"]}
+    assert extract.document(jina) == {"title": "Write-Ahead Logging", "url": "https://sqlite.org/wal.html", "text": jina["data"]["content"], "readable": True}
+    # A string answer arrives wrapped by the MCP adapter, and is often JSON itself: the page is two levels down.
+    assert extract.document({"result": json.dumps(jina)}) == extract.document(jina)
+    # No field held the text: the whole answer stands in, and says so.
+    assert extract.document({"status": "ok", "rows": [1, 2]})["readable"] is False
     assert extract.document(firecrawl)["title"] == "Firecrawl page" and extract.document(firecrawl)["url"] == "https://f.example"
     assert extract.document(openai_fetch)["text"].startswith("Revenue grew")
     assert extract.document("# Heading here\n\nParagraph", "https://g.example")["title"] == "Heading here"

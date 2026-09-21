@@ -7,6 +7,9 @@ without the real ones:
 - three search tools answer in three shapes: JSON chunks without title or link (`search_docs`), `Title:/URL:` text blocks
   (`search_wiki`) and a structured envelope with its own `name`/`description` (`search_tickets`);
 - **no tool can open an original document**, so search results and records are the evidence;
+- `find_pages` + `open_page` rehearse a search and a fetch tool exposed to research **directly** (`kind: mcp`, overlay
+  `research-overlay-passthrough.yaml`): results under unusual field names, the page as escaped JSON in an envelope, and nothing
+  that says "this is a page". Research recognises the page from the call's `url` argument and cites it with title and address;
 - `delete_page` exists only to prove that `allowed_tools` keeps research away from it;
 - `MCP_STUB_LATENCY` (seconds per call) rehearses slow tools and the time budget; `MCP_STUB_LOG` writes one JSON line per call.
 

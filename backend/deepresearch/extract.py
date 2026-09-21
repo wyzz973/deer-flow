@@ -15,9 +15,9 @@ import json
 import re
 from urllib.parse import urlsplit
 
-URL_KEYS = ("url", "link", "href", "uri", "source_url", "sourceUrl", "sourceURL", "page_url", "pageUrl", "website", "permalink")
+URL_KEYS = ("url", "link", "href", "uri", "source_url", "sourceUrl", "sourceURL", "page_url", "pageUrl", "web_url", "webUrl", "doc_url", "document_url", "website", "permalink")
 TITLE_KEYS = ("title", "name", "headline", "document_name", "doc_name", "docnm_kwd", "document_keyword", "file_name", "filename", "source_title")
-TEXT_KEYS = ("snippet", "summary", "description", "content", "text", "body", "abstract", "excerpt", "highlight", "highlights", "raw_content", "markdown", "chunk", "content_with_weight", "answer")
+TEXT_KEYS = ("snippet", "summary", "description", "desc", "content", "text", "body", "abstract", "excerpt", "passage", "highlight", "highlights", "raw_content", "page_content", "markdown", "chunk", "content_with_weight", "answer")
 DOCUMENT_TEXT_KEYS = ("markdown", "raw_content", "content", "text", "body", "html_content", "page_content")
 DATE_KEYS = (
     "published_at",
@@ -85,6 +85,27 @@ def parse_json(value):
     return value
 
 
+WRAPPER_KEYS = ("result", "output", "data", "content", "text", "response")
+
+
+def unwrap(value):
+    """The answer inside what servers and adapters wrap it in.
+
+    A tool that returns a string reaches us as ``{"result": "<that string>"}``
+    (MCP structured content), and the string is often JSON itself. Found in a
+    real run: the page's title and text were two levels down and never seen.
+    """
+    for _ in range(4):
+        value = parse_json(value)
+        if not (isinstance(value, dict) and len(value) == 1):
+            break
+        ((key, inner),) = value.items()
+        if not (isinstance(inner, str) and key in WRAPPER_KEYS):
+            break
+        value = inner
+    return value
+
+
 def content_text(content):
     """Text of a tool result: a string, LangChain/MCP content blocks or JSON."""
     if isinstance(content, str):
@@ -108,6 +129,12 @@ def content_text(content):
 # in a list of such chunks (a knowledge-base tool returning {content, score,
 # doc_id}). Shorter strings are labels or status fields, not content.
 MIN_CHUNK_CHARS = 40
+CJK = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]")
+
+
+def _weight(text):
+    """Length in Latin characters: a Chinese sentence of 25 characters says as much as 50 of English."""
+    return len(text) + len(CJK.findall(text))
 
 
 def _headline(text, limit=80):
@@ -124,7 +151,7 @@ def _record(item, text_limit, *, chunk=False):
     url = http_url(_first(item, URL_KEYS))
     title = _first(item, TITLE_KEYS)
     text = _first(item, TEXT_KEYS)
-    if chunk and not title and not url and text and len(text) >= MIN_CHUNK_CHARS:
+    if chunk and not title and not url and text and _weight(text) >= MIN_CHUNK_CHARS:
         title = _headline(html.unescape(text))
     if not ((url and (title or text)) or (title and text)):
         return None
@@ -139,9 +166,13 @@ def _record(item, text_limit, *, chunk=False):
     return record
 
 
-def records(value, *, limit=50, text_limit=1200):
-    """Result records from any JSON shape, Markdown links or labeled text blocks."""
-    value = parse_json(value)
+def records(value, *, limit=50, text_limit=1200, from_text=True):
+    """Result records from any JSON shape, Markdown links or labeled text blocks.
+
+    ``from_text=False`` keeps to structured answers: links in running text are
+    places a document mentions, not records it returns.
+    """
+    value = unwrap(value)
     found, seen = [], set()
 
     def add(record):
@@ -181,10 +212,31 @@ def records(value, *, limit=50, text_limit=1200):
 
     if isinstance(value, (dict, list)):
         walk(value)
-    if found:
+    if found or not from_text:
         return found[:limit]
     text = content_text(value)
     return text_records(text, limit=limit, text_limit=text_limit)
+
+
+def coverage(value, found):
+    """How much of a structured answer's text its records carry, 0 to 1.
+
+    Records are recognised by shape. When they hold nearly everything the
+    answer said, the answer as a whole adds nothing to cite; when a shape was
+    read only in part, or long texts were cut, the whole answer still matters.
+    """
+    total = 0
+    pending = [unwrap(value)]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, dict):
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+        elif isinstance(item, str):
+            total += len(item.strip())
+    kept = sum(len(record.get("snippet") or "") + len(record.get("url") or "") + (len(record.get("title") or "") if record.get("title") not in (record.get("snippet") or "") else 0) for record in found)
+    return min(1.0, kept / total) if total else 0.0
 
 
 def text_records(text, *, limit=50, text_limit=1200):
@@ -213,15 +265,17 @@ def text_records(text, *, limit=50, text_limit=1200):
 
 def document(value, requested_url=None):
     """The readable text, title and address of one fetched document."""
-    value = parse_json(value)
+    value = unwrap(value)
     title = url = None
     text = None
+    readable = True  # False when no field held the text and the whole answer stands in for it
     if isinstance(value, dict):
         # Common envelopes: {"data": {...}}, {"results": [{...}]}.
         inner = value
         for key in ("data", "result", "document", "page"):
-            if isinstance(inner.get(key), dict):
-                inner = inner[key]
+            nested = parse_json(inner.get(key))
+            if isinstance(nested, dict):
+                inner = nested
         if isinstance(inner.get("results"), list) and inner["results"] and isinstance(inner["results"][0], dict):
             inner = inner["results"][0]
         texts = [inner[key] for key in DOCUMENT_TEXT_KEYS if isinstance(inner.get(key), str) and inner[key].strip()]
@@ -230,6 +284,7 @@ def document(value, requested_url=None):
         title = _first(inner, TITLE_KEYS) or _first(metadata, TITLE_KEYS)
         url = http_url(_first(inner, URL_KEYS) or _first(metadata, URL_KEYS))
         if text is None:
+            readable = False
             text = json.dumps(value, ensure_ascii=False, indent=1, default=str)
     else:
         text = content_text(value)
@@ -240,7 +295,7 @@ def document(value, requested_url=None):
     if not title:
         match = HTML_TITLE.search(text[:20000])
         title = html.unescape(re.sub(r"\s+", " ", match.group(1))).strip() if match else None
-    return {"title": (title or url or requested_url or "")[:1000], "url": url or requested_url, "text": text}
+    return {"title": (title or url or requested_url or "")[:1000], "url": url or requested_url, "text": text, "readable": readable}
 
 
 def render_search(query, found, provider, *, citable=False):

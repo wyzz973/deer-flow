@@ -1,19 +1,29 @@
 """Project native execution records into research references after execution.
 
-Nothing here sits between a tool and the research model. The only structures
-we inspect are DeerFlow/LangChain's own ToolMessage and tool receipt envelopes;
-the tool's business payload stays opaque. A receipt proves a call occurred,
-not that the model's interpretation of its result is correct.
+Nothing here sits between a tool and the research model: tools keep their own
+schemas and the model reads their results unchanged. Afterwards the archived
+ToolMessages are turned into evidence. A research source says what it returned
+in an artifact of its own; a directly exposed tool (an MCP server's, the
+host's) says nothing, so the page it opened or the records it returned are
+looked up in its arguments and its answer, whatever shape that has. A receipt
+proves a call occurred, not that the model's interpretation of its result is
+correct.
 """
 
 import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import extract
 from .channels import BUDGET_STOP
 from .contracts import RawEvidence
 from .evidence import digest
-from .sources import fetched_source, observed_sources
+from .sources import fetched_source, observed_sources, opened_pages
+
+# Share of an answer's text its records must carry for the records alone to be cited.
+RECORDS_COVER_ANSWER = 0.8
+# Artifacts research sources emit about their own result.
+OWN_ARTIFACTS = {"deerflow.web_page.v1", "deepresearch.search.v1", "deepresearch.records.v1"}
 
 
 @dataclass
@@ -161,7 +171,8 @@ def research_observations(execution: NativeExecution, sources, cite_search_resul
         if page is not None:
             document_id = "doc_" + digest([execution.execution_id, call_id, page["fetched"]["id"]])[:24]
             raw_ref = f"execution:{execution.execution_id}:{call_id}"
-            document = derive(page["item"], raw_id=document_id, snippet=text[:20000], raw_content_ref=raw_ref, source_uri=None, provenance="fetched_document", title=page["fetched"]["title"], url=page["fetched"]["url"])
+            known = page["fetched"]
+            document = derive(page["item"], raw_id=document_id, snippet=text[:20000], raw_content_ref=raw_ref, source_uri=known.get("source_uri"), provenance="fetched_document", title=known["title"], url=known["url"])
             if document is None:
                 continue
             evidence[document_id] = document
@@ -203,6 +214,12 @@ def research_observations(execution: NativeExecution, sources, cite_search_resul
         )
         evidence[raw_id] = item
         fetched = fetched_source(artifact, connector=source.name if source else name, origin=item.origin) if source and source.kind in {"native", "channel"} else None
+        # A directly exposed tool describes nothing: what it opened or returned
+        # is read from its arguments and its answer.
+        undescribed = bool(source) and not (isinstance(artifact, dict) and artifact.get("schema") in OWN_ARTIFACTS)
+        structured = artifact.get("structured_content") if isinstance(artifact, dict) else None
+        answer = structured if isinstance(structured, (dict, list)) else text
+        opened = opened_pages(call.get("args"), answer, text, connector=source.name, origin=item.origin) if undescribed and source.role == "read" else []
         # A knowledge source's records become separate citable evidence with
         # their own titles; the combined tool output stays as a superseded copy.
         records = artifact.get("records") if source and source.role == "data" and isinstance(artifact, dict) and artifact.get("schema") == "deepresearch.records.v1" else None
@@ -211,6 +228,15 @@ def research_observations(execution: NativeExecution, sources, cite_search_resul
         # its title and link instead of the whole result list.
         if records is None and cite_search_results and source and source.role == "search" and isinstance(artifact, dict) and artifact.get("schema") == "deepresearch.search.v1":
             records = [record for record in artifact.get("results") or [] if isinstance(record, dict) and not record.get("opaque")]
+        # The same for a directly exposed search or knowledge tool that answers
+        # with structured records. They are found by shape, so unless they carry
+        # nearly all of the answer it stays citable next to them: a format read
+        # only in part, or texts cut to length, must not lose the rest. Links in
+        # a text answer remain observed sources, as before.
+        found_by_shape = False
+        if records is None and undescribed and (source.role == "data" or (source.role == "search" and cite_search_results)):
+            records = extract.records(answer, limit=50, text_limit=1200 if source.role == "search" else 4000, from_text=False) or None
+            found_by_shape = bool(records) and extract.coverage(answer, records) < RECORDS_COVER_ANSWER
         recorded_urls = set()
         if records:
             for index, record in enumerate(records[:100]):
@@ -237,7 +263,20 @@ def research_observations(execution: NativeExecution, sources, cite_search_resul
                 if link:
                     recorded_urls.add(canonical_url(link))
                 catalog.append({"raw_id": record_id, "receipt_id": receipt.get("id"), "tool_call_id": call_id, "tool_name": name, "origin": item.origin, "title": found.title, "url": link, "record": index + 1})
-        if fetched:
+        for page in opened:
+            document_id = "doc_" + digest([execution.execution_id, call_id, page["id"]])[:24]
+            address = {"title": page["title"], "url": page["url"], "source_uri": page["source_uri"]}
+            document = derive(item, raw_id=document_id, source_id=page["id"], snippet=page["text"][:20000], provenance="fetched_document", document_hash=page["document_hash"], **address)
+            if document is None:
+                continue
+            evidence[document_id] = document
+            fetched = fetched or page
+            if len(opened) == 1 and (external := _externalized_path(message, text)):
+                pages[external] = {"fetched": page, "item": document}
+            if page["canonical_url"]:
+                recorded_urls.add(page["canonical_url"])
+            catalog.append({"raw_id": document_id, "receipt_id": receipt.get("id"), "tool_call_id": call_id, "tool_name": name, "origin": item.origin, **address, "provenance": "fetched_document"})
+        if fetched and not opened:
             document_id = "doc_" + digest([execution.execution_id, call_id, fetched["id"]])[:24]
             document = derive(item, raw_id=document_id, title=fetched["title"], url=fetched["url"], source_id=fetched["id"], source_uri=None, provenance="fetched_document", document_hash=fetched["document_hash"])
             if document is None:
@@ -250,7 +289,7 @@ def research_observations(execution: NativeExecution, sources, cite_search_resul
                     pages[external] = {"fetched": fetched, "item": document}
                 catalog.append({"raw_id": document_id, "receipt_id": receipt.get("id"), "tool_call_id": call_id, "tool_name": name, "origin": item.origin, "url": fetched["url"], "title": fetched["title"], "provenance": "fetched_document"})
         for observed in observed_sources(text, connector=source.name if source else name, origin=item.origin):
-            if fetched and observed["canonical_url"] == fetched["canonical_url"]:
+            if fetched and not opened and observed["canonical_url"] == fetched["canonical_url"]:
                 continue
             if observed["canonical_url"] in recorded_urls:
                 continue  # already cited as its own search result
@@ -262,7 +301,11 @@ def research_observations(execution: NativeExecution, sources, cite_search_resul
             catalog.append({"raw_id": document_id, "receipt_id": receipt.get("id"), "tool_call_id": call_id, "tool_name": name, "origin": item.origin, "url": observed["url"], "title": observed["title"], "excerpt": observed["excerpt"]})
         # When the native reader registered the page itself, cite that page
         # (with its URL) rather than the anonymous tool envelope.
-        catalog.append({"raw_id": raw_id, "receipt_id": receipt.get("id"), "tool_call_id": call_id, "tool_name": name, "origin": item.origin, "excerpt": item.snippet, "superseded": bool(fetched or records)})
+        envelope = {"raw_id": raw_id, "receipt_id": receipt.get("id"), "tool_call_id": call_id, "tool_name": name, "origin": item.origin, "excerpt": item.snippet, "superseded": bool(fetched or (records and not found_by_shape))}
+        if source:
+            # What was asked: the converter matches the notes to a call by it.
+            envelope["title"] = item.title
+        catalog.append(envelope)
     return list(evidence.values()), catalog
 
 
@@ -290,6 +333,8 @@ def ground_source_annotations(evidences, annotations):
         # A link seen in a result list sits next to other results. Its quote must
         # come from its own surroundings, or a neighbour's sentence would be
         # shown under this link's address.
-        scope = normalize(evidence.snippet) if evidence.provenance == "observed_source" else body
+        # A read page's own text counts too: inside a JSON answer the same
+        # sentence is escaped and would never match.
+        scope = normalize(evidence.snippet) if evidence.provenance == "observed_source" else body + " " + normalize(evidence.snippet)
         if annotation.quote.strip() and normalize(annotation.quote) in scope:
             evidence.snippet = annotation.quote.strip()

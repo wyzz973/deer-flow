@@ -46,7 +46,8 @@ sources:
 
 - 自定义 HTTP 接口用 `type: http`，模板变量 `{query}`、`{max_results}`、`{url}`、`{time_range}`。
 - MCP 工具用 `type: mcp`（`server` + `tool`，参数按工具 schema 自动对应），服务写在研究自己的 `mcp_servers` 里。
-- 想保留某个 MCP 工具自己的参数 schema，就把数据源写成 `kind: mcp`（不填 `providers`）。
+- 想保留某个 MCP 工具自己的参数 schema，就把数据源写成 `kind: mcp`（不填 `providers`），并如实填 `role`：能打开原文的填 `read`，
+  只返回摘录或搜索结果的填 `search`，知识库记录填 `data`。读取工具打开的页面会按调用参数里的地址登记为可引用的原文。
 - 返回格式不固定没关系：系统会从 JSON、Markdown 链接、`Title/URL` 文本块或 HTML 中识别标题、链接与正文。
 - 凭据只写 `$环境变量` 或 `secret:名字`，绝不放进模型可见的参数里。设置页可以单独测试每个供应商并查看健康状态。
 - 旧字段 `query_arg`、`fixed_args`、`results_path`、`fields`、`response_mode` 已无执行效果，可以删掉。

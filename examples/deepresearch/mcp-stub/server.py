@@ -3,6 +3,9 @@
 - Streamable HTTP, protected by BOTH a bearer token and a session cookie.
 - Search only: nothing here returns a full original document.
 - Every tool answers in a different shape, the way real internal tools do.
+- ``find_pages`` + ``open_page`` rehearse a search and a fetch tool exposed to
+  research directly (``kind: mcp``): results under unusual field names, the page
+  in a JSON envelope with escaped text, and nothing that says "this is a page".
 - One dangerous tool that research must never be able to call.
 """
 
@@ -78,6 +81,32 @@ async def search_tickets(q: str, size: int = 5) -> dict:
     found = search("ticket", q, size)
     log(tool="search_tickets", query=q, results=len(found))
     return {"name": "ticket_search", "description": "工单检索结果", "total": len(found), "items": [{"headline": item["title"], "summary": item["text"], "ticket_id": item["id"], "date": item["date"]} for item in found]}
+
+
+PAGE_BASE = "https://wiki.corp.example/"
+
+
+@mcp.tool()
+async def find_pages(query: str, count: int = 5) -> str:
+    """Search pages. Returns links with a one-line summary; open a page to read it."""
+    await asyncio.sleep(LATENCY)
+    found = search("wiki", query, count) + search("doc", query, count)
+    log(tool="find_pages", query=query, results=len(found))
+    return json.dumps({"code": 0, "data": {"hits": [{"headline": item["title"], "link": PAGE_BASE + item["id"], "desc": item["text"][:36] + "…"} for item in found[:count]]}})
+
+
+@mcp.tool()
+async def open_page(url: str, max_chars: int = 4000) -> str:
+    """Open one page by its link and return its text."""
+    await asyncio.sleep(LATENCY)
+    item = next((item for item in CORPUS if url.rstrip("/") == PAGE_BASE + item["id"]), None)
+    log(tool="open_page", query=url, results=int(item is not None))
+    if item is None:
+        return "404 not found"
+    related = [other for other in CORPUS if other is not item and other["kind"] == item["kind"]][:2]
+    body = f"# {item['title']}\n\n更新时间：{item['date']}\n\n{item['text']}\n\n## 相关页面\n" + "\n".join(f"- [{other['title']}]({PAGE_BASE}{other['id']})" for other in related)
+    # ensure_ascii on purpose: many servers escape non-ASCII text.
+    return json.dumps({"code": 0, "data": {"title": item["title"], "content": body[:max_chars], "truncated": len(body) > max_chars}})
 
 
 @mcp.tool()

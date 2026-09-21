@@ -18,7 +18,7 @@
 
 | 错误码 | 含义 | 通常的根因 / 去哪看 |
 | --- | --- | --- |
-| `NO_EVIDENCE` | 没有任何带可引用证据的发现 | **先看工具调用数**：为 0 且每步只有 1 轮、`finish_reason=tool_calls` → 工具调用被 Token 预算摘掉了（底稿 `budget-too-small`），和检索工具无关（这种情况现在的错误文案会直接指出预算且 `recoverable=false`；旧版本记录的运行仍写着“请检查检索/读取工具”，不要被它带偏）。工具调用不为 0 → 检索供应商全失败；结果只有摘录而 `cite_search_results=false`；conversion 丢弃了无证据结论 |
+| `NO_EVIDENCE` | 没有任何带可引用证据的发现 | **先看工具调用数**：为 0 且每步只有 1 轮、`finish_reason=tool_calls` → 工具调用被 Token 预算摘掉了（底稿 `budget-too-small`），和检索工具无关（这种情况现在的错误文案会直接指出预算且 `recoverable=false`；旧版本记录的运行仍写着“请检查检索/读取工具”，不要被它带偏）。工具调用不为 0 → 检索供应商全失败；结果只有摘录而 `cite_search_results=false`；conversion 丢弃了无证据结论（底稿 `findings-pruned`，事件 `research.output.pruned`）。**研究员明明读了页面却没有可引用证据**时，打开该步的 conversion 调用看 `observed_calls`：条目只有 `raw_id`/`tool_name`、没有 `url`/`title`，说明工具的返回没被识别成页面或记录——2026-09-21 之前直接暴露的 MCP 读取工具（`kind: mcp` + `role: read`）就是这样；现在页面地址取自调用参数，见 `sources.opened_pages`。也检查数据源的 `role` 填得对不对：把能打开原文的工具填成 `search`，它读到的内容就只是“发现”|
 | `RESEARCH_GAPS` | 有缺口且不允许带局限出报告 | `allow_limited_report=false`；看 `gaps` 的 code |
 | `BUDGET_EXHAUSTED` / `RESEARCH_BUDGET_SPENT` / `TIME_BUDGET` / `RESEARCH_TIME_SPENT` | Token、工具调用或时间预算用完 | 每步份额 =（`max_model_tokens` − 报告预留 − 已用）÷ 并行步骤数 − 8192，太小时第一轮就被收尾；接口创建任务时省略 `budget` 会用很小的默认值（12 万） |
 | `NATIVE_AGENT_TIMEOUT` | 一次角色执行超时 | 慢模型 + 长上下文；调 `nodes.<节点>.timeout_seconds`、`max_seconds_per_unit`，或减小上下文（`max_searches_per_unit`、压缩） |

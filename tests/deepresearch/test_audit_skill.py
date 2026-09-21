@@ -86,6 +86,8 @@ async def recorded_run(tmp_path):
     await store.record_agent_run(RUN, "exec-1", {"config_node": "research", "purpose": "agent", "skill": "technical-route", "unit_id": "R1", "status": "completed", "duration_ms": 130000, "model_calls": 2, "tool_calls": 4})
     await store.save_unit(RUN, "0:R1", "h", {"unit_id": "R1", "findings": [{"claim": "c"}], "raw_evidences": [{}], "open_questions": ["q"], "limitations": []})
     await store.event(RUN, "report.draft.repair", {"task": "report-section-1", "attempt": 1, "problems": 1})
+    # The converter could not match two conclusions of the notes to citable evidence.
+    await store.event(RUN, "research.output.pruned", {"unit_id": "R1", "findings": 2, "references": 3})
     return home
 
 
@@ -110,7 +112,8 @@ def test_a_recorded_run_becomes_a_fact_sheet_with_findings_an_auditor_can_act_on
     assert (breaks["turns_compared"], breaks["breaks"]) == (1, 1)
     assert breaks["examples"][0]["shared_messages"] == 1 and breaks["examples"][0]["preview"].startswith("## Tool receipts")
     codes = {item["code"] for item in facts["findings"]}
-    assert {"provider-failing", "slow-tools"} <= codes
+    assert {"provider-failing", "slow-tools", "findings-pruned"} <= codes
+    assert "裁掉了 2 条结论、3 处引用" in next(item["title"] for item in facts["findings"] if item["code"] == "findings-pruned")
     assert facts["process"]["draft_repairs"] == {"report-section-1": 1} and facts["process"]["open_gaps"] == [{"unit_id": "R1", "code": "open-questions"}]
     sheet = (out / "audit-11111111.md").read_text(encoding="utf-8")
     assert "## 1. 需要关注的发现" in sheet and "web_search/serper" in sheet and "## 4. 提示词缓存" in sheet

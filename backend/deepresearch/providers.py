@@ -505,7 +505,9 @@ async def mcp(spec, request, *, servers, request_secrets=None):
     payload = structured if structured is not None else text
     if request.role == "read":
         found = extract.document(payload if structured is not None else text, request.url)
-        if structured is not None and len(text) > len(found["text"]):
+        # The tool's text is the better copy only when no field of the structured
+        # answer held the page; otherwise it is the same page as escaped JSON.
+        if structured is not None and not found["readable"] and len(text) > len(found["text"]):
             found["text"] = text
         return _page(found["title"], found.get("url") or request.url, found["text"], payload)
     records = extract.records(payload, limit=request.max_results, text_limit=1200 if request.role == "search" else 4000)

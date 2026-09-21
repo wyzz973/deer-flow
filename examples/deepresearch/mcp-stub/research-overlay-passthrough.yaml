@@ -1,0 +1,54 @@
+# Acceptance overlay: research that searches AND reads only through MCP tools exposed
+# directly (`kind: mcp`). The model sees the server's own tool schemas and answers;
+# nothing tells research "this is a page" - the page is recognised after execution from
+# the call's arguments and its answer. Before 2026-09-21 such a research ended with
+# NO_EVIDENCE. Start the stub as in README.md, then:
+#   ... python -m deepresearch.live --allow-live --model <model> \
+#         --research-overlay examples/deepresearch/mcp-stub/research-overlay-passthrough.yaml --port 8011
+sources:
+  - name: public-web-search
+    enabled: false
+    tool: web_search_builtin
+    role: search
+    origin: external
+    providers: [{id: duckduckgo, type: duckduckgo}]
+  - name: public-web-read
+    enabled: false
+    tool: web_fetch_builtin
+    role: read
+    origin: external
+    providers: [{id: direct, type: direct}]
+  - name: mcp-search
+    kind: mcp
+    server: kb
+    tool: web_search
+    mcp_tool: find_pages
+    role: search
+    origin: internal
+    level: L2
+    publisher: kb-wiki
+  - name: mcp-fetch
+    kind: mcp
+    server: kb
+    tool: web_fetch
+    mcp_tool: open_page
+    role: read
+    origin: internal
+    level: L2
+    publisher: kb-wiki
+source_fallback: [mcp-search, mcp-fetch]
+require_dual_source: false
+mcp_servers:
+  kb:
+    transport: http
+    url: http://127.0.0.1:9731/mcp
+    headers:
+      Authorization: Bearer ${MCP_STUB_TOKEN}
+      Cookie: sid=${MCP_STUB_COOKIE}; lang=zh
+    allowed_tools: [find_pages, open_page]
+    timeout_seconds: 30
+plan_min_units: 2
+plan_max_units: 2
+max_searches_per_unit: 6
+supplement_gap_codes: []
+plan_countdown_seconds: 3
