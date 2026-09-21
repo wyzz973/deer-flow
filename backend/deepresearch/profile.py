@@ -56,6 +56,8 @@ EDITABLE = (
     "max_report_sections",
     "report_length_scale",
     "trace_capture_content",
+    "tool_audit",
+    "wire_audit",
     "llm_audit",
     "pricing",
 )
@@ -74,12 +76,18 @@ OPERATOR_ONLY = (
     "native_tools",
     "source_priority_file",
     "trace_max_chars",
+    "audit_max_chars",
+    "audit_retention_days",
     "tool_timeout_seconds",
     "tool_retries",
 )
 # Fields added after run fingerprints existed. Removing them at their defaults
 # keeps the fingerprint of an unchanged operator file identical across upgrades.
 LATER_FIELDS = {
+    "tool_audit",
+    "wire_audit",
+    "audit_max_chars",
+    "audit_retention_days",
     "prompts",
     "models",
     "default_model",

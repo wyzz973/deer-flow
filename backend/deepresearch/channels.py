@@ -22,7 +22,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from . import extract
+from . import extract, wire
 from .audit import scrub_text
 from .contracts import ResearchError
 from .evidence import canonical_url, digest
@@ -180,7 +180,7 @@ async def run_providers(source, request, settings, request_secrets=None):
             attempts.append({"provider": provider.id, "type": provider.type, "status": "ok", "ms": milliseconds})
             return provider, outcome, skipped + attempts
         milliseconds = round((time.monotonic() - started) * 1000)
-        attempts.append({"provider": provider.id, "type": provider.type, "status": "error", "kind": failure.kind, "message": _message(failure), "ms": milliseconds})
+        attempts.append({"provider": provider.id, "type": provider.type, "status": "error", "kind": failure.kind, "message": _message(failure), "http_status": failure.status, "ms": milliseconds})
         if failure.kind in PROVIDER_FAILURES:
             HEALTH.failure(key, source, provider, failure)
     if empty is not None:
@@ -224,10 +224,14 @@ BUDGET_STOP = "deepresearch.budget_stop.v1"
 class Stop:
     reason: Literal["step", "run", "time"]
     text: str
+    # How much of the allowance was gone when this refusal happened. The event
+    # is emitted once per reason, so without these the repeats say only "no".
+    used: int | None = None
+    limit: int | None = None
 
     @property
     def artifact(self):
-        return {"schema": BUDGET_STOP, "reason": self.reason}
+        return {"schema": BUDGET_STOP, "reason": self.reason, "scope": self.reason, **{key: value for key, value in {"used": self.used, "limit": self.limit}.items() if value is not None}}
 
 
 class SearchBudget:
@@ -256,13 +260,13 @@ class SearchBudget:
         """Account one source call, or return the Stop that ends it."""
         if self.deadline is not None and time.monotonic() >= self.deadline:
             text = "Stop: the time for this research step is used up. Do not call search or read tools again. Write your research notes now from the evidence you already collected and say what remains unverified."
-            return await self._wrap_up(Stop("time", text))
+            return await self._wrap_up(Stop("time", text, self.used, self.limit))
         searching = kind != "read"
         if searching:
             if self.limit is not None and self.used >= self.limit:
                 text = f"No more searches in this step: it has used all {self.limit} of its searches. You may still open pages you already found with the read tool; "
                 text += "then write your research notes from that evidence and say what remains unverified."
-                return await self._wrap_up(Stop("step", text))
+                return await self._wrap_up(Stop("step", text, self.used, self.limit))
             # Claim the slot before waiting on the ledger: searches sent in one
             # turn run concurrently and would otherwise all see it free.
             self.used += 1
@@ -274,7 +278,7 @@ class SearchBudget:
             if error.code != "BUDGET_EXHAUSTED":
                 raise
             text = "Stop: the research-wide tool budget is used up. Write your research notes now from the evidence you already collected, say what remains unverified, and do not call search or read tools again."
-            return await self._wrap_up(Stop("run", text))
+            return await self._wrap_up(Stop("run", text, self.used, self.limit))
         return None
 
     def call_timeout(self):
@@ -295,7 +299,7 @@ class SearchBudget:
         return stop
 
 
-def build_tool(source, settings, run_id, request_secrets=None, budget=None):
+def build_tool(source, settings, run_id, request_secrets=None, budget=None, recorder=None):
     """One StructuredTool for a provider-based source; returns (content, artifact)."""
     from langchain_core.tools import StructuredTool, ToolException
 
@@ -371,6 +375,8 @@ def build_tool(source, settings, run_id, request_secrets=None, budget=None):
         return extract.render_records(source.name, found, provider.id), artifact
 
     coroutine, schema = {"search": (search, SearchArgs), "read": (read, ReadArgs), "data": (data, DataArgs)}[source.role]
+    if recorder is not None:
+        coroutine = wire.recorded(coroutine, recorder, tool=source.tool, source=source.name)
     return StructuredTool(name=source.tool, description=description, args_schema=schema, coroutine=coroutine, response_format="content_and_artifact", handle_tool_error=True)
 
 

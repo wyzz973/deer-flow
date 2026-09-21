@@ -486,6 +486,28 @@ def build_router(service, *, local_demo=False, demo_origins=None):
 
         return StreamingResponse(stream(), media_type="application/x-ndjson", headers={"Content-Disposition": f'attachment; filename="research-{run["run_id"]}-llm-calls.jsonl"', "Cache-Control": "no-store"})
 
+    @router.get("/{run_id}/log/export")
+    async def export_log(request: Request, compact: bool = False, run=Depends(owned)):
+        """Everything this run recorded, as one self-contained file.
+
+        The other exports each cover one layer. This one joins them so a reader
+        does not have to: the request and the settings, every event, every model
+        call with its prompt and answer, every tool call with its arguments and
+        its answer, every MCP and HTTP call behind those, the steps, the
+        evidence and the report.
+        """
+        from . import logbook
+
+        async def stream():
+            index = 0
+            async for line in logbook.export(service.store, run["run_id"], compact=compact):
+                index += 1
+                if index % 200 == 0:
+                    await owned(run["run_id"], request, run["owner"])
+                yield line + "\n"
+
+        return StreamingResponse(stream(), media_type="application/x-ndjson", headers={"Content-Disposition": f'attachment; filename="research-{run["run_id"]}-log.jsonl"', "Cache-Control": "no-store"})
+
     @router.get("/{run_id}/llm-calls/{call_id}")
     async def llm_call(call_id: str, run=Depends(owned)):
         from .audit import openai_request

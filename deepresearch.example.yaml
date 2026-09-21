@@ -174,9 +174,15 @@ supplement_gap_codes: [coverage, unsupported, missing-internal, missing-external
 # null: a quarter of the ceiling, 120-900 seconds.
 report_time_reserve_seconds: null
 output_retries: 2
-trace_capture_content: true
-trace_max_chars: 16000
+trace_capture_content: true       # master switch: off records no content at all
+trace_max_chars: 16000            # trace payloads only; the full copies live in the audit tables
 llm_audit: true                   # keep the complete prompt and answer of every model call
+tool_audit: true                  # keep the complete arguments and answer of every tool call
+wire_audit: true                  # keep every MCP invocation and HTTP provider request behind those tools
+audit_max_chars: 200000           # one recorded body; over it the record says it was cut
+# Days of recorded runs to keep. null keeps everything: pruning is explicit,
+# with `python -m deepresearch.logbook prune --data-dir <dir> --older-than 30d`.
+audit_retention_days: null
 # Write a report with explicit caveats when bounded supplementation cannot close
 # every gap. Evidence-free runs still fail. Set false to require owner consent.
 allow_limited_report: true

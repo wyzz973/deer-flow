@@ -17,7 +17,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import quote
 
-from . import extract
+from . import extract, wire
 from .audit import scrub_text
 from .secrets import SECRETS
 
@@ -155,6 +155,17 @@ def _brief(text):
 
 
 async def _http(spec, method, url, *, secrets=(), headers=None, params=None, body=None, raw=False, follow_redirects=True, user_agent=API_USER_AGENT, max_bytes=None):
+    """One HTTP request to a source, recorded when a wire recorder is bound."""
+    async with wire.outbound(
+        "http",
+        {"provider": spec.id, "provider_type": spec.type, "method": method, "url": url},
+        request={"headers": headers, "params": params, "body": body, "timeout_seconds": spec.timeout_seconds},
+        secrets=secrets,
+    ) as sent:
+        return await _request(spec, method, url, sent, secrets=secrets, headers=headers, params=params, body=body, raw=raw, follow_redirects=follow_redirects, user_agent=user_agent, max_bytes=max_bytes)
+
+
+async def _request(spec, method, url, sent, *, secrets=(), headers=None, params=None, body=None, raw=False, follow_redirects=True, user_agent=API_USER_AGENT, max_bytes=None):
     import httpx
 
     try:
@@ -178,6 +189,9 @@ async def _http(spec, method, url, *, secrets=(), headers=None, params=None, bod
         raise ProviderError("timeout", f"{type(exc).__name__} after {spec.timeout_seconds:g}s") from None
     except httpx.HTTPError as exc:
         raise ProviderError("network", type(exc).__name__) from None
+    # Recorded before the 4xx raise, so a rate-limited or refused call keeps the
+    # provider's own explanation instead of the 300 characters the attempt keeps.
+    sent.responded(response)
     if response.status_code >= 400:
         text = scrub_text(response.text[:600], secrets)
         raise ProviderError(classify(response.status_code, text), f"HTTP {response.status_code}: {_brief(text)}", status=response.status_code, retry_after=_retry_after(response.headers.get("retry-after")))
@@ -493,8 +507,12 @@ async def mcp(spec, request, *, servers, request_secrets=None):
 
     tool = await MANAGER.tool(spec.server, servers[spec.server], spec.tool, request=request_secrets)
     arguments = _render(spec.arguments, request) if spec.arguments else infer_arguments(tool, request)
+    # Which parameter the heuristic picked: a wrong guess used to be invisible
+    # afterwards, leaving a source that always returned nothing unexplained.
+    asked = request.url if request.role == "read" else request.query
+    guessed = None if spec.arguments else next((name for name, value in arguments.items() if value == asked), None)
     try:
-        result = await asyncio.wait_for(MANAGER.call(tool, arguments), spec.timeout_seconds)
+        result = await asyncio.wait_for(MANAGER.call(tool, arguments, server=spec.server, provider=spec.id, argument_name=guessed), spec.timeout_seconds)
     except TimeoutError:
         raise ProviderError("timeout", f"MCP tool timed out after {spec.timeout_seconds:g}s") from None
     content, artifact, status = result

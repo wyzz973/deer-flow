@@ -31,6 +31,7 @@ Base: `/api/deepresearch`，由 DeerFlow Gateway 扩展路由提供。生产请�
 | GET | `/{id}/llm-calls` | 本次研究的全部模型调用（含指标；`audited: false` 表示早于审计或关闭了内容记录） |
 | GET | `/{id}/llm-calls/{call_id}` | 一次调用的完整消息、工具定义、参数、返回、与上一次调用的差异、可重建的 OpenAI 请求 |
 | GET | `/{id}/llm-calls/export` | JSONL：逐条调用的完整请求与返回 |
+| GET | `/{id}/log/export?compact=false` | **整包导出**：一次研究的全部记录合成一个 JSONL（运行快照、设置快照、事件、每次模型调用的完整请求与返回、每次工具调用的完整参数与返回、每次 MCP 与 HTTP 往返、子 Agent、研究步骤、证据、报告）。正文已还原，文件自包含；`compact=true` 去掉与调用记录重复的 span payload |
 | GET | `/settings` | 研究设置：当前值、配置文件默认值、已覆盖字段、运维上限、目录（含 `catalog.nodes`、`catalog.gap_codes`）、凭据状态、供应商健康度。不能编辑的用户看到的请求头/环境变量/URL 里的明文凭据显示为 `[hidden]` |
 | POST | `/settings` | 管理员保存设置；`version` 不匹配返回 409 `PROFILE_VERSION`，校验失败返回 422 及字段路径。不接受角色 `path`、stdio MCP 服务、自定义模型类和请求头/环境变量里的明文凭据（只能写在运维配置文件里） |
 | POST | `/settings/reset` | 管理员把指定字段（或全部）恢复为配置文件 |

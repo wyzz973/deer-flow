@@ -236,7 +236,8 @@ async def test_a_directly_exposed_mcp_tool_is_metered_like_any_source(monkeypatc
     for query in ("a", "b", "c"):
         message = await tool.ainvoke({"type": "tool_call", "name": "wiki", "args": {"query": query}, "id": "call-" + query})
     assert served == ["a", "b"] and ledger.calls == 2
-    assert message.artifact == {"schema": BUDGET_STOP, "reason": "step"} and "No more searches" in message.content
+    # The refusal says how much of the allowance was gone, on every repeat and not only the first.
+    assert message.artifact == {"schema": BUDGET_STOP, "reason": "step", "scope": "step", "used": 2, "limit": 2} and "No more searches" in message.content
     assert [kind for kind, _ in ledger.events] == ["research.search.limited"]
 
 

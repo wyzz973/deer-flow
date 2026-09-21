@@ -424,6 +424,21 @@ class Settings(Contract):
     trace_max_chars: int = Field(default=16000, ge=1000, le=100000)
     # Complete prompts and answers of every model call (requires trace_capture_content).
     llm_audit: bool = True
+    # The arguments and the answer of every tool call, whole. The tool-call row
+    # keeps only metrics and a hash of the arguments on purpose, so without this
+    # a research whose sources are MCP tools cannot say what it sent or received.
+    tool_audit: bool = True
+    # Every outbound MCP invocation and HTTP provider request behind those tools:
+    # which server, which remote tool, the arguments actually sent, the status
+    # and the body that came back. Credentials are never part of it.
+    wire_audit: bool = True
+    # Ceiling for one recorded body. Over it the record says it was cut rather
+    # than clipping in silence. Measured: tool answers are a few thousand
+    # characters, a whole page up to a few hundred thousand.
+    audit_max_chars: int = Field(default=200000, ge=1000, le=2000000)
+    # Days of recorded runs to keep. None keeps everything: deleting research is
+    # the owner's decision, so retention is opt-in and pruning is explicit.
+    audit_retention_days: int | None = Field(default=None, ge=1, le=3650)
     # Every instruction sent to models; defaults live in prompts.py.
     prompts: PromptSet = Field(default_factory=PromptSet)
     # Context compaction for long role executions (engine summarization).

@@ -355,12 +355,44 @@ compaction:
 | `max_synthesis_repairs` | 1 | 0–3 | 章节引用有问题时的修复次数 |
 | `max_report_sections` | 8 | 2–12 | 报告最多章节数 |
 | `report_length_scale` | 1.0 | 0.2–3.0 | 报告长度系数：乘到计划的报告风格（brief / standard / detailed）对应的每章与摘要长度目标上，并把目标同时描述成“形态”（几段、至多几张表）。小于 1 时，明显超出上限（1.3 倍）的章节会得到一次“请缩短”的修复。模型并不严格按字数写：同一问题实测 1.0 约 2.9 万字、0.45 约 1.8 万字（ChatGPT 深度研究约 5 千字加表格）。长度只是目标，不会因此失败 |
-| `trace_capture_content` | `true` | 布尔 | Trace 是否记录内容（已脱敏） |
+| `trace_capture_content` | `true` | 布尔 | 总开关：关掉之后一律不记内容（Trace payload、模型审计、工具审计、线级审计都停），只剩计量 |
 | `llm_audit` | `true` | 布尔 | 是否保存每次模型调用的完整提示词与返回（“LLM 调用”审计） |
+| `tool_audit` | `true` | 布尔 | 是否保存每次工具调用的完整参数、返回与 artifact。关掉后工具调用只剩计量与参数哈希 |
+| `wire_audit` | `true` | 布尔 | 是否保存工具背后每一次 MCP 调用与 HTTP 供应商请求：服务器、真实远端工具名、实际发出的参数、状态码、返回体、重试链。凭据一律不记 |
+| `audit_max_chars` | 200000 | 1000–2000000 | 单条记录正文的上限。超出时记录显式标注 `truncated`，不静默截断。实测工具返回通常几千字符，整页最多几十万 |
+| `audit_retention_days` | `null` | 1–3650 | 保留多少天的运行记录。`null` 为不自动删除；设置后网关启动时清理一次。手动清理见下 |
 | `favicons` | `true` | 布尔 | 网关是否代取被引用网站图标。**离线必须 `false`** |
 | `source_fallback` | `[]` | 来源名列表 | 计划没指定来源时的默认顺序 |
 | `native_tools` | `null` | 工具名列表 | 可选的引擎工具上限（运维字段） |
 | `tool_timeout_seconds`、`tool_retries` | 45、1 | — | 旧版字段，当前不生效；超时在供应商的 `timeout_seconds` 里设置 |
+
+### 记录了什么，怎么整包取出来
+
+一次研究的记录分布在 `research.sqlite3` 的十几张表里：`research_run`（运行快照）、`research_profile_snapshot`（设置快照）、
+`research_event`（事件与 span）、`research_model_call` + `research_llm_exchange` + `research_llm_blob`（模型调用的计量与完整请求/返回）、
+`research_tool_call` + `research_tool_exchange`（工具调用的计量与完整参数/返回/artifact）、`research_wire_call`（每次 MCP 与 HTTP 往返）、
+`research_audit_blob`（前两者的正文，按内容去重压缩）、`research_agent_run`、`research_unit`、`research_evidence`、`research_report`。
+
+要读就整包导出成一个 JSONL，正文已还原、文件自包含：
+
+```sh
+backend/.venv/bin/python -m deepresearch.logbook export --data-dir <含 research.sqlite3 的目录> --run <id|前缀|页面 URL|thread|latest> --out run.jsonl
+# 或走接口：GET /api/deepresearch/{id}/log/export
+```
+
+每行一条，`record` 标明类型：`run`、`settings`、`event`、`model_call`、`tool_call`、`wire_call`、`agent_run`、`unit`、`evidence`、`report`。
+`tool_call` 把计量行和正文合在一起，`wire_call` 用 `call_id` 指回它所属的工具调用。一次六步研究约 2–20MB，加 `--compact` 去掉与调用记录重复的 span payload。
+
+**凭据永远不在里面**：API key、token、Cookie、`Authorization`、MCP 的 header 与 env 取值都被替换成 `[redacted]`；MCP 服务发现只记 header 的**名字**。
+
+### 清理
+
+代码里没有任何自动删除。磁盘会一直涨（实测一次研究的 LangGraph 检查点约 100–155MB），所以要么配 `audit_retention_days`，要么定期手动清：
+
+```sh
+backend/.venv/bin/python -m deepresearch.logbook prune --data-dir <目录> --older-than 30d --dry-run   # 先看会删什么
+backend/.venv/bin/python -m deepresearch.logbook prune --data-dir <目录> --older-than 30d             # 删掉并 VACUUM 回收空间
+```
 
 ## 11. `budget_ceiling`：研究预算上限
 

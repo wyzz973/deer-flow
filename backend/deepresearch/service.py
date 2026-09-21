@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from contextlib import AsyncExitStack
@@ -52,6 +53,22 @@ class ResearchService(ConversationLifecycle):
         self.fingerprint = None
         self.log_handler = None
 
+    async def _retain(self):
+        """Apply the configured retention, if there is one.
+
+        Deleting research is the owner's decision, so nothing goes without
+        ``audit_retention_days``; and a failure to prune must not stop a start.
+        """
+        days = getattr(self.settings, "audit_retention_days", None)
+        if not days:
+            return
+        try:
+            report = await self.store.prune((datetime.now(UTC) - timedelta(days=days)).isoformat())
+            if report["runs"]:
+                logger.info(json.dumps({"event": "research_pruned", "runs": len(report["runs"]), "rows": report.get("rows"), "days": days}))
+        except Exception as exc:  # noqa: BLE001 - retention must not block startup
+            logger.warning(json.dumps({"event": "research_prune_failed", "error": type(exc).__name__}))
+
     async def start(self, deps=None):
         from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
@@ -64,6 +81,7 @@ class ResearchService(ConversationLifecycle):
         try:
             await self.store.start()
             self.log_handler = install_log(self.settings.resolve(self.settings.data_dir))
+            await self._retain()
             bodies = {name: await asyncio.to_thread(self.operator.read_skill, name) for name in self.operator.skills}
             self.fingerprint = profile.fingerprint(self.operator, bodies)
             self.operator._skill_cache = bodies

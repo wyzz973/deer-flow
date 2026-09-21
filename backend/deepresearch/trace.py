@@ -18,7 +18,7 @@ from contextvars import ContextVar
 from logging.handlers import RotatingFileHandler
 from uuid import uuid4
 
-from .audit import audit_request, audit_response, request_summary, response_summary, shared_prefix
+from .audit import audit_request, audit_response, bounded, request_summary, response_summary, shared_prefix
 from .output import visible_text
 from .store import REPORT_CALL_OUTPUT, RESEARCH_TURN_OUTPUT
 
@@ -303,6 +303,7 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None, out
     self_metered = {source.tool for source in trace.settings.sources if source.kind == "channel" or (source.kind == "mcp" and source.server in trace.settings.mcp_servers)}
     # Full request/response audit follows the same content-capture switch.
     audited = trace.settings.trace_capture_content and getattr(trace.settings, "llm_audit", True)
+    tool_audited = trace.settings.trace_capture_content and getattr(trace.settings, "tool_audit", True)
     counters = ("model_calls", "model_errors", "unreported_model_calls", "tool_calls", "tool_errors", "input_tokens", "output_tokens", "total_tokens", "cache_read_tokens", "reasoning_tokens", "max_input_tokens")
 
     async def record_model(key, details):
@@ -571,6 +572,28 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None, out
             await audit(str(run_id), {"status": "error", "ended_at": utcnow(), "duration_ms": self.elapsed_ms(run_id), "error": {"code": code, "type": type(error).__name__, **({"status_code": status} if isinstance(status, int) else {})}})
             await self.finish(run_id, error=error)
 
+        async def exchange(self, run_id, details, payloads):
+            """Keep a tool call's own arguments and answer, whole.
+
+            ``research_tool_call`` holds the metrics a reader groups by and a
+            hash of the arguments, so a research with only MCP tools left no
+            answer to "what did we send, what came back". Bodies are bounded by
+            ``audit_max_chars`` and say so when they do not fit, because silent
+            clipping is worse than no record at all.
+            """
+            if not tool_audited:
+                return
+            try:
+                limit = trace.settings.audit_max_chars
+                kept = {name: bounded(value, trace.secrets, limit) for name, value in payloads.items() if value is not None}
+                measured = kept.pop("content", None)
+                if measured is not None:
+                    details = {**details, "chars": measured["chars"], "truncated": measured["truncated"]}
+                    kept["content"] = measured["value"]
+                await trace.store.record_tool_exchange(trace.run_id, str(run_id), details, payloads={name: value["value"] if isinstance(value, dict) and "value" in value else value for name, value in kept.items()})
+            except Exception as exc:
+                logger.warning(json.dumps({"event": "tool_audit_failed", "error": type(exc).__name__}))
+
         async def on_tool_start(self, serialized, input_str, *, run_id, **kwargs):
             name = (serialized or {}).get("name", "tool")
             inputs = kwargs.get("inputs") or input_str
@@ -579,7 +602,9 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None, out
             detail = redact(tool_detail(role, inputs), trace.secrets, 2000) if role else {}
             details = {**scope, "tool_name": name, "role": role, **detail}
             request = request_key(inputs, trace.secrets)
-            await trace.store.record_call(trace.run_id, str(run_id), {**details, "started_at": utcnow(), "status": "running", "span_id": str(run_id), "request_key": request})
+            started = utcnow()
+            await trace.store.record_call(trace.run_id, str(run_id), {**details, "started_at": started, "status": "running", "span_id": str(run_id), "request_key": request})
+            await self.exchange(run_id, {**details, "started_at": started}, {"arguments": inputs})
             self.totals["tool_calls"] += 1
             await trace.store.event(trace.run_id, "activity.tool.started", {**details, "call_id": str(run_id)})
             # Host and engine tools are reserved here; research sources reserve
@@ -617,9 +642,15 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None, out
                 # its time is used up. Nothing was searched, so it must not be
                 # counted as a search anywhere a reader or an operator looks.
                 page["budget_stop"] = artifact.get("reason") or "step"
+                # How much of the allowance was already gone, on every refusal
+                # and not only on the first one of each reason.
+                page.update({key: artifact[key] for key in ("used", "limit", "scope") if artifact.get(key) is not None})
             # Provider-based sources say which backend answered and what failed first.
             if isinstance(artifact, dict) and artifact.get("provider"):
-                attempts = [{key: item.get(key) for key in ("provider", "type", "status", "kind", "ms")} for item in (artifact.get("attempts") or [])[:10] if isinstance(item, dict)]
+                # Why a provider failed, not only that it did: the message and
+                # the status code are what tell a broken key from a rate limit.
+                kept = ("provider", "type", "status", "kind", "ms", "http_status", "cooldown_seconds", "message")
+                attempts = [{key: item.get(key) for key in kept if item.get(key) is not None} for item in (artifact.get("attempts") or []) if isinstance(item, dict)]
                 page.update(provider=artifact["provider"], provider_type=artifact.get("provider_type"), attempts=attempts, failovers=sum(item["status"] in {"error", "empty"} for item in attempts))
             elif status == "error" and spec and spec.kind == "channel":
                 from .channels import failed_attempts
@@ -645,6 +676,9 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None, out
                 found,
             )
             await trace.store.event(trace.run_id, "activity.tool.completed", call)
+            # What the row deliberately leaves out: the answer itself, whole.
+            ended = {key: call.get(key) for key in ("ended_at", "duration_ms")}
+            await self.exchange(run_id, {**ended, "status": status, **({"error_type": call.get("error_type")} if status == "error" else {})}, {"content": content, "artifact": getattr(output, "artifact", None)})
             returned_error = ResearchError("TOOL_RETURNED_ERROR", "Native tool returned an error result") if status == "error" else None
             await self.finish(run_id, payload=output, error=returned_error)
 
@@ -659,6 +693,9 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None, out
                 {**scope, "status": "error", "ended_at": utcnow(), "duration_ms": self.elapsed_ms(run_id), "tool_name": entry[1] if entry else "tool", "error_type": type(error).__name__},
             )
             await trace.store.event(trace.run_id, "activity.tool.completed", call)
+            # The message the model was handed: the row keeps only its bucket.
+            ended = {key: call.get(key) for key in ("ended_at", "duration_ms")}
+            await self.exchange(run_id, {**ended, "status": "error", "error_type": type(error).__name__}, {"content": str(error)})
             await self.finish(run_id, error=error)
 
     return LocalCallbacks()

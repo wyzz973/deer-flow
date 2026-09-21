@@ -16,7 +16,7 @@
 | 更早的基线 | `5fa0299c` `feat(deepresearch): unify native research chat and harden workflow recovery` |
 | 功能状态 | 交互、工作流、报告与前端改造完成；五次真实 DeepSeek 研究端到端完成；配置与 DeerFlow 解耦（研究自己的模型、数据源与供应商故障切换、MCP、角色、提示词、上下文压缩）、请求改写节点、设置页、LLM 调用审计均已完成并真实验收 |
 | 离线开发 | 不联网的本地 Agent 从 [OFFLINE_AGENT_GUIDE.md](OFFLINE_AGENT_GUIDE.md) 开始；配置见 [MODEL_CONFIGURATION.md](MODEL_CONFIGURATION.md)、[DEERFLOW_CONFIGURATION.md](DEERFLOW_CONFIGURATION.md)、[RESEARCH_CONFIGURATION.md](RESEARCH_CONFIGURATION.md)；模板在 `examples/deepresearch/offline/` |
-| 最近一轮 | 2026-09-21：直接暴露的 MCP 工具读到的页面可被引用（修复只用 MCP 检索时的 `NO_EVIDENCE`，第 3.7 节）；研究步骤接续调度与编辑计划时保留依赖（第 3.8 节）；运行审计的离线 HTML 页面与两项新分析（第 3.6 节技能部分）。此前 2026-09-19：全模块代码审查与修复、按节点调参、仅 MCP / 无原文研究、模型网关兼容、时间预算收尾，见第 3.6 节与第 4 节末尾 |
+| 最近一轮 | 2026-09-21：日志记全（工具出入参、MCP 协议层、HTTP 供应商层）、整包导出与保留期清理（第 3.9 节）；直接暴露的 MCP 工具读到的页面可被引用（修复只用 MCP 检索时的 `NO_EVIDENCE`，第 3.7 节）；研究步骤接续调度与编辑计划时保留依赖（第 3.8 节）；运行审计的离线 HTML 页面与两项新分析（第 3.6 节技能部分）。此前 2026-09-19：全模块代码审查与修复、按节点调参、仅 MCP / 无原文研究、模型网关兼容、时间预算收尾，见第 3.6 节与第 4 节末尾 |
 | 本次回归 | 见第 6 节 |
 | 未验证 | 干净克隆部署、生产构建、目标环境的 MCP 与 SSO、真实手机视口、报告事实逐条核验；远端 CI 以 GitHub Actions 结果为准 |
 
@@ -425,6 +425,53 @@ observations / report_policy / prompts / store 预算 / service 驱动），三�
 units、id、顺序与 depends_on”。用文字提的修改（`revision`）仍由模型决定。只有结构化 API 客户端走这条路，页面用的是 `plan/pause` + 消息。
 真实验证 `de4e545c`：编辑后 v2 为 `cost-model ← quota-sla`、`security-baseline ← scale-out`；运行中 `security-baseline` 在 `scale-out` 完成的同一时刻（25.3 秒）开始，
 此时 `quota-sla` 还要再跑 7 秒（32.2 秒结束，`cost-model` 随即开始）。这也是接续调度更清楚的一次实证。
+
+## 3.9 本轮完成的工作（2026-09-21）：日志记全 + 整包导出 + 保留期
+
+**起因**：需要「所有内容、请求、请求的结果、MCP 的请求都记录好」，并能拿到完整日志做分析。
+
+**盘点结果**（基于本机 14 次真实研究的数据库）：模型调用那一层本来就完整（`research_llm_exchange` + `research_llm_blob`，全部消息含 reasoning、工具定义、参数、完整回复，
+按内容去重压缩，单条上限 100 万字符）。缺的是另外三层：
+
+1. **工具调用**：`research_tool_call` 不存参数正文也不存返回正文，只有 16 位参数哈希 `request_key`、按 role 抽出的 `query[:300]` / `url[:2000]` 和 `output_chars`。
+   正文散在三处、上限各不相同：trace span 事件（16K，静默截断）、执行缓存（20K，且**只有成功完成的步骤才写**）、下一次模型请求的审计副本（100 万）。**错误原文从未落盘**。
+2. **MCP 协议层**：完全没有。`mcp.py` 的 `config={"callbacks": []}` 把内层调用对回调隐藏（这是对的，否则工具预算重复计费——真实事故：25 次搜索计成 41 次），
+   代价是服务器名、真实远端工具名、实际发出的参数、`isError`、`structured_content`、连接失败原因、工具发现结果全部不可见。
+3. **HTTP 供应商层**：完全没有。method、URL、请求体、状态码、响应体、重定向链一个没记；失败时错误体被砍到 300 字，写入调用行时再丢掉。
+
+外加：代码里搜不到任何 TTL、prune 或 VACUUM，本机 14 次研究已占 760MB（`research.sqlite3` 193MB + `checkpoints.sqlite3` 567MB，单次研究约 100–155MB 检查点）。
+
+**做了什么**
+
+- 新表 `research_tool_exchange`（与 `research_tool_call` 同键，存完整参数/返回/artifact/错误原文）、`research_wire_call`（一行一次 MCP 或 HTTP 往返，带 `call_id` 索引）、
+  `research_audit_blob`（两者的正文，内容寻址 + zlib 去重）。都是 `CREATE TABLE IF NOT EXISTS`，旧库自动兼容；新读取方法带 `missing_table` 守卫，
+  技能脚本只读打开旧库时返回空而不是抛错。
+- 新模块 `wire.py`：`WireRecorder` + 一个在**工具协程内部**绑定的 contextvar。不在构造处绑、也不在回调里绑——子 Agent 在自己的事件循环上跑工具（上下文是空的），
+  回调处理器又在自己的上下文副本里，两处都够不到发起调用的代码。任务创建时会继承当时的上下文，所以在协程里绑能一路传到 `asyncio.wait_for` / `asyncio.to_thread` 之下的每个叶子。
+- **关联方式**：LangChain 会给声明了 `callbacks` 参数的工具协程注入该次工具运行的子回调管理器，它的 `parent_run_id` 正是 `trace.on_tool_start` 用作 `research_tool_call` 行 ID 的那个值。
+  比往 artifact 里塞 ID 可靠得多——MCP 适配层经常返回 `None`，根本没有 dict 可塞。包装函数**不能**用 `functools.wraps`：`inspect.signature` 会跟随 `__wrapped__`，
+  注入会静默停止；也绝不能把那个管理器往里传，继承了它的调用会被计成第二次工具调用。
+- 两个接入点：`providers._http`（覆盖所有预设供应商与自定义 HTTP；`duckduckgo`/`ragflow`/`lightrag` 走自己的 SDK，不在覆盖内）和 `mcp.MANAGER.call` / `MANAGER.tools`。
+  签名只新增带默认值的 `recorder=None`，`runner._source_tools` 沿 `budget` 同一条路传下去。
+- 去掉静默截断：超过 `audit_max_chars` 的正文显式标 `truncated` 并记原长。
+- 补全既有字段：尝试链不再只留前 10 条、补 `http_status`/`cooldown_seconds`/`message`；预算拒绝的 artifact 带 `used`/`limit`/`scope`（以前只有第一条事件里有）。
+- 新模块 `logbook.py`：`export` 把一次研究的全部记录合成一个自包含 JSONL（10 种 `record`，正文已还原），`prune` 是唯一的删除路径（删 run 在所有表里的行 + VACUUM）。
+  接口 `GET /{id}/log/export`。四个新设置：`tool_audit`、`wire_audit`、`audit_max_chars`、`audit_retention_days`（默认 `null` = 不自动删）。
+
+**验证**：`tests/deepresearch/test_logging.py` 新增 15 项（HTTP 请求/返回、完整错误体、重定向逐跳、MCP 服务器与真实工具名与参数、`isError` 与超时可区分、
+工具发现不记凭据、供应商猜中的参数名、`callbacks.parent_run_id` 关联、记录器抛异常不影响研究、无记录器时不写表、超限显式标注、工具层出入参、整包导出、保留期清理）。
+全量 `tests/deepresearch` 296 项通过。
+
+真实运行（MCP 桩 + `deepseek-v4-flash`，仅直通 MCP 工具，run `ba344612`）：导出 375 条记录 2.3MB，其中
+
+| 核对项 | 结果 |
+| --- | --- |
+| 桩自己记录的 MCP 调用 vs 导出里的 `wire_call` | 35 / 35，参数逐条对得上 |
+| 带完整参数与返回的 `tool_call` | 39 / 39 |
+| 关联到工具调用的 `wire_call` | 35 / 35 |
+| 桩的 token / cookie 出现在导出里 | 0 次 |
+
+**没做的**（用户本轮只要整包导出）：`show_call.py` 的逐条打开、`GET /{id}/tools` 接口、前端「工具调用」页签。
 
 ## 4. 真实验收
 

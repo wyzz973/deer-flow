@@ -15,6 +15,7 @@ import time
 from collections import OrderedDict
 from uuid import uuid4
 
+from . import wire
 from .evidence import digest
 from .secrets import SECRETS
 
@@ -56,6 +57,21 @@ def connection_failure(name, error):
     return ProviderError("network", f"MCP server {name} is unavailable ({names})")
 
 
+def described(tools):
+    """What a server said it offers: names, descriptions and argument shapes.
+
+    A tool that stops being offered, or quietly changes its schema, explains a
+    research that suddenly found nothing; without this the tool list existed
+    only in memory for ten minutes and was never written down.
+    """
+    found = []
+    for tool in tools or []:
+        schema = getattr(tool, "args", None)
+        shape = schema if isinstance(schema, dict) else None
+        found.append({"name": getattr(tool, "name", None), "description": (getattr(tool, "description", "") or "")[:2000], "arguments": sorted(shape) if shape else None, "schema": shape})
+    return found
+
+
 def connection(spec, request=None):
     """Connection parameters with credentials resolved for this request."""
     if spec.transport == "stdio":
@@ -92,10 +108,19 @@ class McpManager:
             cached = self._tools.get(key)
             if cached:
                 self._tools.move_to_end(key)
-        if cached and not refresh and time.monotonic() - cached[0] < DISCOVERY_TTL_SECONDS:
+        fresh = cached and not refresh and time.monotonic() - cached[0] < DISCOVERY_TTL_SECONDS
+        # Header and env values are credentials; which headers were sent is the
+        # useful part and the only part recorded.
+        details = {"server": name, "transport": spec.transport, "url": spec.url, "cache": "hit" if fresh else "expired" if cached else "miss"}
+        asked = {"header_names": sorted(spec.headers or {}), "env_names": sorted(spec.env or {}), "timeout_seconds": spec.timeout_seconds}
+        if fresh:
+            async with wire.outbound("mcp_discovery", details, request=asked) as sent:
+                sent.responded(status="success", discovered_tools=described(cached[1]))
             return cached[1]
         client = MultiServerMCPClient({name: params})
-        tools = await asyncio.wait_for(client.get_tools(server_name=name), spec.timeout_seconds)
+        async with wire.outbound("mcp_discovery", details, request=asked) as sent:
+            tools = await asyncio.wait_for(client.get_tools(server_name=name), spec.timeout_seconds)
+            sent.responded(status="success", discovered_tools=described(tools))
         with self._lock:
             self._tools[key] = (time.monotonic(), tools)
             self._tools.move_to_end(key)
@@ -123,26 +148,44 @@ class McpManager:
             raise ProviderError("config", f"MCP server {name} has no tool named {tool_name}")
         return found
 
-    async def call(self, tool, arguments):
-        """Invoke one MCP tool and return (content, artifact, status)."""
+    async def call(self, tool, arguments, *, server=None, provider=None, source=None, argument_name=None):
+        """Invoke one MCP tool and return (content, artifact, status).
+
+        ``server`` and the rest only describe the call for the audit: the tool a
+        researcher sees may be an alias (``mcp_tool``) of a differently named
+        remote tool on a server neither the model nor any record ever mentioned.
+        """
         from langchain_core.tools import ToolException
 
-        try:
-            # The research callbacks of the surrounding source tool must not see
-            # this inner call: they would record it as a second tool call and
-            # charge the run's tool budget twice for one search (found in a real
-            # run: 25 searches were billed as 41). An empty callback list
-            # replaces the inherited one.
-            message = await tool.ainvoke({"type": "tool_call", "name": tool.name, "args": arguments, "id": "dr-" + uuid4().hex}, config={"callbacks": []})
-        except ToolException as exc:
-            return str(exc), None, "error"
-        return getattr(message, "content", message), getattr(message, "artifact", None), getattr(message, "status", "success")
+        inner = "dr-" + uuid4().hex
+        details = {"server": server, "provider": provider, "remote_tool": tool.name, "inner_call_id": inner}
+        if argument_name:
+            details["argument_name"] = argument_name
+        if source:
+            details["source"] = source
+        async with wire.outbound("mcp", details, request={"arguments": arguments}) as sent:
+            try:
+                # The research callbacks of the surrounding source tool must not see
+                # this inner call: they would record it as a second tool call and
+                # charge the run's tool budget twice for one search (found in a real
+                # run: 25 searches were billed as 41). An empty callback list
+                # replaces the inherited one.
+                message = await tool.ainvoke({"type": "tool_call", "name": tool.name, "args": arguments, "id": inner}, config={"callbacks": []})
+            except ToolException as exc:
+                sent.responded(status="error", body=str(exc))
+                return str(exc), None, "error"
+            content, artifact = getattr(message, "content", message), getattr(message, "artifact", None)
+            status = getattr(message, "status", "success")
+            # A server that answered "isError" is not our timeout and not an
+            # adapter exception; flattening them into one ToolException lost that.
+            sent.responded(status=status, body=content, artifact=artifact)
+            return content, artifact, status
 
 
 MANAGER = McpManager()
 
 
-async def source_tool(source, servers, request_secrets=None, budget=None):
+async def source_tool(source, servers, request_secrets=None, budget=None, recorder=None):
     """Expose a DeepResearch MCP server tool under the source's tool name.
 
     The model sees the MCP tool's own description and input schema; results
@@ -169,18 +212,27 @@ async def source_tool(source, servers, request_secrets=None, budget=None):
             return stop.text, stop.artifact
         limits = [value for value in (spec.timeout_seconds, budget.call_timeout() if budget is not None else None) if value is not None]
         try:
-            content, artifact, status = await asyncio.wait_for(MANAGER.call(remote, arguments), min(limits))
+            content, artifact, status = await asyncio.wait_for(MANAGER.call(remote, arguments, server=source.server, source=source.name), min(limits))
         except TimeoutError:
             raise ToolException(f"Error: {source.tool} did not answer within {min(limits):g}s. Do not retry the same call; continue with what you have.") from None
         if status == "error":
             raise ToolException(content if isinstance(content, str) else "MCP tool returned an error")
         return content, artifact
 
+    coroutine = run
+    if recorder is not None:
+        # A server whose schema has a field called `callbacks` would have the
+        # model's value overwritten by LangChain's injected manager; leave that
+        # call unwrapped (no correlation id) rather than corrupt it.
+        if "callbacks" in (getattr(remote, "args", None) or {}):
+            recorder = None
+        else:
+            coroutine = wire.recorded(run, recorder, tool=source.tool, source=source.name)
     return StructuredTool(
         name=source.tool,
         description=source.description or remote.description or source.name,
         args_schema=remote.args_schema,
-        coroutine=run,
+        coroutine=coroutine,
         response_format="content_and_artifact",
         handle_tool_error=True,
     )

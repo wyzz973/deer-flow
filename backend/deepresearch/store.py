@@ -20,6 +20,25 @@ def dumps(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
+def missing_table(op, default):
+    """Read a table an older database may not have yet.
+
+    The audit scripts open a copied store read-only and skip ``start()``, so a
+    reader added after that copy was taken must answer "nothing recorded"
+    instead of raising.
+    """
+
+    def guarded(db):
+        try:
+            return op(db)
+        except sqlite3.OperationalError as error:
+            if "no such table" not in str(error):
+                raise
+            return default
+
+    return guarded
+
+
 # Tokens a report needs at the least. A measured three-step report took eight
 # calls (outline, six sections, summary) and about 145k tokens; a compact one
 # about half. Less than this cannot hold even the parallel section calls.
@@ -193,6 +212,16 @@ class Store:
               run_id TEXT NOT NULL REFERENCES research_run(id), id TEXT NOT NULL,
               body TEXT NOT NULL, PRIMARY KEY(run_id,id));
             CREATE TABLE IF NOT EXISTS research_llm_blob (
+              run_id TEXT NOT NULL REFERENCES research_run(id), hash TEXT NOT NULL,
+              body BLOB NOT NULL, PRIMARY KEY(run_id,hash));
+            CREATE TABLE IF NOT EXISTS research_tool_exchange (
+              run_id TEXT NOT NULL REFERENCES research_run(id), id TEXT NOT NULL,
+              body TEXT NOT NULL, PRIMARY KEY(run_id,id));
+            CREATE TABLE IF NOT EXISTS research_wire_call (
+              run_id TEXT NOT NULL REFERENCES research_run(id), id TEXT NOT NULL,
+              call_id TEXT, started_at TEXT, body TEXT NOT NULL, PRIMARY KEY(run_id,id));
+            CREATE INDEX IF NOT EXISTS research_wire_call_by_call ON research_wire_call(run_id, call_id);
+            CREATE TABLE IF NOT EXISTS research_audit_blob (
               run_id TEXT NOT NULL REFERENCES research_run(id), hash TEXT NOT NULL,
               body BLOB NOT NULL, PRIMARY KEY(run_id,hash));
             CREATE TABLE IF NOT EXISTS research_profile (
@@ -402,6 +431,117 @@ class Store:
     async def agent_runs(self, run_id):
         return await self._records("research_agent_run", run_id)
 
+    def _keep(self, db, run_id, payloads):
+        """Content-address the bodies of one audit record.
+
+        A page read twice, or a query retried down the failover chain, is stored
+        once. These bodies are kept apart from ``research_llm_blob``: a model
+        message is bounded at MESSAGE_LIMIT and is always a message, while a
+        wire body can be a whole page and needs its own ceiling and its own
+        retention.
+        """
+        from .audit import encode
+
+        marks = {}
+        for name, value in (payloads or {}).items():
+            if value is None:
+                continue
+            digest, blob = encode(value)
+            db.execute("INSERT OR IGNORE INTO research_audit_blob VALUES (?,?,?)", (run_id, digest, blob))
+            marks[name + "_hash"] = digest
+        return marks
+
+    def _resolve(self, db, run_id, record, names):
+        from .audit import decode
+
+        for name in names:
+            digest = record.pop(name + "_hash", None)
+            if digest is None:
+                continue
+            row = db.execute("SELECT body FROM research_audit_blob WHERE run_id=? AND hash=?", (run_id, digest)).fetchone()
+            record[name] = decode(row[0]) if row else None
+        return record
+
+    async def record_tool_exchange(self, run_id, call_id, details, payloads=None):
+        """What one tool call was actually given and actually answered.
+
+        Keyed by the tool call id, so it joins ``research_tool_call``, which
+        keeps the metrics a reader groups by and deliberately holds no bodies.
+        """
+
+        def op(db):
+            marks = self._keep(db, run_id, payloads)
+            old = db.execute("SELECT body FROM research_tool_exchange WHERE run_id=? AND id=?", (run_id, call_id)).fetchone()
+            record = {**(json.loads(old[0]) if old else {}), "id": call_id, **details, **marks}
+            db.execute("INSERT INTO research_tool_exchange VALUES (?,?,?) ON CONFLICT(run_id,id) DO UPDATE SET body=excluded.body", (run_id, call_id, dumps(record)))
+            return record
+
+        return await self.call(op)
+
+    async def tool_exchange(self, run_id, call_id):
+        def op(db):
+            row = db.execute("SELECT body FROM research_tool_exchange WHERE run_id=? AND id=?", (run_id, call_id)).fetchone()
+            if row is None:
+                return None
+            return self._shape(self._resolve(db, run_id, json.loads(row[0]), ("arguments", "content", "artifact")))
+
+        return await self.call(missing_table(op, None))
+
+    async def tool_exchanges(self, run_id):
+        def op(db):
+            items = []
+            for (body,) in db.execute("SELECT body FROM research_tool_exchange WHERE run_id=? ORDER BY rowid", (run_id,)):
+                items.append(self._shape(self._resolve(db, run_id, json.loads(body), ("arguments", "content", "artifact"))))
+            return items
+
+        return await self.call(missing_table(op, []))
+
+    @staticmethod
+    def _shape(record):
+        """Split the flat row into request and response the way a reader reads it."""
+        request = {"arguments": record.pop("arguments", None)}
+        response = {key: record.pop(key) for key in ("content", "artifact", "chars", "truncated") if key in record}
+        return {**record, "request": request, "response": response}
+
+    async def record_wire_call(self, run_id, wire_id, details, request=None, response=None):
+        """One outbound call a source made: an MCP invocation or an HTTP request."""
+
+        def op(db):
+            marks = self._keep(db, run_id, {"request": request, "response": response})
+            record = {**details, "id": wire_id, **marks}
+            db.execute(
+                "INSERT INTO research_wire_call VALUES (?,?,?,?,?) ON CONFLICT(run_id,id) DO UPDATE SET body=excluded.body",
+                (run_id, wire_id, details.get("call_id"), details.get("started_at"), dumps(record)),
+            )
+            return record
+
+        return await self.call(op)
+
+    async def wire_calls(self, run_id, call_id=None):
+        """Outbound calls in the order they were made, without their bodies."""
+
+        def op(db):
+            if call_id is None:
+                rows = db.execute("SELECT body FROM research_wire_call WHERE run_id=? ORDER BY started_at, rowid", (run_id,))
+            else:
+                rows = db.execute("SELECT body FROM research_wire_call WHERE run_id=? AND call_id=? ORDER BY started_at, rowid", (run_id, call_id))
+            items = []
+            for (body,) in rows:
+                record = json.loads(body)
+                record.pop("request_hash", None)
+                record.pop("response_hash", None)
+                items.append(record)
+            return items
+
+        return await self.call(missing_table(op, []))
+
+    async def wire_call(self, run_id, wire_id):
+        def op(db):
+            row = db.execute("SELECT body FROM research_wire_call WHERE run_id=? AND id=?", (run_id, wire_id)).fetchone()
+            return self._resolve(db, run_id, json.loads(row[0]), ("request", "response")) if row else None
+
+        return await self.call(missing_table(op, None))
+
     async def record_llm_request(self, run_id, call_id, details, messages, tools):
         """Store one model request; identical messages across agent turns are stored once."""
         from .audit import encode
@@ -545,6 +685,16 @@ class Store:
 
         return await self.call(op)
 
+    async def evidences(self, run_id):
+        """The merged evidence pool, for an export that must stand on its own."""
+        return await self.call(missing_table(lambda db: [json.loads(row[0]) for row in db.execute("SELECT body FROM research_evidence WHERE run_id=? ORDER BY rowid", (run_id,))], []))
+
+    async def reports(self, run_id):
+        def op(db):
+            return [{"version": version, **json.loads(body)} for version, body in db.execute("SELECT version, body FROM research_report WHERE run_id=? ORDER BY version", (run_id,))]
+
+        return await self.call(missing_table(op, []))
+
     async def unit_results(self, run_id):
         return await self.call(lambda db: [{"id": row[0], "result": json.loads(row[1])} for row in db.execute("SELECT id, result FROM research_unit WHERE run_id=? ORDER BY rowid", (run_id,))])
 
@@ -589,6 +739,65 @@ class Store:
     async def trace_events(self, run_id, after=0, limit=100):
         """Page trace records in SQL, not after limiting the mixed event stream."""
         return await self.call(lambda db: [json.loads(row[0]) for row in db.execute("SELECT body FROM research_event WHERE run_id=? AND seq>? AND json_extract(body, '$.type') LIKE 'trace.%' ORDER BY seq LIMIT ?", (run_id, after, limit))])
+
+    # Every table a run owns. Retention deletes a run from all of them at once;
+    # leaving one behind would keep a run's content alive under a deleted run.
+    RUN_TABLES = (
+        "research_unit",
+        "research_evidence",
+        "research_gap",
+        "research_report",
+        "research_event",
+        "research_cache",
+        "research_source",
+        "research_tool_call",
+        "research_tool_exchange",
+        "research_wire_call",
+        "research_audit_blob",
+        "research_model_call",
+        "research_agent_run",
+        "research_llm_exchange",
+        "research_llm_blob",
+    )
+
+    async def prune(self, before, *, dry_run=False, keep=()):
+        """Delete every trace of the runs created before ``before``.
+
+        Research keeps everything it recorded until someone says otherwise, so
+        this is the only delete path and it is never automatic without a
+        configured retention. ``dry_run`` reports what would go without writing.
+        """
+
+        def op(db):
+            doomed = [run_id for (run_id, created) in db.execute("SELECT id, json_extract(body, '$.created_at') FROM research_run") if created and created < before and run_id not in set(keep)]
+            report = {"runs": sorted(doomed), "rows": 0, "before": before}
+            if not doomed or dry_run:
+                report["dry_run"] = dry_run
+                return report
+            marks = ",".join("?" for _ in doomed)
+            for table in self.RUN_TABLES:
+                try:
+                    report["rows"] += db.execute(f"DELETE FROM {table} WHERE run_id IN ({marks})", doomed).rowcount
+                except sqlite3.OperationalError as error:
+                    if "no such table" not in str(error):
+                        raise
+            report["rows"] += db.execute(f"DELETE FROM research_run WHERE id IN ({marks})", doomed).rowcount
+            return report
+
+        report = await self.call(op)
+        if report["runs"] and not dry_run:
+            before_bytes = self.path.stat().st_size
+            await asyncio.to_thread(self._vacuum)
+            report["reclaimed_bytes"] = max(0, before_bytes - self.path.stat().st_size)
+        return report
+
+    def _vacuum(self):
+        """Give the freed pages back to the filesystem; VACUUM cannot run inside a transaction."""
+        db = sqlite3.connect(self.path, timeout=30)
+        try:
+            db.execute("VACUUM")
+        finally:
+            db.close()
 
     async def reconcile_trace(self, run_id):
         """Append explicit interruption records beneath already-ended parents.

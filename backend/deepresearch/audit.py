@@ -77,6 +77,19 @@ def scrub(value, secrets=(), depth=0):
     return scrub_text(str(value), secrets)
 
 
+def bounded(value, secrets=(), max_chars=MESSAGE_LIMIT):
+    """A payload kept whole where it fits, and marked where it does not.
+
+    Silent clipping is the worst of both: the reader cannot tell whether what
+    they are looking at is the whole answer, so a record that had to cut says so.
+    """
+    cleaned = scrub(value, secrets)
+    text = cleaned if isinstance(cleaned, str) else json.dumps(cleaned, ensure_ascii=False, default=str)
+    if len(text) <= max_chars:
+        return {"value": cleaned, "chars": len(text), "truncated": False}
+    return {"value": text[:max_chars], "chars": len(text), "truncated": True}
+
+
 def _bounded(text):
     text = text if isinstance(text, str) else str(text)
     if len(text) <= MESSAGE_LIMIT:

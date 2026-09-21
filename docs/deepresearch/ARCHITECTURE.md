@@ -478,6 +478,33 @@ workflow、节点、原生 Agent、模型调用、工具调用、结构化转换
 已知凭据值、`Bearer` 令牌和 URL 中的密钥参数在存储前脱敏。
 接口：`GET /{id}/llm-calls`（合并指标）、`/{id}/llm-calls/{call_id}`（含可重建的 OpenAI 请求）、`/{id}/llm-calls/export`。
 
+### 12.1.2 工具调用审计（`trace.py` → `research_tool_exchange`）
+
+`tool_audit: true` 时，每次工具调用的**完整参数**（`on_tool_start`）与**完整返回、artifact、错误原文**（`on_tool_end` / `on_tool_error`）
+按调用 ID 存进 `research_tool_exchange`，与 `research_tool_call` 同键。调用行本身只保留计量与参数哈希：
+这是刻意的，正文另有一份去重副本。正文超过 `audit_max_chars` 时记录显式标 `truncated`，不静默截断。
+
+### 12.1.3 线级审计（`wire.py` → `research_wire_call`）
+
+`wire_audit: true` 时，工具背后的每一次外发调用单独成行：
+
+- **MCP**：服务器名、真实远端工具名（`mcp_tool` 别名之下的那个）、实际发出的参数、内部调用 ID、耗时、`isError`、返回内容与 `structured_content`；
+  作为供应商时还记 `infer_arguments` 猜中的参数名。工具发现另记一条 `mcp_discovery`：transport、URL 主机、发现到的工具清单与 schema、缓存命中/过期。
+- **HTTP**：method、URL（凭据参数脱敏）、请求体、头部（凭据值替换）、状态码、`retry-after`、响应体、重定向逐跳一行。
+
+记录器在**工具协程内部**绑定：原生子 Agent 在自己的事件循环上跑工具，回调处理器又在自己的上下文副本里，两处都够不到真正发起调用的代码。
+所属的工具调用用 LangChain 注入的 `callbacks.parent_run_id` 标识，它就是 `research_tool_call` 的行 ID。
+`mcp.py` 的 `config={"callbacks": []}` 保持不变——内层调用被回调看见会把工具预算重复计费（真实事故：25 次搜索计成 41 次）。
+记录失败只写日志，绝不影响研究。凭据一律不入库。
+
+正文存在 `research_audit_blob`，按内容寻址 + zlib 压缩：同一个页面读两次只存一份。
+
+### 12.1.4 整包导出与清理（`logbook.py`）
+
+`GET /{id}/log/export` 或 `python -m deepresearch.logbook export` 把一次研究的全部记录合成一个自包含 JSONL
+（`run`、`settings`、`event`、`model_call`、`tool_call`、`wire_call`、`agent_run`、`unit`、`evidence`、`report`）。
+`store.prune` 是唯一的删除路径：按 `audit_retention_days` 在启动时执行，或用 `logbook prune --older-than 30d` 手动执行，删完 VACUUM 回收空间。
+
 ### 12.2 活动时间线（`activity.py`）
 
 `GET /{id}/activity` 从本轮 cycle 的事件与调用投影出结构化条目：`plan`、`step`、`note`（研究员进展说明）、

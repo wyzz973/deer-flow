@@ -226,7 +226,7 @@ async def test_mcp_providers_map_arguments_from_the_tool_schema(settings, monkey
         async def tool(self, server, spec, name, *, request=None):
             return Tool()
 
-        async def call(self, tool, arguments):
+        async def call(self, tool, arguments, **described):
             calls.append(arguments)
             return [{"type": "text", "text": "Found 2 documents:\n\nTitle: Plan\nURL: https://intra.example/plan\nThe plan.\n\nTitle: Budget\nURL: https://intra.example/budget\nNumbers."}], None, "success"
 
@@ -385,7 +385,7 @@ async def test_an_exhausted_step_never_reaches_a_provider(settings, tmp_path, mo
     tool = channels.build_tool(source, settings, "r", budget=budget)
     message = await tool.ainvoke({"type": "tool_call", "name": "web_search", "args": {"query": "q"}, "id": "c1"})
     assert "write your research notes" in message.content.lower()
-    assert message.artifact == {"schema": channels.BUDGET_STOP, "reason": "step"}
+    assert message.artifact == {"schema": channels.BUDGET_STOP, "reason": "step", "scope": "step", "used": 0, "limit": 0}
 
 
 @pytest.mark.asyncio
@@ -422,7 +422,7 @@ async def test_a_step_out_of_searches_can_still_open_the_pages_it_found(settings
     # Past the run-wide ceiling a read is refused too, and the model is told to stop.
     await read.ainvoke({"type": "tool_call", "name": "web_fetch", "args": {"url": "https://docs.example/other"}, "id": "p2"})
     stopped = await read.ainvoke({"type": "tool_call", "name": "web_fetch", "args": {"url": "https://docs.example/third"}, "id": "p3"})
-    assert "research-wide tool budget" in stopped.content and stopped.artifact == {"schema": channels.BUDGET_STOP, "reason": "run"}
+    assert "research-wide tool budget" in stopped.content and stopped.artifact == {"schema": channels.BUDGET_STOP, "reason": "run", "scope": "run", "used": 1, "limit": 1}
     assert (await store.get("r"))["usage"]["tool_calls"] == 3
 
 

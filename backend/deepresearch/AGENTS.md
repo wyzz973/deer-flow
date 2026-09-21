@@ -69,27 +69,34 @@ prompts, engine tools, compaction and budgets all live in the research profile
   streaming mode and return an empty message for a plain request; treating that
   as a refused contract made research unusable on them. A reply whose only
   content is a tool call counts as an answer.
-- `observations.py` projects native ToolMessage/receipt envelopes after execution.
-  For MCP-bound (`kind: mcp`) and host-bound sources the original tool object
-  reaches the native loop unchanged: never replace its input schema or rewrite
-  what the model reads. Such a tool emits no artifact of ours, so evidence is
-  derived afterwards: a `read` tool's page becomes `fetched_document` with the
-  address from the call's own arguments (`sources.opened_pages`; an identifier
-  becomes `mcp://<source>/<id>`), structured `search`/`data` answers become
+- `observations.py` projects native ToolMessage/receipt envelopes after
+  execution. For `kind: mcp` and host-bound sources the tool object reaches the
+  native loop unchanged: never replace its schema or rewrite what the model
+  reads. Such a tool emits no artifact of ours, so evidence is derived
+  afterwards: a `read` tool's page becomes `fetched_document` addressed from the
+  call's own arguments (`sources.opened_pages`; an identifier becomes
+  `mcp://<source>/<id>`), and structured `search`/`data` answers become
   per-record evidence by shape (`extract.records`; the whole answer stays
   citable unless records carry ≥80% of it). Without this, MCP-only research
   ended with NO_EVIDENCE: the converter saw no URL to match the notes to.
-  Provider-backed sources own the
-  model-facing schema (`channels.py`), read payloads with the same `extract.py`
-  (JSON walk through wrappers such as `{"result": "<json>"}`, Markdown links,
-  Title/URL blocks, HTML title) and emit the artifacts themselves.
+  Provider-backed sources own the model-facing schema (`channels.py`) and emit
+  their artifacts themselves, reading payloads with the same `extract.py`.
   Native completed executions are cached; individual tool calls are not replayed.
-- `trace.py` records bounded, redacted payloads and paired spans in the local
-  event store. It has no telemetry-service dependency. Callbacks must remain
-  loop-independent because native subagents run on an isolated loop.
-- Trace API and export inherit owner/ACL checks. Operational logs rotate under
-  the configured data directory; do not log raw prompts, headers or provider
-  exceptions to stdout. Unknown failures retain type/status/stack locations.
+- `wire.py` records every MCP invocation and HTTP request a source makes; its
+  docstring says why it binds inside the tool coroutine. Two rules: the
+  enclosing call is `callbacks.parent_run_id` (the `research_tool_call` row id),
+  and that manager is never passed on — a call inheriting it is billed twice (25
+  searches once became 41), so `config={"callbacks": []}` stays. `trace.py`
+  writes a tool's arguments and answer to `research_tool_exchange`; the row
+  keeps only metrics and a hash. Bodies are bounded by `audit_max_chars` and say
+  `truncated` rather than clip silently. `logbook.py` exports a run as one
+  JSONL and owns the only delete path (`store.prune`).
+- `trace.py` records bounded, redacted payloads and paired spans locally, with
+  no telemetry-service dependency. Callbacks stay loop-independent: native
+  subagents run on an isolated loop.
+- Trace and export APIs inherit owner/ACL checks. Operational logs rotate under
+  the data directory; never log raw prompts, headers or provider exceptions to
+  stdout. Unknown failures retain type/status/stack locations.
 - Native subagents retain one-shot state semantics. Workflow recovery reuses
   completed units/tool responses, but does not resume an interrupted child
   model turn. Do not claim exactly-once tools or full Gateway chat persistence.
@@ -186,41 +193,37 @@ prompts, engine tools, compaction and budgets all live in the research profile
 - Requests are built for prompt-prefix caching (providers reuse a prompt only
   from its first token on; on a slow self-hosted model a hit also skips that
   prefill). Three rules, each pinned by a test:
-  1. A role's conversation only appends. `model_budget_config` turns the engine's
-     `verification.receipts_enabled` off in the private config unless
-     `tool_receipt_ledger` is set: `ToolReceiptMiddleware` inserts its ledger
-     right after the system prompt and rewrites it every turn, which left
-     researcher loops with 4-5% cached input (3% reusable prefix; 77-82% without
-     it, measured on recorded runs). The switch also stops stamping, so
+  1. A role's conversation only appends. `model_budget_config` turns the
+     engine's `verification.receipts_enabled` off unless `tool_receipt_ledger`
+     is set: `ToolReceiptMiddleware` rewrites its ledger after the system
+     prompt every turn, which left researcher loops at 4-5% cached input
+     against 77-82% without it. The switch also stops stamping, so
      `observations.derived_receipts` rebuilds `r1..rN`/status from the archived
-     tool messages. Never add anything that edits or inserts before the newest
-     message of a running role.
+     tool messages. Never insert or edit before a running role's newest message.
   2. Payloads read from what every call shares to what only this call has:
-     `instructions` first, run-level context, `sources`, then `unit`, with the
-     counters that change between steps (`search_budget`, `shared_run_budget`)
-     last; sections put `findings`/`evidence` before `section`; conversion sends
-     `{"task", "answer"}` in that order; a follow-up sends plan, report,
-     conversation, then the new `message`; a revision sends findings and
-     evidence, then the report, then the request; planning leads with everything
-     a deployment keeps constant. `structured_task` puts `output_schema` right
-     after `instructions` when they lead, and leaves both last in long writer
-     tasks where the instruction must sit next to the point of generation.
-     `recent_messages` moves a conversation window's head once per ten
-     messages, not every turn. `tests/deepresearch/test_prompt_cache.py` states
-     the property on the text a model receives (shared prefix of two calls). `digest` sorts keys, so reordering never
-     changes a cache key.
+     `instructions`, run-level context, `sources`, `unit`, and last the counters
+     that change between steps (`search_budget`, `shared_run_budget`). Sections
+     put `findings`/`evidence` before `section`; conversion sends
+     `{"task", "answer"}`; a follow-up sends plan, report, conversation, then
+     the new `message`; a revision sends findings and evidence, then the report,
+     then the request; planning leads with what a deployment keeps constant.
+     `structured_task` puts `output_schema` after `instructions` when they lead,
+     and leaves both last in long writer tasks, next to the point of generation.
+     `recent_messages` moves a window's head once per ten messages, not every
+     turn. `tests/deepresearch/test_prompt_cache.py` states the property on the
+     text a model receives. `digest` sorts keys, so reordering never changes a
+     cache key.
   3. Nothing that changes per call goes into a system prompt.
-  `LocalCallbacks` records `prefix_messages`/`prefix_chars` per model call (shared
-  leading messages with the previous request of the same engine node) and metrics
-  report `prefix_reuse_ratio` overall and per node: the ceiling a prefix cache
-  could serve, independent of provider usage reporting. `session_overrides`
-  adds the conversation's id (the native thread id, or a digest per direct call
-  and its retries) as `extra_body[session_param]` / `default_headers[session_header]`
-  only where a `ModelSpec` names them (OpenAI's own endpoint gets
-  `prompt_cache_key` unasked); `merged_overrides` merges dictionary fields with
-  the profile's own because the engine's `model_overrides` replaces whole fields. Low ceiling = our request
-  changed early; high ceiling with low `cache_read_ratio` = provider/gateway
-  (no prefix caching, no replica affinity, or an expired entry).
+  `LocalCallbacks` records `prefix_messages`/`prefix_chars` per call and metrics
+  report `prefix_reuse_ratio`: the ceiling a prefix cache could serve,
+  independent of provider reporting. A low ceiling means our request changed
+  early; a high ceiling with low `cache_read_ratio` means the provider or
+  gateway (no prefix caching, no replica affinity, an expired entry).
+  `session_overrides` adds the conversation's id as
+  `extra_body[session_param]` / `default_headers[session_header]` only where a
+  `ModelSpec` names them (OpenAI's own endpoint gets `prompt_cache_key`
+  unasked); `merged_overrides` merges dictionary fields with the profile's,
+  because the engine's `model_overrides` replaces whole fields.
 - Compaction is research configuration: `compaction_config` builds the engine's
   summarization settings per role from `CompactionSpec` and the role model's
   declared context window, with `prompts.compaction` as the summary template
@@ -393,13 +396,13 @@ authentication, local-model quality or end-to-end deployment readiness.
   many searches it may make (`max_searches_per_unit`, in its payload); when the
   allowance or the run's tool ceiling is gone, `channels.SearchBudget` answers
   the model with a stop instruction, so the step writes its notes rather than
-  raising `BUDGET_EXHAUSTED`. The allowance is enforced by the tool, not by
-  the model's compliance; a search claims its slot before awaiting the ledger,
-  because searches from one model turn run concurrently. Page reads never count against the step
-  allowance — only an opened page is citable, and charging reads left a live
-  run with no page read and `NO_EVIDENCE` — they count toward the run-wide tool
-  ceiling only. A stop reply carries the `BUDGET_STOP` artifact and
-  `research_observations` skips it: the instruction is never evidence. Source
+  raising `BUDGET_EXHAUSTED`. The tool enforces the allowance, not the model's
+  compliance; a search claims its slot before awaiting the ledger, because
+  searches from one turn run concurrently. Page reads never count against the
+  step allowance — only an opened page is citable, and charging reads left a
+  live run with no page read and `NO_EVIDENCE` — only against the run-wide
+  ceiling. A stop reply carries the `BUDGET_STOP` artifact (with the allowance
+  it refused) and `research_observations` skips it: it is never evidence. Source
   tools account for their own calls — the model callback must not reserve them
   again. Model tokens keep a report reserve (`store.report_reserve`). Each
   research step gets a share of what research may still spend (left ÷ steps
@@ -505,17 +508,17 @@ authentication, local-model quality or end-to-end deployment readiness.
   access policy. System message IDs cannot be used as client idempotency keys.
   Invalid plan edits must not stop the valid plan's countdown.
 - Budget coordination updates the effective native per-agent token policy, not
-  just the lead-agent token_budget field. Preserve stricter configured caps and
-  explicit native opt-outs; unbounded acceptance remains explicitly opt-in.
+  only the lead-agent `token_budget`. Preserve stricter configured caps and
+  native opt-outs; unbounded acceptance stays explicitly opt-in.
 
-### Interrupted callbacks and persistent-shell directory operations
+### Interrupted callbacks
 
-Close the research callback handler only after native worker drainage, including
-when the native result was already terminal. Keep uncertain model reservations;
-never turn a missing tool callback into successful source evidence. On workflow
-entry, reconcile historical open descendants of terminal parents by appending
-explicit interruption events and atomically updating tool activity. Leave live
-roots alone and keep unknown durations null.
+Close the research callback handler only after native worker drainage, even when
+the native result was already terminal. Keep uncertain model reservations; never
+turn a missing tool callback into successful source evidence. On workflow entry,
+reconcile open descendants of terminal parents with explicit interruption events
+and an atomic tool-activity update; leave live roots alone, keep unknown
+durations null.
 
 AIO directory listing must execute its exit-bearing script in an isolated child
 shell, use unique temporary files, and have its own remote hard timeout plus a

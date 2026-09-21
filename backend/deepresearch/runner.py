@@ -525,7 +525,7 @@ class DeerFlowRunner(SettingsBound):
         still bind exact host tools (``kind: native``) or host MCP servers;
         those keep their original objects, schemas and interceptors unchanged.
         """
-        from . import channels
+        from . import channels, wire
         from .mcp import source_tool
 
         settings = self.settings
@@ -545,13 +545,21 @@ class DeerFlowRunner(SettingsBound):
 
             app_config = await asyncio.to_thread(get_app_config)
             native = await asyncio.to_thread(get_available_tools, include_mcp=False, include_upload_tool=False, app_config=app_config)
+        # Where the MCP and HTTP calls a source makes are written. It holds no
+        # asyncio primitive, because a native subagent runs these tools on its
+        # own event loop.
+        recorder = None
+        if run.get("run_id") and settings.trace_capture_content and settings.wire_audit:
+            from .secrets import trace_secrets
+
+            recorder = wire.WireRecorder(store=self.store, run_id=run["run_id"], secrets=trace_secrets(settings, current_context()), max_chars=settings.audit_max_chars)
         selected = {}
         for source in sources:
             if source.kind == "channel":
-                selected[source.name] = channels.build_tool(source, settings, run["run_id"], request_secrets, budget)
+                selected[source.name] = channels.build_tool(source, settings, run["run_id"], request_secrets, budget, recorder)
                 continue
             if source.kind == "mcp" and source.server in settings.mcp_servers:
-                selected[source.name] = await source_tool(source, settings.mcp_servers, request_secrets, budget)
+                selected[source.name] = await source_tool(source, settings.mcp_servers, request_secrets, budget, recorder)
                 continue
             if source.kind == "native":
                 if settings.native_tools is not None and source.tool not in settings.native_tools:
