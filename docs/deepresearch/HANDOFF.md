@@ -16,7 +16,7 @@
 | 更早的基线 | `5fa0299c` `feat(deepresearch): unify native research chat and harden workflow recovery` |
 | 功能状态 | 交互、工作流、报告与前端改造完成；五次真实 DeepSeek 研究端到端完成；配置与 DeerFlow 解耦（研究自己的模型、数据源与供应商故障切换、MCP、角色、提示词、上下文压缩）、请求改写节点、设置页、LLM 调用审计均已完成并真实验收 |
 | 离线开发 | 不联网的本地 Agent 从 [OFFLINE_AGENT_GUIDE.md](OFFLINE_AGENT_GUIDE.md) 开始；配置见 [MODEL_CONFIGURATION.md](MODEL_CONFIGURATION.md)、[DEERFLOW_CONFIGURATION.md](DEERFLOW_CONFIGURATION.md)、[RESEARCH_CONFIGURATION.md](RESEARCH_CONFIGURATION.md)；模板在 `examples/deepresearch/offline/` |
-| 最近一轮 | 2026-09-21：研究完成后计划卡折叠可回看（第 3.10 节）；日志记全（工具出入参、MCP 协议层、HTTP 供应商层）、整包导出与保留期清理（第 3.9 节）；直接暴露的 MCP 工具读到的页面可被引用（修复只用 MCP 检索时的 `NO_EVIDENCE`，第 3.7 节）；研究步骤接续调度与编辑计划时保留依赖（第 3.8 节）；运行审计的离线 HTML 页面与两项新分析（第 3.6 节技能部分）。此前 2026-09-19：全模块代码审查与修复、按节点调参、仅 MCP / 无原文研究、模型网关兼容、时间预算收尾，见第 3.6 节与第 4 节末尾 |
+| 最近一轮 | 2026-09-22：数据源可为自己域名声明站点图标、由网关代取（第 3.12 节）；证据带上来源声明的发布日期，参考文献行显示日期，`not_before` 可机械校验（第 3.11 节）。2026-09-21：研究完成后计划卡折叠可回看（第 3.10 节）；日志记全（工具出入参、MCP 协议层、HTTP 供应商层）、整包导出与保留期清理（第 3.9 节）；直接暴露的 MCP 工具读到的页面可被引用（修复只用 MCP 检索时的 `NO_EVIDENCE`，第 3.7 节）；研究步骤接续调度与编辑计划时保留依赖（第 3.8 节）；运行审计的离线 HTML 页面与两项新分析（第 3.6 节技能部分）。此前 2026-09-19：全模块代码审查与修复、按节点调参、仅 MCP / 无原文研究、模型网关兼容、时间预算收尾，见第 3.6 节与第 4 节末尾 |
 | 本次回归 | 见第 6 节 |
 | 未验证 | 干净克隆部署、生产构建、目标环境的 MCP 与 SSO、真实手机视口、报告事实逐条核验；远端 CI 以 GitHub Actions 结果为准 |
 
@@ -493,6 +493,89 @@ units、id、顺序与 depends_on”。用文字提的修改（`revision`）仍�
 浏览器端到端 `playwright.deepresearch.config.ts` 5 项通过（新增：点开折叠卡后步骤可见）。
 真实网关上用浏览器看过已完成、失败、已取消三种运行，以及深色模式。
 
+## 3.11 本轮完成的工作（2026-09-22）：证据带上发布日期，时效要求可机械校验
+
+**起因（用户要求）**：「这是需要加上 Publish date 保证时效性。」
+
+**原来的行为**：日期全程丢失。`observations.py` 的记录循环写死了 `published_at=None`，
+读到的页面根本不提取日期。实测本机全部历史运行：**34,053 条证据行，0 条带日期**。
+而下游早就在等它——`runner.py` 给写作者的证据目录里有 `published_at` 字段，
+`report.py` 的参考文献行有 `· <日期>` 的渲染逻辑，两处都是死代码。
+`git log -S 'published_at=None'` 显示这个 `None` 是 `c7be5e96` 那次从 `model_copy` 改成 `derive` 时**顺手带过来的**，不是决定。
+
+**改成**：
+
+- 新增 `extract.published(value)`：防御式日期解析，返回 `datetime` 或 `None`。认 ISO、`2026/07/10`、
+  `2026年7月10日`、`Apr 21, 2026`、`21 Apr 2026`、epoch 秒/毫秒；拒绝相对时间（`3 天前`、`2 days ago`）、
+  `0000-00-00`、epoch 零、1990 年之前和今天 +400 天之后的值。**解析不了只丢日期，绝不丢证据**——
+  `derive()` 走 pydantic 校验，一个非 ISO 字符串会让整条记录返回 `None`，那就等于因为日期格式丢掉了内容。
+- 记录循环改成 `published_at=extract.published(record.get("published_at"))`。这一行同时覆盖三条产出记录的路径：
+  我们自己的 `deepresearch.records.v1`（`role: data`）、`deepresearch.search.v1` 的逐条结果（开了 `cite_search_results`）、
+  以及直通 MCP 按形状识别出的记录。所以自建 MCP 和内置 websearch 一起生效。
+- 读到的页面也带日期：`extract.document()` 从返回顶层或 `metadata` 里取日期字段，
+  `sources._page()` 带着它，页面证据行 `fetched_document` 上就有了。
+- `validators.py` 里那条 `date` 缺口检查原来 gate 在 `provenance == "document"` 上，而研究从不产出这个 provenance，
+  所以它是死代码。改成只在**能证明**时报缺口：有日期的证据全部早于 `not_before` → 报缺口并触发补研；
+  一条日期都没有 → 不报，因为补研也变不出服务端不给的日期。
+- MCP 桩（`examples/deepresearch/mcp-stub/`）的 `find_pages` 与 `open_page` 按格式文档的建议声明 `published_at`。
+- **配置出来的读取数据源也补齐了**（第二轮发现的口子）：原来只有直通 MCP 的页面有日期，走 `channels.py` 的
+  `role: read` 数据源（Jina、direct、`type: mcp` 供应商）生成 `deerflow.web_page.v1` artifact 时不带日期，
+  `sources.fetched_source` 也不读，等于同一份报告里日期有没有取决于数据源怎么接的。现在：供应商把页面声明的日期
+  交给 `channels`，由 `_stated()` 统一归一成 ISO 写进 artifact，`fetched_source` 与两条页面证据路径都带上。
+  同时补了两处真实世界的覆盖：Jina Reader 的字段名 `publishedTime`，以及 `extract.page_date()` 从 HTML 头部读
+  `<meta article:published_time>` / `<meta name="date">` / `<time datetime>` / JSON-LD 的 `datePublished`
+  （readability 只保留正文，日期在 head 里，所以要单独读原始 HTML）。
+  实测三个真实网页：Wikipedia `2023-06-12`、Qdrant `2024-10-08` 都读到了；Anthropic 新闻页整页没有任何日期声明，
+  如实为空而不是编一个。
+
+**真实验收抓到的回归**：第一次真实运行直接 `EXECUTION_FAILED`。堆栈落在
+`structured.convert_answer` 的 `json.dumps` —— 页面证据目录是给转换节点的 JSON 载荷，
+而我把解析后的 `datetime` 放进了 `address`，`datetime` 不可序列化，整个步骤挂掉。
+修法：页面上的日期存 ISO 字符串（pydantic 再解析回 `datetime`），并补一条断言目录可 JSON 序列化的回归测试。
+单元测试全绿而真实运行挂掉，这一条值得记住。
+
+**验证**：
+- `tests/deepresearch` 302 项通过（新增 4 项：日期进证据与参考文献、九种真实写法的解析、读页日期、目录仍是 JSON）；
+  `ruff check` / `ruff format --check` 通过。
+- 拿本机历史运行里**真实供应商给过的**日期字符串核对解析器：455 次出现、27 种写法，解析成功 451/455；
+  剩下 4 条是从页面正文里误抓的散文（含被正确拒绝的 `8 Nov 2029`）。
+- 一次**只有 MCP 搜索 + MCP 读取**的真实研究（网关 8013、桩 9731、`deepseek-v4-flash`，79s / 32 次工具 / 28.3 万 token）：
+  **12 条引用 12 条带日期**（改动前同一条链路 0 条）；126 条证据里 18 条带日期，
+  带日期的全是 `fetched_document`，信封与只“见过”的链接没有日期——正确，因为没人声明过。
+
+## 3.12 本轮完成的工作（2026-09-22）：数据源可以声明自己站点的图标
+
+**起因（用户）**：自建 MCP 的返回里有 `logo_url`，「需要渲染在页面的」。
+
+**为什么不能直接渲染**：`<img src="来源给的 URL">` 等于读者一打开报告，浏览器就逐个访问被引站点（IP、Referer 交给第三方，
+也可以当追踪信标用）。`favicons.py` 存在的原因正是这个——图标一律由网关代取。内网站点的问题则是另一头：
+它们通常没有 `/favicon.ico`，网关猜不到，界面上只能显示首字母徽标。
+
+**改成**：数据源可以在结果里为**自己的域名**声明图标，由网关代取。
+
+- `extract.declared_icons(payload)`：从任意信封里找"同一个对象既有地址又有图标"的组合，认 `logo_url`、`logo`、
+  `icon_url`、`icon`、`favicon`、`favicon_url`、`site_icon`、`site_logo`（含驼峰）。**同源才认**：
+  图标主机必须等于该条结果的主机，否则一个数据源就能让网关去取、缓存并向所有读者展示别人家选的图片。
+- 图标不再被当成"见过的链接"记成一条 `observed_source`，也不再压低第四节那个 80% 覆盖率
+  （实测同一份返回：0.54 → 0.89，参考列表因此少一条没有链接的条目）。
+- `research_icon_hint(domain, url, at)` 新表记下这条声明，随来源行一起写（`store.record_call`）。
+  `favicons.py` 取图标时优先用它，再退回原来的 `/favicon.ico` 与首页声明。
+- 新增运维设置 `favicon_private_network`（默认 `false`）：允许图标代取访问内网地址。默认关，因为打开意味着
+  数据源可以指定一个网关会去取的地址；即使打开，也只取该来源自己引用的那个主机。
+- **前端零改动**：`SiteIcon` 本来就是按域名问 `/api/deepresearch/favicon`，能取到就显示图标，取不到显示首字母。
+
+**真实运行里发现的一个坑**：第一次跑完，19 条来源行 0 条带图标。原因是 MCP 适配器把服务器的 JSON **又包成一个字符串**
+放进 `structured_content.result`（也可能是 content block 的 `text`），我的遍历只解析了最外层字符串。
+补成遍历时遇到像 JSON 的字符串就解析（限 40 次、单串 1MB）。这个形状是从真实运行的 `research_wire_call` 记录里抄出来当测试数据的。
+
+**验证**：
+- `tests/deepresearch` 309 项通过（新增：图标读取与同源规则、三种适配器包装形状、声明图标优先于猜测、跨站声明被忽略、
+  内网图标需要开关）；`ruff` 通过；指导链回到软上限内。
+- 真实研究（仅 MCP 检索 + 读取，桩声明 `logo_url`）：19 条来源行 **13 条带图标**，logo 自身**没有**被记成来源，
+  `research_icon_hint` 恰好一条。
+- 真实网络验证取图逻辑（qdrant.tech）：声明了图标 → 返回声明的那张 PNG（4977 字节）；没声明 → 退回猜测
+  `/favicon.ico`（15086 字节）；声明的是别人家域名 → 忽略，退回猜测。
+
 ## 4. 真实验收
 
 使用 DeepSeek `deepseek-v4-flash`、原生 `web_search` / `web_fetch`（Jina 无 key 模式），非演示 Runner。
@@ -804,6 +887,19 @@ DEEPRESEARCH_E2E_FRONTEND_PORT=3200 DEEPRESEARCH_E2E_REUSE_BACKEND=1 DEEPRESEARC
 
 未运行：`make test-blocking-io`、`make test-live`、前端生产构建。远端 CI 结果见 GitHub Actions 的 “DeepResearch full-stack checks”。单元测试使用伪造提供方，只证明适配与生命周期行为，
 不能代替真实研究与浏览器验收。
+
+### 2026-09-22 回归
+
+从 `backend/`（改动只涉及 `backend/deepresearch`、`tests/deepresearch`、MCP 桩与文档；前端没有改动，未重跑前端）：
+
+```sh
+uv run --no-sync python -m pytest ../tests/deepresearch -q   # 309 passed（新增：日期进证据与参考文献、九种真实写法的解析、读页日期、证据目录仍是 JSON；另改 test_source_providers.py 的 document() 精确断言与 test_core.py 的 date 缺口）
+uv run --no-sync python -m pytest tests/test_agent_guidance_check.py -q   # 11 passed、1 failed：仍是 subagents/AGENTS.md 41,088 > 40,960 的宿主已有问题
+uv run --no-sync ruff check deepresearch ../tests/deepresearch && uv run --no-sync ruff format --check deepresearch ../tests/deepresearch
+python ../scripts/check_agent_guidance.py   # deepresearch 指导链回到软上限内（新增日期规则后压缩了若干条目）
+```
+
+真实验收见第 3.11、3.12 节：两次仅 MCP 检索 + 读取的完整研究——12 条引用全部带日期；19 条来源行 13 条带站点图标。
 
 ### 2026-09-21 回归
 

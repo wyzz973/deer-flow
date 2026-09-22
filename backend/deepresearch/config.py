@@ -475,6 +475,10 @@ class Settings(Contract):
     # Site icons for cited domains are fetched by the gateway (public hosts only).
     # Disable for deployments without outbound access; the UI shows letter badges.
     favicons: bool = True
+    # Allow that fetch to reach a private address, for the icon a site declared
+    # for itself (an internal wiki has no public host and often no favicon.ico).
+    # Off by default: it lets a configured source name a URL the gateway fetches.
+    favicon_private_network: bool = False
     # Model name -> list prices, used only to estimate research cost in metrics.
     # Excluded from the configuration fingerprint, so a price update never
     # blocks resuming earlier runs.

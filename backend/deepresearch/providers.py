@@ -323,10 +323,12 @@ async def duckduckgo(spec, request):
     return Outcome(records=records[: request.max_results], raw=_raw(results))
 
 
-def _page(title, url, text, raw):
+def _page(title, url, text, raw, published=None):
     if not text or len(text.strip()) < 40:
         raise ProviderError("empty", "No readable content was returned for this page")
-    return Outcome(document={"title": title or url, "url": url, "text": text}, raw=_raw(raw, 4000))
+    # Whatever the page said about its own date, in the shape the provider had
+    # it; the read tool normalizes it once, where the artifact is built.
+    return Outcome(document={"title": title or url, "url": url, "text": text, "published_at": published}, raw=_raw(raw, 4000))
 
 
 async def jina_reader(spec, request):
@@ -337,7 +339,7 @@ async def jina_reader(spec, request):
         headers["Authorization"] = f"Bearer {key}"
     data = await _http(spec, "POST", base + "/", secrets=[key] if key else [], headers=headers, body={"url": request.url})
     found = extract.document(data, request.url)
-    return _page(found["title"], request.url, found["text"], data)
+    return _page(found["title"], request.url, found["text"], data, found.get("published_at"))
 
 
 async def tavily_extract(spec, request):
@@ -350,7 +352,7 @@ async def tavily_extract(spec, request):
         failed = (data.get("failed_results") or [{}])[0] if isinstance(data, dict) else {}
         raise ProviderError("blocked", "Tavily could not extract the page: " + str(failed.get("error") or "no result")[:200])
     found = extract.document(results[0], request.url)
-    return _page(found["title"], request.url, found["text"], data)
+    return _page(found["title"], request.url, found["text"], data, found.get("published_at"))
 
 
 async def firecrawl(spec, request):
@@ -362,7 +364,7 @@ async def firecrawl(spec, request):
     status = ((data.get("data") or {}).get("metadata") or {}).get("statusCode") if isinstance(data, dict) else None
     if isinstance(status, int) and status >= 400:
         raise ProviderError("not_found" if status == 404 else "blocked", f"The page returned HTTP {status}")
-    return _page(found["title"], request.url, found["text"], data)
+    return _page(found["title"], request.url, found["text"], data, found.get("published_at"))
 
 
 async def direct(spec, request):
@@ -399,13 +401,14 @@ async def direct(spec, request):
         text = article.to_markdown()
         if "No content could be extracted from this page" in text:
             raise ProviderError("empty", "No readable content was extracted")
-        return _page(str(article.title or ""), url, text, "")
+        # Readability keeps the article, not the head; the date lives in the head.
+        return _page(str(article.title or ""), url, text, "", extract.page_date(response.text))
     if kind == "application/pdf" or content[:5] == b"%PDF-":
         text = await asyncio.to_thread(_convert_document, content, ".pdf")
         return _page(extract.document(text, url)["title"], url, text, "")
     if kind.startswith("text/") or kind in {"application/json", "application/xml"}:
         found = extract.document(response.text, url)
-        return _page(found["title"], url, found["text"], "")
+        return _page(found["title"], url, found["text"], "", found.get("published_at") or extract.page_date(response.text))
     raise ProviderError("unsupported", f"Unsupported content type: {kind or 'unknown'}")
 
 
@@ -493,7 +496,7 @@ async def http(spec, request, *, request_secrets=None):
         data = response.text
     if request.role == "read":
         found = extract.document(data, request.url)
-        return _page(found["title"], request.url, found["text"], data)
+        return _page(found["title"], request.url, found["text"], data, found.get("published_at"))
     records = extract.records(data, limit=request.max_results, text_limit=1200 if request.role == "search" else 4000)
     if not records and request.role == "data":
         text = extract.content_text(data)
@@ -527,7 +530,7 @@ async def mcp(spec, request, *, servers, request_secrets=None):
         # answer held the page; otherwise it is the same page as escaped JSON.
         if structured is not None and not found["readable"] and len(text) > len(found["text"]):
             found["text"] = text
-        return _page(found["title"], found.get("url") or request.url, found["text"], payload)
+        return _page(found["title"], found.get("url") or request.url, found["text"], payload, found.get("published_at"))
     records = extract.records(payload, limit=request.max_results, text_limit=1200 if request.role == "search" else 4000)
     if not records and text.strip():
         if request.role == "search":

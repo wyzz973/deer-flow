@@ -305,6 +305,18 @@ sequenceDiagram
 | `observed_source` | 任意工具输出中出现的链接（每个输出最多 100 条） | 仅 `cite_search_results: true` |
 | 运行时工具输出 | 未声明的工具（文件、命令行、未确认页面的浏览器输出） | 否 |
 
+**发布日期**只来自来源自己的声明，由 `extract.published` 解析：逐条结果上的日期字段、
+读取工具返回顶层或 `metadata` 里的日期字段都认，写法上认 ISO、`2026年7月10日`、`Apr 21, 2026`、epoch。
+配置出来的读取数据源同样带日期：Jina Reader 的 `publishedTime`、直接抓取的 HTML 由 `extract.page_date`
+从 `<meta article:published_time>` / `<meta name="date">` / `<time datetime>` / JSON-LD 的 `datePublished` 里读，
+`deerflow.web_page.v1` artifact 上带着它。不从时钟、URL 或正文文字推断。解析不了或明显是占位（相对时间、epoch 零、1990 年前、今天 +400 天后）的值
+只丢日期，不影响这条证据。日期随证据进入写作者的证据目录，并渲染在参考文献行 `N. [标题](url) · 2026-07-10`。
+
+**站点图标**：数据源可以在结果里为**自己的域名**声明图标（`logo_url` 等字段，主机必须与该条 `url` 相同）。
+这类地址不会被当成"见过的链接"，而是记进 `research_icon_hint`；`/favicon` 接口按域名取图标时优先用它，
+再退回猜测 `/favicon.ico` 与首页声明。取图标的是网关（逐跳地址筛查、按字节校验、限大小、缓存），浏览器从不直连被引站点。
+内网地址需要 `favicon_private_network: true`。
+
 宿主 `ToolOutputBudgetMiddleware` 会把超长工具输出外置到 `/mnt/user-data/outputs/.tool-results/*.log`；
 研究员随后用 `read_file` 读取该文件时，读取内容登记为原网页（URL、标题、文档哈希），匿名文件副本标为已取代。
 不会从文件内容推断 URL。
@@ -317,7 +329,9 @@ sequenceDiagram
 ### 7.5 缺口与补研（`validators.py`）
 
 缺口类型与优先级：`coverage`（单元没有可引用发现）、`unsupported`、`missing-internal` / `missing-external`
-（部署要求双来源时）、`date`、`open-questions`（研究员列出的可公开检索的问题）。用户私有背景
+（部署要求双来源时）、`date`、`open-questions`（研究员列出的可公开检索的问题）。
+`date` 只在能证明时报出：调用方给了 `not_before`，且**有日期的**证据全部早于截止日；
+一条日期都没有时不报，因为补研变不出来源不声明的日期，由研究员写成待解问题。用户私有背景
 （`assumptions_needed`）只成为报告假设，不算缺口；单一站点支持的高风险结论只要求写作时加限定（`single_source`）。
 
 补研单元按缺口严重度排序并受 `max_units` 限制，被截断的缺口发出 `research.supplement.deferred`。

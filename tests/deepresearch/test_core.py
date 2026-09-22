@@ -324,3 +324,29 @@ def test_display_labels_a_model_overshoots_are_bounded_not_rejected():
     assert len(plan.research_units[0].title) == 80
     with pytest.raises(ValidationError):  # research content is never silently cut
         ResearchPlan.model_validate({"goal": "比" * 20000, "research_units": [{"id": "u1", "skill": "s", "objective": "o"}]})
+
+
+def test_a_date_requirement_is_checked_against_the_dates_sources_actually_stated(plan, result):
+    """A caller-supplied ``not_before`` is worth checking once evidence has dates.
+
+    The check used to require every evidence to be provenance ``document``,
+    which research never produces, so a date requirement was silently only a
+    model judgement. Now that a source's stated date is kept, a cutoff can be
+    enforced where it is provable: dated evidence, all of it too old. Undated
+    evidence stays a matter for the researcher — supplements cannot make a
+    provider send dates it does not have.
+    """
+    from datetime import UTC, datetime
+
+    pool, findings, _ = merge_results([result])
+    units = [u.model_dump() for u in plan.research_units]
+    plan.research_units[0].source_strategy.not_before = datetime(2026, 1, 1, tzinfo=UTC)
+    codes = lambda: {g["code"] for g in research_gaps(plan, units, findings, pool)}  # noqa: E731 - three one-line calls below
+    # Nothing is dated: unchanged behaviour, the researcher reports the doubt.
+    assert "date" not in codes()
+    for item in pool.values():
+        item["published_at"] = "2019-05-04T00:00:00+00:00"
+    assert "date" in codes()
+    # One source inside the window satisfies it, even if the others are old.
+    next(iter(pool.values()))["published_at"] = "2026-03-09T00:00:00+00:00"
+    assert "date" not in codes()

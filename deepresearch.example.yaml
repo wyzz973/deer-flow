@@ -195,8 +195,14 @@ max_report_sections: 8
 # a section far past its ceiling gets one shortening repair. Guidance, never a failure.
 report_length_scale: 1.0
 # Site icons for cited domains are fetched by the Gateway (public hosts only,
-# raster images only, cached). Set false without outbound access.
+# raster images only, cached). Set false without outbound access. A source may
+# name the icon of its own site (`logo_url` beside the result's `url`); it is
+# fetched here, never by the browser, and only for that site's own host.
 favicons: true
+# Let that fetch reach a private address, for an icon an internal site declared
+# for itself. Off by default: it lets a configured source name a URL the Gateway
+# then fetches. Only ever on the host the source itself cites.
+favicon_private_network: false
 # Estimated research cost per model name (metrics only; never fetched or assumed).
 # pricing:
 #   deepseek-flash:

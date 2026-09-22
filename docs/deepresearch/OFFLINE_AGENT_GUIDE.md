@@ -175,6 +175,8 @@ SKIP_ENV_VALIDATION=1 DEER_FLOW_AUTH_DISABLED=1 DEER_FLOW_ENV=development \
 | 回答整理成数据 | `structured.py`、`output.py` | — | `test_structured_role.py` |
 | 报告大纲、章节、摘要 | `runner.py`（`write_report` 及写作指令）、`report.py` | `components/deepresearch/report-view.tsx`、`report-reader.tsx` | `test_report_quality.py` |
 | 引用资格、来源 | `report_policy.py`、`observations.py`、`sources.py`、`evidence.py` | `components/deepresearch/sources-panel.tsx`、`citation-preview.tsx` | `test_sources.py`、`test_native_sources.py`、`citation-preview.dom.test.tsx` |
+| 证据的发布日期（时效） | `extract.py`（`published`、`page_date`、`DATE_KEYS`）、`observations.py`、`sources.py`、`channels.py`（`_stated`）、`validators.py`（`date` 缺口） | 参考文献行由后端渲染 | `test_sources.py`、`test_mcp_passthrough.py`、`test_core.py` |
+| 站点图标（来源声明的 logo） | `extract.py`（`declared_icons`、`ICON_KEYS`）、`sources.py`、`trace.py`、`store.py`（`research_icon_hint`）、`favicons.py`、`config.py`（`favicon_private_network`） | `citation-preview.tsx`（`SiteIcon`，按域名取，无需改动） | `test_sources.py`、`test_favicons.py` |
 | 数据源、供应商与故障切换 | `providers.py`、`channels.py`、`extract.py`、`mcp.py` | 设置页“数据源与搜索”（`settings/sources-section.tsx`） | `test_source_providers.py` |
 | 研究模型、上下文压缩 | `models.py`、`native.py`（`model_budget_config`） | 设置页“模型 / 运行参数” | `test_research_models.py` |
 | 按节点的模型与参数（`nodes:`） | `config.py`（`NodeSpec`）、`models.py`（`model_for`、`with_node`）、`native.py`（`node_of`）、`structured.py` | 设置页“节点调参”（`settings/nodes-section.tsx`）；指标“按节点”表 | `test_tuning.py` |
@@ -308,3 +310,4 @@ git commit -m "fix(deepresearch): 一句话说明改了什么"
 | [ARCHITECTURE.md](ARCHITECTURE.md) | 理解工作流、数据、引用规则、指标 |
 | [API.md](API.md) | 修改或调用接口 |
 | [HANDOFF.md](HANDOFF.md) | 历史进度、验收记录、已知风险 |
+| [MCP_RESPONSE_FORMAT.md](MCP_RESPONSE_FORMAT.md) | 自建 MCP 该返回什么格式：字段去向、四条硬规则、日期与站点图标 |

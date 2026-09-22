@@ -94,3 +94,183 @@ def test_observed_evidence_from_a_real_page_always_survives_the_merge_contract()
         }
     )
     assert all(len(item.title) <= 1000 for item in result.raw_evidences)
+
+
+def test_a_supplied_publication_date_survives_into_evidence_and_the_reference_list():
+    """A source that says when its page was published is the only date we have.
+
+    The writer's evidence catalogue and the reference list were both built to
+    show it, but the record loop nulled it out, so across 34,053 recorded
+    evidence rows not one carried a date and a reader could not tell a 2019 page
+    from last week's.
+    """
+    import json
+
+    from deepresearch.config import SourceSpec
+    from deepresearch.evidence import merge_results, valid_result
+    from deepresearch.observations import NativeExecution, research_observations
+    from deepresearch.report import bind, references
+
+    source = SourceSpec(name="kb", kind="mcp", server="kb", tool="kb_search", role="data", origin="internal")
+    answer = {
+        "results": [
+            {"title": "平台 SLA", "url": "https://wiki.example/sla", "snippet": "可用性 99.9%。", "published_at": "2026-07-10"},
+            # A date nobody can parse must cost the date, never the evidence.
+            {"title": "接入指引", "url": "https://wiki.example/on", "snippet": "配额 3000 万向量。", "published_at": "3 天前"},
+        ]
+    }
+    messages = [
+        {"type": "ai", "tool_calls": [{"id": "c1", "name": "kb_search", "args": {"query": "配额"}}]},
+        {"type": "tool", "name": "kb_search", "tool_call_id": "c1", "status": "success", "content": json.dumps(answer, ensure_ascii=False)},
+    ]
+    evidence, _ = research_observations(NativeExecution("notes", "exec", messages), [source])
+    dated = {item.url: item.published_at for item in evidence if item.url}
+    assert str(dated["https://wiki.example/sla"])[:10] == "2026-07-10"
+    assert dated["https://wiki.example/on"] is None and len(dated) == 2
+
+    result = valid_result({"unit_id": "R1", "findings": [], "raw_evidences": [item.model_dump(mode="json") for item in evidence], "confidence": 0.5})[0]
+    pool, _, _ = merge_results([result])
+    cited = next(eid for eid, item in pool.items() if item["url"] == "https://wiki.example/sla")
+    mapping = bind(f"结论[[{cited}]]", pool)
+    assert str(references(mapping, pool)[0]["published_at"])[:10] == "2026-07-10"
+
+
+def test_dates_are_read_in_the_shapes_search_providers_actually_send():
+    from deepresearch.extract import published
+
+    for value, expected in (
+        ("2026-07-10", "2026-07-10"),
+        ("2026-07-10T08:30:00Z", "2026-07-10"),
+        ("2026-04-21T00:00:00", "2026-04-21"),  # Brave page_age
+        ("Apr 21, 2026", "2026-04-21"),  # Serper date
+        ("21 Apr 2026", "2026-04-21"),
+        ("July 10, 2026", "2026-07-10"),
+        ("2026/07/10", "2026-07-10"),
+        ("2026年7月10日", "2026-07-10"),
+        (1752105600, "2025-07-10"),  # epoch seconds
+    ):
+        assert str(published(value))[:10] == expected, value
+    # Never guess, and never raise: an unusable value is simply no date.
+    for value in ("", None, "3 天前", "2 days ago", "recently", "not a date", {}, [], "0000-00-00", "2199-01-01", "1970-01-01"):
+        assert published(value) is None, value
+
+
+def test_a_web_page_states_its_date_the_way_the_open_web_does():
+    """HTML pages and the readers in front of them put the date in known places.
+
+    A page read with `direct` arrives as HTML: its date is in the metadata every
+    CMS writes, not in the prose. Jina Reader hands back its own field name.
+    Reading both is what makes dates show up for open-web research, not only for
+    a self-hosted server that was told what to send.
+    """
+    from deepresearch import extract
+
+    html = '<html><head><title>Qdrant 1.12</title><meta property="article:published_time" content="2026-05-04T09:00:00Z"></head><body>正文。</body></html>'
+    assert extract.page_date(html) == "2026-05-04T09:00:00Z"
+    assert extract.page_date('<meta name="date" content="2026-05-04">') == "2026-05-04"
+    assert extract.page_date('<time datetime="2026-05-04">5 月 4 日</time>') == "2026-05-04"
+    # itemprop and JSON-LD are the other two shapes worth reading.
+    assert extract.page_date('<meta itemprop="datePublished" content="2026-05-04"/>') == "2026-05-04"
+    assert extract.page_date('<script type="application/ld+json">{"@type":"Article","datePublished":"2026-05-04"}</script>') == "2026-05-04"
+    # Nothing to read is not a failure, and prose is never a date.
+    assert extract.page_date("<html><body>更新于上周。</body></html>") is None
+    assert extract.page_date("") is None
+    # Jina Reader's own field name, in the envelope shape it returns.
+    jina = {"code": 200, "data": {"title": "SLA", "url": "https://x.example/sla", "content": "正文。", "publishedTime": "2026-05-04T09:00:00Z"}}
+    assert extract.document(jina)["published_at"] == "2026-05-04T09:00:00Z"
+
+
+def test_a_source_that_states_its_own_logo_has_it_read_as_an_icon_not_as_a_link():
+    """A logo is decoration, and a source may only speak for its own site.
+
+    Before this it was scanned as an ordinary link: a picture became a "seen
+    source" row and its long URL pushed the records' share of the answer below
+    the threshold, so the whole answer turned into an extra reference with no
+    link. Now it is read as the site's icon, counts as part of the record, and
+    an icon claimed for somebody else's host is ignored.
+    """
+    import json
+
+    from deepresearch import extract
+    from deepresearch.config import SourceSpec
+    from deepresearch.observations import NativeExecution, research_observations
+
+    logo = "https://wiki.corp.example/static/logo/platform-256.png"
+    answer = {
+        "results": [
+            {"title": "平台 SLA", "url": "https://wiki.corp.example/sla", "summary": "可用性 99.9%。", "publish_date": "2026-07-10", "logo_url": logo, "site_name": "平台 Wiki"},
+            # An icon on another host is not this source's to declare.
+            {"title": "接入指引", "url": "https://wiki.corp.example/on", "summary": "配额 3000 万向量。", "logo_url": "https://cdn.other.example/logo.png"},
+        ]
+    }
+    records = extract.records(answer, limit=50, text_limit=4000, from_text=False)
+    assert [record.get("icon_url") for record in records] == [logo, None]
+    # The icon belongs to the record, so it no longer counts against its share.
+    without = [{key: value for key, value in record.items() if key != "icon_url"} for record in records]
+    assert extract.coverage(answer, records) > extract.coverage(answer, without)
+    # A payload of the recommended shape plus its own logo stays above the
+    # threshold, so the whole answer is not cited next to the records.
+    clean = {"results": [{key: value for key, value in item.items() if key != "site_name"} for item in answer["results"][:1]]}
+    assert extract.coverage(clean, extract.records(clean, limit=50, text_limit=4000, from_text=False)) >= 0.8
+
+    source = SourceSpec(name="kb", kind="mcp", server="kb", tool="kb_search", role="data", origin="internal")
+    messages = [
+        {"type": "ai", "tool_calls": [{"id": "c1", "name": "kb_search", "args": {"query": "SLA"}}]},
+        {"type": "tool", "name": "kb_search", "tool_call_id": "c1", "status": "success", "content": json.dumps(answer, ensure_ascii=False)},
+    ]
+    evidence, catalog = research_observations(NativeExecution("notes", "exec", messages), [source])
+    assert not [item for item in evidence if item.url == logo], "a logo is not a source that was seen"
+    assert not [item for item in evidence if (item.snippet or "").find(logo) >= 0 and item.provenance == "observed_source"]
+
+
+def test_an_icon_is_read_from_whatever_shape_the_answer_has_and_only_for_its_own_site():
+    """The run records its sources from the tool body alone, not from records.
+
+    So the icon has to be found the same way: by looking for an object that
+    names both an address and an icon on the same host, in any envelope.
+    """
+    from deepresearch import extract
+
+    answer = {
+        "data": {
+            "hits": [
+                {"headline": "SLA", "link": "https://wiki.corp.example/sla", "logo_url": "https://wiki.corp.example/logo.png"},
+                {"headline": "别人家的", "link": "https://other.example/a", "icon": "https://cdn.attacker.example/track.png"},
+            ]
+        }
+    }
+    assert extract.declared_icons(answer) == {"wiki.corp.example": "https://wiki.corp.example/logo.png"}
+    # The same answer as the escaped JSON string a server actually sends.
+    import json
+
+    assert extract.declared_icons(json.dumps(answer, ensure_ascii=True)) == {"wiki.corp.example": "https://wiki.corp.example/logo.png"}
+    assert extract.declared_icons("plain text, no icons") == {}
+
+
+def test_icons_survive_the_wrappers_an_mcp_adapter_puts_around_a_server_answer():
+    """Shapes taken from a real run, where the icon was found nowhere.
+
+    The adapter hands back the server's JSON as a *string* inside
+    ``structured_content``, and content blocks carry it as text. Walking only
+    the outer object found no address and no icon, so the logo stayed an
+    ordinary link: recorded as a site that was seen, and never shown.
+    """
+    import json
+
+    from deepresearch import extract
+
+    server = json.dumps(
+        {
+            "code": 0,
+            "data": {
+                "hits": [
+                    {"headline": "向量检索接入指引", "link": "https://wiki.corp.example/wiki-vector-onboarding", "desc": "新业务接入…", "published_at": "2026-07-10", "logo_url": "https://wiki.corp.example/static/logo/platform-team.png"},
+                ]
+            },
+        },
+        ensure_ascii=True,
+    )
+    expected = {"wiki.corp.example": "https://wiki.corp.example/static/logo/platform-team.png"}
+    assert extract.declared_icons({"structured_content": {"result": server}}) == expected
+    assert extract.declared_icons([{"type": "text", "text": server}]) == expected
+    assert extract.declared_icons(json.dumps({"artifact": {"body": {"structured_content": {"result": server}}}})) == expected

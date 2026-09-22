@@ -163,3 +163,71 @@ async def test_favicon_route_requires_a_user_and_serves_images_with_safe_headers
         assert pending.status_code == 404 and pending.headers["cache-control"] == "no-store"
         assert (await client.get("/api/deepresearch/favicon?domain=127.0.0.1", headers=user)).status_code == 422
     assert looked_up == ["docs.example.com", "missing.example.com", "slow.example.com"]
+
+
+@pytest.mark.asyncio
+async def test_a_site_icon_a_source_declared_is_used_before_guessing_and_only_for_its_own_host(tmp_path):
+    """An internal wiki usually has no /favicon.ico, but its search tool knows the logo.
+
+    The browser still asks only the gateway, so the declared URL is fetched
+    here, screened like every other hop and validated by its bytes. A source
+    may declare an icon for its own host and no other, or one server could make
+    the gateway fetch anything and have it served to every reader.
+    """
+    store = Store(tmp_path / "icons.sqlite")
+    await store.start()
+    await store.create({"run_id": "run-1", "thread_id": "dr-run-1", "owner": "u", "query": "q", "created_at": "2026-09-22T10:00:00+00:00", "budget": {}}, "k", "h")
+    requested = []
+
+    def handler(request):
+        requested.append(str(request.url))
+        if str(request.url) == "https://wiki.corp.example/static/logo/platform-256.png":
+            return httpx.Response(200, content=PNG)
+        return httpx.Response(404)
+
+    # Recorded the way an observed source reaches the store, with the call it came from.
+    await store.record_call("run-1", "c1", {"tool": "kb_search"}, sources=[{"id": "s1", "domain": "wiki.corp.example", "url": "https://wiki.corp.example/sla", "icon_url": "https://wiki.corp.example/static/logo/platform-256.png"}])
+    await store.record_call("run-1", "c2", {"tool": "kb_search"}, sources=[{"id": "s2", "domain": "other.example", "url": "https://other.example/a", "icon_url": "https://cdn.elsewhere.example/logo.png"}])
+
+    icons = Favicons(store, transport=httpx.MockTransport(handler), validate=lambda url: None)
+    icon = await icons.get("wiki.corp.example")
+    assert icon["content_type"] == "image/png" and icon["body"] == PNG
+    assert requested[0] == "https://wiki.corp.example/static/logo/platform-256.png"
+    # The cross-host claim is dropped: guessing starts as usual, nothing else is fetched.
+    requested.clear()
+    assert (await icons.get("other.example"))["body"] is None
+    assert "https://cdn.elsewhere.example/logo.png" not in requested
+
+
+@pytest.mark.asyncio
+async def test_a_declared_icon_on_a_private_address_needs_the_operator_to_allow_it(tmp_path):
+    """The deployment that most needs this is the one whose sites are internal.
+
+    Fetching a private address from a payload-supplied URL is the operator's
+    decision, so it stays off until they make it, and the icon is simply missing
+    until then.
+    """
+
+    async def deployment(name):
+        # Two deployments of the same sites: one store each, so neither reads
+        # the other's cached answer.
+        store = Store(tmp_path / f"{name}.sqlite")
+        await store.start()
+        await store.create({"run_id": "run-1", "thread_id": "dr-run-1", "owner": "u", "query": "q", "created_at": "2026-09-22T10:00:00+00:00", "budget": {}}, "k", "h")
+        await store.record_call("run-1", "c1", {"tool": "kb_search"}, sources=[{"id": "s1", "domain": "wiki.internal", "url": "https://wiki.internal/sla", "icon_url": "https://wiki.internal/logo.png"}])
+        return store
+
+    def handler(request):
+        return httpx.Response(200, content=PNG)
+
+    screened = []
+
+    def validate(url, *, allow_private_addresses=False):
+        screened.append((url, allow_private_addresses))
+        return None if allow_private_addresses else "Error: private address"
+
+    closed = Favicons(await deployment("closed"), transport=httpx.MockTransport(handler), validate=validate)
+    assert (await closed.get("wiki.internal"))["body"] is None
+    opened = Favicons(await deployment("opened"), transport=httpx.MockTransport(handler), validate=validate, private_network=True)
+    assert (await opened.get("wiki.internal"))["body"] == PNG
+    assert ("https://wiki.internal/logo.png", True) in screened

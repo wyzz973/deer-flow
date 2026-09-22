@@ -19,7 +19,7 @@ DeepResearch 的配置**独立于 DeerFlow**：研究用哪些模型、哪些搜
 | 何时生效 | 重启网关 | 立刻生效，之后**新建**的研究使用；进行中的研究不受影响 |
 | 存在哪 | `deepresearch.local.yaml` | 研究数据库的 `research_profile` 表（只存与配置文件的差异） |
 
-设置页不能改的部分（运维专属）：`runner`、`runner_factory`、`data_dir`、`max_active_runs`、`favicons`、
+设置页不能改的部分（运维专属）：`runner`、`runner_factory`、`data_dir`、`max_active_runs`、`favicons`、`favicon_private_network`、
 `budget_ceiling`、`local_secret_env`、`request_secret_headers`、`access_policy`、`native_tools`、
 `source_priority_file`、`trace_max_chars`。改这些要改文件并重启。
 
@@ -362,7 +362,8 @@ compaction:
 | `wire_audit` | `true` | 布尔 | 是否保存工具背后每一次 MCP 调用与 HTTP 供应商请求：服务器、真实远端工具名、实际发出的参数、状态码、返回体、重试链。凭据一律不记 |
 | `audit_max_chars` | 200000 | 1000–2000000 | 单条记录正文的上限。超出时记录显式标注 `truncated`，不静默截断。实测工具返回通常几千字符，整页最多几十万 |
 | `audit_retention_days` | `null` | 1–3650 | 保留多少天的运行记录。`null` 为不自动删除；设置后网关启动时清理一次。手动清理见下 |
-| `favicons` | `true` | 布尔 | 网关是否代取被引用网站图标。**离线必须 `false`** |
+| `favicons` | `true` | 布尔 | 网关是否代取被引用网站图标。数据源可以在结果里声明自己站点的图标（`logo_url` 与 `url` 同域），由网关取、浏览器不直连。**离线必须 `false`** |
+| `favicon_private_network` | `false` | 布尔 | 允许图标代取访问内网地址（内网站点常没有 `/favicon.ico`）。只对**数据源为自己域名声明的**图标生效；打开意味着数据源可以指定一个网关会去取的地址 |
 | `source_fallback` | `[]` | 来源名列表 | 计划没指定来源时的默认顺序 |
 | `native_tools` | `null` | 工具名列表 | 可选的引擎工具上限（运维字段） |
 | `tool_timeout_seconds`、`tool_retries` | 45、1 | — | 旧版字段，当前不生效；超时在供应商的 `timeout_seconds` 里设置 |

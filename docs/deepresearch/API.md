@@ -100,7 +100,7 @@ trace 分页返回 `{"trace_id":"...","items":[...],"next_cursor":123}`。导出
 
 `activity` 返回 `{status, started_at, finished_at, elapsed_seconds, counts:{searches,pages_read,steps,steps_done}, current, items}`。`items` 是结构化条目：`plan`、`step`、`note`（研究员给出的可见进展说明；中文请求只展示含中文的说明，提到技能文件或工具名的说明只保留在 Trace 中）、`search`（同一单元连续搜索合并，带查询词与结果域名）、`read`（打开的页面标题/域名）、`tool`、`step_done`（单元摘要）、`step_failed`（非致命失败的步骤）、`gap`、`limited`、`update`、`writing`、`outline`、`section`、`done`、`failed`、`cancelled`。只展示本轮 `cycle`，不包含 Trace 载荷。`counts.steps`/`steps_done` 只统计计划中的原始步骤（完成或失败都算结束），补研步骤不计入。搜索/读取的查询词或 URL 只从运营方声明为 `search`/`read` 角色的工具参数中提取。
 
-`sources` 中的来源包含稳定 ID、URL、domain、connector、`call_ids` 和 `status=discovered`；`calls` 包含实际调用 ID、工具/Agent/单元、状态、耗时与来源 ID。来源分组不改变正文引用顺序。发现链接不等于读取原文，更不等于已被报告引用。
+`sources` 中的来源包含稳定 ID、URL、domain、connector、`call_ids` 和 `status=discovered`；数据源为自己域名声明了图标时还带 `icon_url`；`calls` 包含实际调用 ID、工具/Agent/单元、状态、耗时与来源 ID。来源分组不改变正文引用顺序。发现链接不等于读取原文，更不等于已被报告引用。
 
 ## 证据语义
 
@@ -149,7 +149,7 @@ trace 分页返回 `{"trace_id":"...","items":[...],"next_cursor":123}`。导出
 
 ## 网站图标
 
-`GET /favicon?domain=` 由 Gateway 代取被引用网站的图标，浏览器不直接访问第三方网站。域名必须是普通主机名（不接受 IP、端口、路径），`www.` 会被去掉。依次尝试该主机和上级站点的 `/favicon.ico`，再尝试首页 `<link rel=icon>` 声明的最多 3 个非 SVG 图标。每一次请求和重定向都先做公网地址校验（与原生 web 工具相同，DNS 由 HTTP 客户端再次解析，存在同样的重绑定限制），单个响应不超过 256 KB，只按文件头识别 ico/png/gif/jpeg/webp，SVG、HTML 等一律视为没有图标。命中缓存 7 天，未命中缓存 1 天。首次获取超过 2 秒时返回 `no-store` 的 404，后台继续获取，前端 4 秒后重试一次。响应带 `X-Content-Type-Options: nosniff` 和 `Content-Security-Policy: default-src 'none'`。配置 `favicons: false` 时不发起任何外部请求。
+`GET /favicon?domain=` 由 Gateway 代取被引用网站的图标，浏览器不直接访问第三方网站。域名必须是普通主机名（不接受 IP、端口、路径），`www.` 会被去掉。数据源为自己域名声明过图标时（结果里的 `logo_url` 等字段，主机必须与该条结果的 `url` 相同）先取它；否则依次尝试该主机和上级站点的 `/favicon.ico`，再尝试首页 `<link rel=icon>` 声明的最多 3 个非 SVG 图标。每一次请求和重定向都先做公网地址校验（与原生 web 工具相同，DNS 由 HTTP 客户端再次解析，存在同样的重绑定限制），单个响应不超过 256 KB，只按文件头识别 ico/png/gif/jpeg/webp，SVG、HTML 等一律视为没有图标。命中缓存 7 天，未命中缓存 1 天。首次获取超过 2 秒时返回 `no-store` 的 404，后台继续获取，前端 4 秒后重试一次。响应带 `X-Content-Type-Options: nosniff` 和 `Content-Security-Policy: default-src 'none'`。配置 `favicons: false` 时不发起任何外部请求；内网地址只有在 `favicon_private_network: true` 时才会被取，且仅限来源为自己域名声明的图标。
 
 ## 步骤失败
 

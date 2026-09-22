@@ -299,6 +299,16 @@ class SearchBudget:
         return stop
 
 
+def _stated(value):
+    """A provider's date claim as text a payload can carry, or None.
+
+    Providers report whatever their page said, in whatever shape; the artifact
+    is read by the model, stored and serialized, so it holds one normal form.
+    """
+    moment = extract.published(value)
+    return moment.isoformat() if moment else None
+
+
 def build_tool(source, settings, run_id, request_secrets=None, budget=None, recorder=None):
     """One StructuredTool for a provider-based source; returns (content, artifact)."""
     from langchain_core.tools import StructuredTool, ToolException
@@ -336,7 +346,7 @@ def build_tool(source, settings, run_id, request_secrets=None, budget=None, reco
             return stop.text, stop.artifact
         if cached is None:
             provider, outcome, attempts = await providers(Request("read", url=url))
-            page = {"title": outcome.document.get("title") or url, "text": outcome.document["text"], "provider": provider.id, "provider_type": provider.type}
+            page = {"title": outcome.document.get("title") or url, "text": outcome.document["text"], "published_at": _stated(outcome.document.get("published_at")), "provider": provider.id, "provider_type": provider.type}
             PAGES.put(run_id, url, page)
         else:
             page, attempts = cached, [{"provider": cached["provider"], "type": cached["provider_type"], "status": "cache", "ms": 0}]
@@ -348,6 +358,7 @@ def build_tool(source, settings, run_id, request_secrets=None, budget=None, reco
             "schema": "deerflow.web_page.v1",
             "url": url,
             "title": str(page["title"])[:1000],
+            "published_at": page.get("published_at"),
             "document_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
             "start_index": position,
             "end_index": end,

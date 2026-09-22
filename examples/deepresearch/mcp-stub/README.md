@@ -10,6 +10,9 @@ without the real ones:
 - `find_pages` + `open_page` rehearse a search and a fetch tool exposed to research **directly** (`kind: mcp`, overlay
   `research-overlay-passthrough.yaml`): results under unusual field names, the page as escaped JSON in an envelope, and nothing
   that says "this is a page". Research recognises the page from the call's `url` argument and cites it with title and address;
+  both state the page's date in a field (`published_at`), as [the response format](../../../docs/deepresearch/MCP_RESPONSE_FORMAT.md) recommends, so the
+  reference list can show it; `find_pages` also states the site's own logo (`logo_url`, same host), which the Gateway fetches and shows
+  as the site icon instead of a letter badge;
 - `delete_page` exists only to prove that `allowed_tools` keeps research away from it;
 - `MCP_STUB_LATENCY` (seconds per call) rehearses slow tools and the time budget; `MCP_STUB_LOG` writes one JSON line per call.
 

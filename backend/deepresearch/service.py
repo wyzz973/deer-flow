@@ -33,7 +33,7 @@ class ResearchService(ConversationLifecycle):
         self.profile_error = None
         self.snapshots = {}
         self.store = Store(settings.resolve(settings.data_dir) / "research.sqlite3")
-        self.favicons = Favicons(self.store, enabled=settings.favicons)
+        self.favicons = Favicons(self.store, enabled=settings.favicons, private_network=settings.favicon_private_network)
         self.lock = ProcessLock(settings.resolve(settings.data_dir) / "worker.lock")
         if runner is not None:
             self.runner = runner

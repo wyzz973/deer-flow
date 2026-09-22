@@ -172,7 +172,8 @@ def research_observations(execution: NativeExecution, sources, cite_search_resul
             document_id = "doc_" + digest([execution.execution_id, call_id, page["fetched"]["id"]])[:24]
             raw_ref = f"execution:{execution.execution_id}:{call_id}"
             known = page["fetched"]
-            document = derive(page["item"], raw_id=document_id, snippet=text[:20000], raw_content_ref=raw_ref, source_uri=known.get("source_uri"), provenance="fetched_document", title=known["title"], url=known["url"])
+            address = {"title": known["title"], "url": known["url"], "source_uri": known.get("source_uri"), "published_at": known.get("published_at")}
+            document = derive(page["item"], raw_id=document_id, snippet=text[:20000], raw_content_ref=raw_ref, provenance="fetched_document", **address)
             if document is None:
                 continue
             evidence[document_id] = document
@@ -238,6 +239,9 @@ def research_observations(execution: NativeExecution, sources, cite_search_resul
             records = extract.records(answer, limit=50, text_limit=1200 if source.role == "search" else 4000, from_text=False) or None
             found_by_shape = bool(records) and extract.coverage(answer, records) < RECORDS_COVER_ANSWER
         recorded_urls = set()
+        # A site icon the answer stated for its own pages: shown next to that
+        # site, never cited, and fetched by the gateway rather than the browser.
+        icons = extract.declared_icons(answer)
         if records:
             for index, record in enumerate(records[:100]):
                 if not isinstance(record, dict) or not str(record.get("snippet") or "").strip():
@@ -254,7 +258,9 @@ def research_observations(execution: NativeExecution, sources, cite_search_resul
                     url=link,
                     source_uri=f"tool-result://{execution.execution_id}/{record_id}",
                     snippet=str(record["snippet"])[:20000],
-                    published_at=None,
+                    # The source's own claim about when its page was published:
+                    # the only date research has, and the reader needs it to judge age.
+                    published_at=extract.published(record.get("published_at")),
                     document_hash=digest(str(record["snippet"])),
                 )
                 if found is None:
@@ -265,7 +271,7 @@ def research_observations(execution: NativeExecution, sources, cite_search_resul
                 catalog.append({"raw_id": record_id, "receipt_id": receipt.get("id"), "tool_call_id": call_id, "tool_name": name, "origin": item.origin, "title": found.title, "url": link, "record": index + 1})
         for page in opened:
             document_id = "doc_" + digest([execution.execution_id, call_id, page["id"]])[:24]
-            address = {"title": page["title"], "url": page["url"], "source_uri": page["source_uri"]}
+            address = {"title": page["title"], "url": page["url"], "source_uri": page["source_uri"], "published_at": page["published_at"]}
             document = derive(item, raw_id=document_id, source_id=page["id"], snippet=page["text"][:20000], provenance="fetched_document", document_hash=page["document_hash"], **address)
             if document is None:
                 continue
@@ -278,7 +284,8 @@ def research_observations(execution: NativeExecution, sources, cite_search_resul
             catalog.append({"raw_id": document_id, "receipt_id": receipt.get("id"), "tool_call_id": call_id, "tool_name": name, "origin": item.origin, **address, "provenance": "fetched_document"})
         if fetched and not opened:
             document_id = "doc_" + digest([execution.execution_id, call_id, fetched["id"]])[:24]
-            document = derive(item, raw_id=document_id, title=fetched["title"], url=fetched["url"], source_id=fetched["id"], source_uri=None, provenance="fetched_document", document_hash=fetched["document_hash"])
+            known = {"title": fetched["title"], "url": fetched["url"], "published_at": fetched.get("published_at"), "document_hash": fetched["document_hash"]}
+            document = derive(item, raw_id=document_id, source_id=fetched["id"], source_uri=None, provenance="fetched_document", **known)
             if document is None:
                 # The page cannot be evidence, but the call still happened: its
                 # links and its envelope are recorded below like any other.
@@ -288,7 +295,7 @@ def research_observations(execution: NativeExecution, sources, cite_search_resul
                 if external := _externalized_path(message, text):
                     pages[external] = {"fetched": fetched, "item": document}
                 catalog.append({"raw_id": document_id, "receipt_id": receipt.get("id"), "tool_call_id": call_id, "tool_name": name, "origin": item.origin, "url": fetched["url"], "title": fetched["title"], "provenance": "fetched_document"})
-        for observed in observed_sources(text, connector=source.name if source else name, origin=item.origin):
+        for observed in observed_sources(text, connector=source.name if source else name, origin=item.origin, icons=icons):
             if fetched and not opened and observed["canonical_url"] == fetched["canonical_url"]:
                 continue
             if observed["canonical_url"] in recorded_urls:

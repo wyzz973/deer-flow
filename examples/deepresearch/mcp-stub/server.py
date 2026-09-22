@@ -84,6 +84,10 @@ async def search_tickets(q: str, size: int = 5) -> dict:
 
 
 PAGE_BASE = "https://wiki.corp.example/"
+# The logo this wiki states for itself. Internal sites rarely have a
+# /favicon.ico the gateway can find, so the search tool names it; research shows
+# it next to the site and only ever fetches an icon on the site's own host.
+SITE_LOGO = PAGE_BASE + "static/logo/platform-team.png"
 
 
 @mcp.tool()
@@ -92,7 +96,7 @@ async def find_pages(query: str, count: int = 5) -> str:
     await asyncio.sleep(LATENCY)
     found = search("wiki", query, count) + search("doc", query, count)
     log(tool="find_pages", query=query, results=len(found))
-    return json.dumps({"code": 0, "data": {"hits": [{"headline": item["title"], "link": PAGE_BASE + item["id"], "desc": item["text"][:36] + "…"} for item in found[:count]]}})
+    return json.dumps({"code": 0, "data": {"hits": [{"headline": item["title"], "link": PAGE_BASE + item["id"], "desc": item["text"][:36] + "…", "published_at": item["date"], "logo_url": SITE_LOGO} for item in found[:count]]}})
 
 
 @mcp.tool()
@@ -106,7 +110,7 @@ async def open_page(url: str, max_chars: int = 4000) -> str:
     related = [other for other in CORPUS if other is not item and other["kind"] == item["kind"]][:2]
     body = f"# {item['title']}\n\n更新时间：{item['date']}\n\n{item['text']}\n\n## 相关页面\n" + "\n".join(f"- [{other['title']}]({PAGE_BASE}{other['id']})" for other in related)
     # ensure_ascii on purpose: many servers escape non-ASCII text.
-    return json.dumps({"code": 0, "data": {"title": item["title"], "content": body[:max_chars], "truncated": len(body) > max_chars}})
+    return json.dumps({"code": 0, "data": {"title": item["title"], "content": body[:max_chars], "published_at": item["date"], "truncated": len(body) > max_chars}})
 
 
 @mcp.tool()

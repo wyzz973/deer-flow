@@ -202,6 +202,8 @@ class Store:
               body TEXT NOT NULL, PRIMARY KEY(run_id,id));
             CREATE TABLE IF NOT EXISTS research_favicon (
               domain TEXT PRIMARY KEY, content_type TEXT, body BLOB, fetched_at REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS research_icon_hint (
+              domain TEXT PRIMARY KEY, url TEXT NOT NULL, at REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS research_model_call (
               run_id TEXT NOT NULL REFERENCES research_run(id), id TEXT NOT NULL,
               body TEXT NOT NULL, PRIMARY KEY(run_id,id));
@@ -358,6 +360,15 @@ class Store:
 
         return await self.call(op)
 
+    async def icon_hint(self, domain):
+        """The icon a source declared for this site, or None."""
+
+        def op(db):
+            row = db.execute("SELECT url FROM research_icon_hint WHERE domain=?", (domain,)).fetchone()
+            return row[0] if row else None
+
+        return await self.call(missing_table(op, None))
+
     async def save_favicon(self, value):
         def op(db):
             db.execute(
@@ -394,6 +405,13 @@ class Store:
                 if source.get("title_observed") and (source.get("status") == "read" or previous.get("status") != "read"):
                     merged.update(title=source["title"], title_observed=True)
                 db.execute("INSERT INTO research_source VALUES (?,?,?) ON CONFLICT(run_id,id) DO UPDATE SET body=excluded.body", (run_id, source["id"], dumps(merged)))
+                # The icon a site stated for itself, so the icon service can ask
+                # for it instead of guessing. It is a hint, never evidence.
+                if source.get("icon_url") and source.get("domain"):
+                    db.execute(
+                        "INSERT INTO research_icon_hint VALUES (?,?,?) ON CONFLICT(domain) DO UPDATE SET url=excluded.url, at=excluded.at",
+                        (source["domain"], str(source["icon_url"])[:2000], time.time()),
+                    )
             return call
 
         return await self.call(op)

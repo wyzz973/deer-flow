@@ -39,6 +39,7 @@ def fetched_source(artifact, *, connector=None, origin="runtime"):
         canonical = canonical_url(url)
     except ValueError:
         return None
+    stated = extract.published(artifact.get("published_at"))
     return {
         "id": "source_" + digest([origin, connector, canonical])[:24],
         "url": url,
@@ -50,6 +51,7 @@ def fetched_source(artifact, *, connector=None, origin="runtime"):
         "connector": connector,
         "status": "read",
         "excerpt": str(artifact.get("excerpt") or "")[:1200],
+        "published_at": stated.isoformat() if stated else None,
         "document_hash": artifact.get("document_hash"),
     }
 
@@ -78,7 +80,7 @@ def requested(arguments):
     return [], identifier
 
 
-def _page(url, identifier, title, text, *, connector, origin):
+def _page(url, identifier, title, text, *, connector, origin, published=None):
     if len((text or "").strip()) < MIN_PAGE_CHARS:
         return None
     canonical = None
@@ -95,6 +97,7 @@ def _page(url, identifier, title, text, *, connector, origin):
     # A document of an internal system has no address; its identifier under the
     # source names it, so reading it twice is one reference.
     locator = None if url else f"mcp://{connector}/{identifier}"[:2000]
+    stated = extract.published(published)
     return {
         "id": "source_" + digest([origin, connector, canonical or locator])[:24],
         "url": url,
@@ -108,6 +111,11 @@ def _page(url, identifier, title, text, *, connector, origin):
         "status": "read",
         "text": text,
         "excerpt": text[:1200],
+        # Only the source knows when its page was published, and a reader needs
+        # it to judge whether what the page says still holds. Kept as text: a
+        # page travels through payloads that are serialized as JSON, and the
+        # evidence record parses it back into a date.
+        "published_at": stated.isoformat() if stated else None,
         "document_hash": digest(" ".join(text.split())),
     }
 
@@ -137,7 +145,7 @@ def opened_pages(arguments, payload, text, *, connector=None, origin="runtime"):
                 asked = wanted.pop(canonical_url(record.get("url")), None)
             except ValueError:
                 asked = None
-            page = _page(asked, None, record.get("title"), record.get("snippet"), connector=connector, origin=origin) if asked else None
+            page = _page(asked, None, record.get("title"), record.get("snippet"), connector=connector, origin=origin, published=record.get("published_at")) if asked else None
             if page:
                 pages.append(page)
         return pages
@@ -145,7 +153,7 @@ def opened_pages(arguments, payload, text, *, connector=None, origin="runtime"):
     # The text a field held is the page; only when none did is the tool's own text the better copy.
     body = found["text"] if found["readable"] or len(found["text"]) >= len(text) else text
     title = found["title"] if found["title"] not in {found.get("url"), urls[0] if urls else None} else None
-    page = _page(urls[0] if urls else found.get("url"), identifier, title, body, connector=connector, origin=origin)
+    page = _page(urls[0] if urls else found.get("url"), identifier, title, body, connector=connector, origin=origin, published=found.get("published_at"))
     return [page] if page else []
 
 
@@ -163,8 +171,20 @@ def _window_start(text, match, previous):
     return max(start, previous.end(), own)
 
 
-def observed_sources(content, *, connector=None, origin="runtime"):
-    """Return actual links and nearby excerpts, not a normalized search result."""
+def observed_sources(content, *, connector=None, origin="runtime", icons=None):
+    """Return actual links and nearby excerpts, not a normalized search result.
+
+    ``icons`` maps a host to the icon that host declared for itself. Such a
+    picture is decoration, not something the research saw: it is skipped as a
+    link and travels on the source row of the site it belongs to.
+    """
+    icons = icons or {}
+    pictures = set()
+    for address in icons.values():
+        try:
+            pictures.add(canonical_url(address))
+        except ValueError:
+            continue
     text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False, default=str)
     clipped = len(text) > MAX_SCAN_CHARS
     text = text[:MAX_SCAN_CHARS]
@@ -184,7 +204,7 @@ def observed_sources(content, *, connector=None, origin="runtime"):
         except ValueError:
             continue
         # Credential-redacted links cannot be reconstructed or opened safely.
-        if "redacted" in url.lower():
+        if "redacted" in url.lower() or canonical in pictures:
             continue
         domain = (urlsplit(url).hostname or "").removeprefix("www.")
         source_id = "source_" + digest([origin, connector, canonical])[:24]
@@ -199,6 +219,7 @@ def observed_sources(content, *, connector=None, origin="runtime"):
             "origin": origin,
             "connector": connector,
             "status": "discovered",
+            **({"icon_url": icons[domain]} if icons.get(domain) else {}),
             # The text around this link, stopping at its neighbours: in a result
             # list the next entry's sentences belong to the next link, and a quote
             # taken from them must not be shown under this address.

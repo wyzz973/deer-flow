@@ -195,3 +195,46 @@ async def test_a_research_that_only_has_mcp_search_and_fetch_tools_keeps_its_fin
     # The report can cite it: the pool keeps its address.
     pool, findings, _ = merge_results([result])
     assert pool[findings[0]["evidence_ids"][0]]["url"] == PAGE
+
+
+def test_a_page_says_when_it_was_published_and_the_date_is_kept():
+    """A read page's own date is evidence metadata, like a search record's.
+
+    A reader judging whether a claim is still true needs the page's date, and
+    the reference list renders it. Only the server states it, so it is read
+    where the server puts it — beside the text or under ``metadata`` — and an
+    unusable value costs the date, never the page.
+    """
+    envelope = json.dumps({"data": {"title": "Qdrant 1.12 发布说明", "content": BODY, "metadata": {"publishedDate": "Oct 8, 2026"}}})
+    evidence, offered = observe("web_fetch", {"url": PAGE}, envelope, READ)
+    (page,) = offered
+    document = next(item for item in evidence if item.raw_id == page["raw_id"])
+    assert str(document.published_at)[:10] == "2026-10-08"
+    # A date nobody can parse leaves the page citable and simply undated.
+    unusable = json.dumps({"data": {"title": "Qdrant 1.12 发布说明", "content": BODY, "published_at": "上周"}})
+    evidence, offered = observe("web_fetch", {"url": PAGE}, unusable, READ)
+    assert len(offered) == 1
+    assert next(item for item in evidence if item.raw_id == offered[0]["raw_id"]).published_at is None
+
+
+def test_the_catalogue_offered_to_conversion_stays_json():
+    """The catalogue is a payload, not an object graph.
+
+    Conversion sends it to the model with ``json.dumps``, so a value that only
+    Python understands fails the whole step: a real run died with TypeError in
+    the converter the first time a page carried a parsed date.
+    """
+    envelope = json.dumps({"data": {"title": "Qdrant 1.12 发布说明", "content": BODY, "published_at": "2026-10-08"}})
+    _, catalog = research_observations(
+        NativeExecution(
+            "notes",
+            "exec",
+            [
+                {"type": "ai", "tool_calls": [{"id": "c1", "name": "web_fetch", "args": {"url": PAGE}}]},
+                {"type": "tool", "name": "web_fetch", "tool_call_id": "c1", "content": envelope, "status": "success"},
+            ],
+        ),
+        [READ],
+    )
+    assert json.dumps({"task": {}, "answer": "notes", "observed_calls": catalog}, ensure_ascii=False)
+    assert "2026-10-08" in json.dumps(catalog)

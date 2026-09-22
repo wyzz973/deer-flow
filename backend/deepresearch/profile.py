@@ -68,6 +68,7 @@ OPERATOR_ONLY = (
     "data_dir",
     "max_active_runs",
     "favicons",
+    "favicon_private_network",
     "pricing",
     "budget_ceiling",
     "local_secret_env",
@@ -84,6 +85,7 @@ OPERATOR_ONLY = (
 # Fields added after run fingerprints existed. Removing them at their defaults
 # keeps the fingerprint of an unchanged operator file identical across upgrades.
 LATER_FIELDS = {
+    "favicon_private_network",
     "tool_audit",
     "wire_audit",
     "audit_max_chars",

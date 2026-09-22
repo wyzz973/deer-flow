@@ -18,6 +18,7 @@ from contextvars import ContextVar
 from logging.handlers import RotatingFileHandler
 from uuid import uuid4
 
+from . import extract
 from .audit import audit_request, audit_response, bounded, request_summary, response_summary, shared_prefix
 from .output import visible_text
 from .store import REPORT_CALL_OUTPUT, RESEARCH_TURN_OUTPUT
@@ -631,7 +632,8 @@ def model_callbacks(trace, *, metered_tools=(), model_name=None, scope=None, out
             # Observe only the model-visible body. Do not mine provider headers
             # or mutate the object handed to the native model/tool loop.
             safe_content = redact(content, trace.secrets, 256000)
-            found = observed_sources(safe_content, connector=spec.name if spec else name, origin=spec.origin if spec else "runtime") if status == "success" else []
+            icons = extract.declared_icons(safe_content) if status == "success" else {}
+            found = observed_sources(safe_content, connector=spec.name if spec else name, origin=spec.origin if spec else "runtime", icons=icons) if status == "success" else []
             artifact = getattr(output, "artifact", None)
             fetched = fetched_source(redact(artifact, trace.secrets), connector=spec.name, origin=spec.origin) if status == "success" and spec and spec.kind in {"native", "channel"} else None
             if fetched:

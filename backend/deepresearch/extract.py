@@ -13,6 +13,7 @@ from __future__ import annotations
 import html
 import json
 import re
+from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit
 
 URL_KEYS = ("url", "link", "href", "uri", "source_url", "sourceUrl", "sourceURL", "page_url", "pageUrl", "web_url", "webUrl", "doc_url", "document_url", "website", "permalink")
@@ -22,6 +23,7 @@ DOCUMENT_TEXT_KEYS = ("markdown", "raw_content", "content", "text", "body", "htm
 DATE_KEYS = (
     "published_at",
     "publishedAt",
+    "publishedTime",
     "publishedDate",
     "published_date",
     "datePublished",
@@ -40,12 +42,112 @@ DATE_KEYS = (
     "created_at",
     "create_time",
 )
+# A site icon a source states for its own page. Read as decoration: never a
+# result's address, never text, and never a source that was seen.
+# Bounds for walking an answer: nested JSON strings are parsed, but only a few
+# and only while they are small enough to be an answer rather than a document.
+MAX_NESTED_JSON = 40
+MAX_SCAN = 1_000_000
+ICON_KEYS = ("logo_url", "logo", "icon_url", "icon", "favicon", "favicon_url", "site_icon", "site_logo", "logoUrl", "iconUrl", "siteIcon")
 ID_KEYS = ("id", "document_id", "doc_id", "chunk_id", "_id")
 MARKDOWN_LINK = re.compile(r"\[([^\[\]\n]{1,300})\]\((https?://[^\s)]+)\)")
 TITLE_LINE = re.compile(r"(?im)^\s*(?:title|标题)\s*[:：]\s*(.+)$")
 URL_LINE = re.compile(r"(?im)^\s*(?:url|link|source|链接|网址)\s*[:：]\s*(https?://\S+)")
 HEADING = re.compile(r"(?m)^\s{0,3}#{1,2}\s+(.+?)\s*#*\s*$")
 HTML_TITLE = re.compile(r"(?is)<title[^>]*>(.*?)</title>")
+
+
+# A publication date is only ever the source's own claim, so it is read where a
+# source states it and never computed. Values outside this window are somebody's
+# placeholder (0000-00-00, an epoch zero, a year in the far future), not a date.
+EARLIEST_YEAR = 1990
+AHEAD_DAYS = 400
+MONTHS = "jan feb mar apr may jun jul aug sep oct nov dec".split()
+NUMERIC_DATE = re.compile(r"(\d{4})\s*[-/年.]\s*(\d{1,2})\s*[-/月.]\s*(\d{1,2})")
+NAMED_DATE = re.compile(r"(?i)([a-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})")
+DAY_FIRST_DATE = re.compile(r"(?i)(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]{3,9})\.?,?\s+(\d{4})")
+
+
+def published(value):
+    """The date a source says its page carries, or None.
+
+    Providers state it in whatever shape they like — ISO, ``Apr 21, 2026``,
+    ``2026年7月10日``, epoch seconds — and plenty state something unusable
+    (``3 天前``, ``recently``). An unusable value must cost the date and nothing
+    else: the evidence it belongs to is still evidence, so this never raises and
+    never guesses a date from a relative phrase.
+    """
+
+    def bounded(moment):
+        moment = moment if moment.tzinfo else moment.replace(tzinfo=UTC)
+        now = datetime.now(UTC)
+        return moment if EARLIEST_YEAR <= moment.year and moment <= now + timedelta(days=AHEAD_DAYS) else None
+
+    if isinstance(value, datetime):
+        return bounded(value)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        # Seconds or milliseconds; anything else is an id that happens to be a number.
+        seconds = value / 1000 if value > 1e11 else value
+        try:
+            return bounded(datetime.fromtimestamp(seconds, UTC))
+        except (OverflowError, OSError, ValueError):
+            return None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    try:
+        return bounded(datetime.fromisoformat(text.replace("Z", "+00:00")))
+    except ValueError:
+        pass
+    numeric = NUMERIC_DATE.search(text)
+    if numeric:
+        year, month, day = (int(part) for part in numeric.groups())
+        try:
+            return bounded(datetime(year, month, day, tzinfo=UTC))
+        except ValueError:
+            return None
+    for pattern, order in ((NAMED_DATE, (2, 0, 1)), (DAY_FIRST_DATE, (2, 1, 0))):
+        found = pattern.search(text)
+        if not found:
+            continue
+        parts = found.groups()
+        name = parts[order[1]][:3].lower()
+        if name not in MONTHS:
+            continue
+        try:
+            return bounded(datetime(int(parts[order[0]]), MONTHS.index(name) + 1, int(parts[order[2]]), tzinfo=UTC))
+        except ValueError:
+            return None
+    return None
+
+
+# Where an HTML page states its date. Every CMS writes at least one of these;
+# the prose around it ("更新于上周") is never one, so it is not read.
+DATE_ATTRIBUTES = "article:published_time|article:modified_time|datepublished|datemodified|dc\\.date[\\w.]*|date|pubdate|publish[-_]?date|og:published_time|parsely-pub-date|sailthru\\.date"
+PAGE_DATE = re.compile(
+    rf"""<meta[^>]+(?:property|name|itemprop)\s*=\s*["']?(?:{DATE_ATTRIBUTES})["']?[^>]*?content\s*=\s*["']([^"']{{4,64}})["']"""
+    rf"""|<meta[^>]+content\s*=\s*["']([^"']{{4,64}})["'][^>]*?(?:property|name|itemprop)\s*=\s*["']?(?:{DATE_ATTRIBUTES})["']"""
+    r"""|<time[^>]+datetime\s*=\s*["']([^"']{4,64})["']"""
+    r"""|["'](?:datePublished|dateCreated)["']\s*:\s*["']([^"']{4,64})["']""",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def page_date(html):
+    """The date an HTML page states about itself, as the page wrote it, or None.
+
+    Read from metadata only — a CMS writes it there, while a date in the prose
+    belongs to what the page is about, not to the page.
+    """
+    if not isinstance(html, str) or "<" not in html:
+        return None
+    for found in PAGE_DATE.finditer(html[:200000]):
+        value = next((group for group in found.groups() if group), None)
+        if value and published(value):
+            return value.strip()
+    return None
 
 
 def http_url(value):
@@ -147,6 +249,10 @@ def _headline(text, limit=80):
     return line[: cut if cut > limit // 2 else limit].rstrip() + "…"
 
 
+def _host(url):
+    return (urlsplit(url).hostname or "").removeprefix("www.").lower()
+
+
 def _record(item, text_limit, *, chunk=False):
     url = http_url(_first(item, URL_KEYS))
     title = _first(item, TITLE_KEYS)
@@ -159,6 +265,11 @@ def _record(item, text_limit, *, chunk=False):
     published = _first(item, DATE_KEYS)
     if published:
         record["published_at"] = published[:64]
+    # Only for its own site: an icon claimed for another host would make the
+    # gateway fetch, cache and show a picture chosen by somebody else.
+    icon = http_url(_first(item, ICON_KEYS))
+    if icon and url and _host(icon) == _host(url):
+        record["icon_url"] = icon
     # Internal tools name their identifier after the record: ticket_id, docId, article_id.
     identifier = item.get(next((key for key in ID_KEYS if key in item), None) or next((key for key in item if re.search(r"(?:_id|Id|ID)$", key)), ""), None)
     if isinstance(identifier, (str, int)) and str(identifier).strip():
@@ -218,6 +329,41 @@ def records(value, *, limit=50, text_limit=1200, from_text=True):
     return text_records(text, limit=limit, text_limit=text_limit)
 
 
+def declared_icons(value, *, limit=4000):
+    """``{host: icon URL}`` for objects that state an icon for their own address.
+
+    A site icon is worth showing next to the sites a report cites, and only the
+    source knows where an internal wiki keeps its logo. It is read from the same
+    object that carries the address, and only when both name the same host: an
+    icon claimed for somebody else's site would have the gateway fetch, cache
+    and show a picture that site never chose.
+    """
+    icons = {}
+    pending = [value]
+    seen = parsed = 0
+    while pending and seen < limit:
+        item = pending.pop()
+        seen += 1
+        if isinstance(item, str):
+            # An adapter hands back the server's answer as a string, inside a
+            # content block or under structured_content, sometimes twice over.
+            if parsed < MAX_NESTED_JSON and item.lstrip()[:1] in "[{" and len(item) <= MAX_SCAN:
+                parsed += 1
+                nested = parse_json(item)
+                if not isinstance(nested, str):
+                    pending.append(nested)
+            continue
+        if isinstance(item, dict):
+            icon = http_url(_first(item, ICON_KEYS))
+            address = http_url(_first(item, URL_KEYS))
+            if icon and address and _host(icon) == _host(address):
+                icons.setdefault(_host(address), icon)
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+    return icons
+
+
 def coverage(value, found):
     """How much of a structured answer's text its records carry, 0 to 1.
 
@@ -235,7 +381,7 @@ def coverage(value, found):
             pending.extend(item)
         elif isinstance(item, str):
             total += len(item.strip())
-    kept = sum(len(record.get("snippet") or "") + len(record.get("url") or "") + (len(record.get("title") or "") if record.get("title") not in (record.get("snippet") or "") else 0) for record in found)
+    kept = sum(len(record.get("snippet") or "") + len(record.get("url") or "") + len(record.get("icon_url") or "") + (len(record.get("title") or "") if record.get("title") not in (record.get("snippet") or "") else 0) for record in found)
     return min(1.0, kept / total) if total else 0.0
 
 
@@ -283,11 +429,14 @@ def document(value, requested_url=None):
         metadata = inner.get("metadata") if isinstance(inner.get("metadata"), dict) else {}
         title = _first(inner, TITLE_KEYS) or _first(metadata, TITLE_KEYS)
         url = http_url(_first(inner, URL_KEYS) or _first(metadata, URL_KEYS))
+        date = _first(inner, DATE_KEYS) or _first(metadata, DATE_KEYS)
         if text is None:
             readable = False
             text = json.dumps(value, ensure_ascii=False, indent=1, default=str)
+        date = date or page_date(text)
     else:
         text = content_text(value)
+        date = page_date(text)
     text = text or ""
     if not title:
         line = TITLE_LINE.search(text[:2000]) or HEADING.search(text[:5000])
@@ -295,7 +444,7 @@ def document(value, requested_url=None):
     if not title:
         match = HTML_TITLE.search(text[:20000])
         title = html.unescape(re.sub(r"\s+", " ", match.group(1))).strip() if match else None
-    return {"title": (title or url or requested_url or "")[:1000], "url": url or requested_url, "text": text, "readable": readable}
+    return {"title": (title or url or requested_url or "")[:1000], "url": url or requested_url, "text": text, "readable": readable, "published_at": date}
 
 
 def render_search(query, found, provider, *, citable=False):

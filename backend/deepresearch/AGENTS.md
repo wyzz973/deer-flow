@@ -2,24 +2,21 @@
 
 The workflow owns planning approval, dependency scheduling, evidence contracts,
 bounded supplementation and report rendering. It does not own a second agent
-runtime. Read `../AGENTS.md` and the harness subagents guide for native execution.
-The current architecture and workflow are described in `docs/deepresearch/ARCHITECTURE.md`
-at the repository root; update it with any change to nodes, events, contracts or storage.
+runtime; the harness subagents guide covers native execution.
+`docs/deepresearch/ARCHITECTURE.md` describes the architecture and workflow;
+update it with any change to nodes, events, contracts or storage.
 
 ## Taking over, debugging or auditing a run
 
-`.agents/skills/deepresearch-engineering/` is the working skill for this module
-(Codex loads `.agents/skills` natively, Claude Code via
-`ln -s ../../.agents/skills/deepresearch-engineering .claude/skills/`). It maps
-the module, lists what must not be done, and carries two offline scripts:
-`scripts/audit_run.py --run <id|prefix|page URL|thread|latest> [--baseline <run>]`
-turns a run's records into a fact sheet and an offline HTML page (timeline; time,
-tokens and tools per stage, node and step; prompt cache; yield of each research
-round; rule findings with the setting that changes each),
-and `scripts/show_call.py` opens or replays one model call. Both read the store
-through `Store` and `metrics.collect`; `tests/deepresearch/test_audit_skill.py`
-runs them against a synthetic store, so change them together with any table,
-record field or metrics key they read.
+`.agents/skills/deepresearch-engineering/` is the working skill for this module.
+It maps the module, says what must not be done, and carries
+two offline scripts: `audit_run.py --run <id|prefix|URL|thread|latest>
+[--baseline <run>]` turns a run's records into a fact sheet and an offline HTML
+page (timeline; time, tokens and tools per stage, node and step; prompt cache;
+round yield; findings with the setting that changes each); `show_call.py`
+opens one model call. Both read the store through `Store` and `metrics.collect`,
+and `test_audit_skill.py` runs them against a synthetic store, so change them
+together with any table, field or metrics key they read.
 
 ## Configuration independence
 
@@ -78,7 +75,7 @@ prompts, engine tools, compaction and budgets all live in the research profile
   `mcp://<source>/<id>`), and structured `search`/`data` answers become
   per-record evidence by shape (`extract.records`; the whole answer stays
   citable unless records carry ≥80% of it). Without this, MCP-only research
-  ended with NO_EVIDENCE: the converter saw no URL to match the notes to.
+  ended with NO_EVIDENCE: the converter had no URL to match the notes to.
   Provider-backed sources own the model-facing schema (`channels.py`) and emit
   their artifacts themselves, reading payloads with the same `extract.py`.
   Native completed executions are cached; individual tool calls are not replayed.
@@ -86,20 +83,19 @@ prompts, engine tools, compaction and budgets all live in the research profile
   docstring says why it binds inside the tool coroutine. Two rules: the
   enclosing call is `callbacks.parent_run_id` (the `research_tool_call` row id),
   and that manager is never passed on — a call inheriting it is billed twice (25
-  searches once became 41), so `config={"callbacks": []}` stays. `trace.py`
-  writes a tool's arguments and answer to `research_tool_exchange`; the row
-  keeps only metrics and a hash. Bodies are bounded by `audit_max_chars` and say
-  `truncated` rather than clip silently. `logbook.py` exports a run as one
+  searches became 41), so `config={"callbacks": []}` stays. `trace.py` writes a
+  tool's arguments and answer to `research_tool_exchange`; that row keeps only
+  metrics and a hash. Bodies are bounded by `audit_max_chars` and say
+  `truncated` instead of clipping silently. `logbook.py` exports a run as one
   JSONL and owns the only delete path (`store.prune`).
-- `trace.py` records bounded, redacted payloads and paired spans locally, with
-  no telemetry-service dependency. Callbacks stay loop-independent: native
-  subagents run on an isolated loop.
+- `trace.py` records bounded, redacted payloads and paired spans locally, with no
+  telemetry-service dependency, and its callbacks stay loop-independent.
 - Trace and export APIs inherit owner/ACL checks. Operational logs rotate under
   the data directory; never log raw prompts, headers or provider exceptions to
-  stdout. Unknown failures retain type/status/stack locations.
+  stdout. Unknown failures keep type, status and stack locations only.
 - Native subagents retain one-shot state semantics. Workflow recovery reuses
-  completed units/tool responses, but does not resume an interrupted child
-  model turn. Do not claim exactly-once tools or full Gateway chat persistence.
+  completed units and tool responses but never resumes an interrupted child
+  model turn. Do not claim exactly-once tools or Gateway chat persistence.
 - `conversation.py` owns server deadlines, pause/resume, idempotent messages,
   and routing back into the existing graph. Never approve a plan from a browser
   interval. Process restart pauses outstanding timers rather than persisting
@@ -124,13 +120,13 @@ prompts, engine tools, compaction and budgets all live in the research profile
   `trace.metric_scope` (set in `traced()`), normalize usage with `usage_details`,
   leave unknown usage empty with `usage_reported=false`, and never invent prices:
   `pricing` is operator configuration excluded from the fingerprint and from the
-  acceptance launcher's resume comparison. Tool records
-  add `request_key` (a hash of redacted arguments, never the arguments) and
-  `error_type` (exception class, or the coarse `returned_error_type` label for an
-  error result). These labels only group metrics; never branch research on them.
-- `doctor.py` checks configuration without calling models; only `--probe-model NAME`
-  sends two short requests (a plain reply and a tool call) through the host model
-  factory with thinking disabled. Pass the loaded `AppConfig` to registry lookups:
+  acceptance launcher's resume comparison. Tool records add `request_key` (a hash
+  of redacted arguments, never the arguments) and `error_type` (exception class,
+  or the coarse `returned_error_type` label for an error result). These labels
+  group metrics only; never branch research on them.
+- `doctor.py` checks configuration without calling models; only `--probe-model
+  NAME` sends two short requests (a plain reply and a tool call) through the host
+  model factory, thinking disabled. Pass the loaded `AppConfig` to registry lookups:
   the global subagent config stays empty until something loads it.
 - Offline templates in `examples/deepresearch/offline/` are validated by
   `tests/deepresearch/test_offline_config.py`; keep them consistent with each other.
@@ -195,44 +191,42 @@ prompts, engine tools, compaction and budgets all live in the research profile
   prefill). Three rules, each pinned by a test:
   1. A role's conversation only appends. `model_budget_config` turns the
      engine's `verification.receipts_enabled` off unless `tool_receipt_ledger`
-     is set: `ToolReceiptMiddleware` rewrites its ledger after the system
-     prompt every turn, which left researcher loops at 4-5% cached input
-     against 77-82% without it. The switch also stops stamping, so
-     `observations.derived_receipts` rebuilds `r1..rN`/status from the archived
-     tool messages. Never insert or edit before a running role's newest message.
+     is set: `ToolReceiptMiddleware` rewrites its ledger after the system prompt
+     every turn, leaving researcher loops at 4-5% cached input against 77-82%
+     without it. It also stops stamping, so `derived_receipts` rebuilds
+     `r1..rN`/status from the archived tool messages. Never insert or edit
+     before a running role's newest message.
   2. Payloads read from what every call shares to what only this call has:
-     `instructions`, run-level context, `sources`, `unit`, and last the counters
-     that change between steps (`search_budget`, `shared_run_budget`). Sections
-     put `findings`/`evidence` before `section`; conversion sends
-     `{"task", "answer"}`; a follow-up sends plan, report, conversation, then
-     the new `message`; a revision sends findings and evidence, then the report,
-     then the request; planning leads with what a deployment keeps constant.
-     `structured_task` puts `output_schema` after `instructions` when they lead,
-     and leaves both last in long writer tasks, next to the point of generation.
-     `recent_messages` moves a window's head once per ten messages, not every
-     turn. `tests/deepresearch/test_prompt_cache.py` states the property on the
-     text a model receives. `digest` sorts keys, so reordering never changes a
-     cache key.
+     `instructions`, run-level context, `sources`, `unit`, then the counters
+     that change between steps (`search_budget`, `shared_run_budget`). Each node
+     follows that shape — sections put `findings`/`evidence` before `section`,
+     conversion sends `{"task", "answer"}`, a follow-up or revision ends with
+     the new message or request, planning leads with what a deployment keeps
+     constant. `structured_task` places `output_schema` after leading
+     `instructions`, both last in long writer tasks. `recent_messages` moves a
+     window's head once per ten messages, not every turn.
+     `tests/deepresearch/test_prompt_cache.py` states the property on the text a
+     model receives; `digest` sorts keys, so reordering never changes a key.
   3. Nothing that changes per call goes into a system prompt.
   `LocalCallbacks` records `prefix_messages`/`prefix_chars` per call and metrics
-  report `prefix_reuse_ratio`: the ceiling a prefix cache could serve,
-  independent of provider reporting. A low ceiling means our request changed
-  early; a high ceiling with low `cache_read_ratio` means the provider or
-  gateway (no prefix caching, no replica affinity, an expired entry).
+  report `prefix_reuse_ratio`: the ceiling a prefix cache could serve, whatever
+  the provider reports. A low ceiling means our request changed early; a high
+  ceiling with low `cache_read_ratio` means the provider or gateway (no prefix
+  caching, no replica affinity, an expired entry).
   `session_overrides` adds the conversation's id as
   `extra_body[session_param]` / `default_headers[session_header]` only where a
-  `ModelSpec` names them (OpenAI's own endpoint gets `prompt_cache_key`
-  unasked); `merged_overrides` merges dictionary fields with the profile's,
-  because the engine's `model_overrides` replaces whole fields.
+  `ModelSpec` names them (OpenAI's own endpoint gets `prompt_cache_key` unasked);
+  `merged_overrides` merges dictionary fields with the profile's, since the
+  engine's `model_overrides` replaces whole fields.
 - Compaction is research configuration: `compaction_config` builds the engine's
   summarization settings per role from `CompactionSpec` and the role model's
-  declared context window, with `prompts.compaction` as the summary template
-  (it must keep opened URLs, verbatim quotes and dates). The host's
-  chat summarization thresholds never apply to research.
-  The engine keeps a subagent's leading system prompt out of compaction
-  (`_leading_system_messages` in `summarization_middleware.py`); without that a
-  researcher loses its methodology mid-run and the human-anchored summary trimmer
-  reduces the window to that prompt, discarding the actual research turns.
+  declared context window, with `prompts.compaction` as the summary template (it
+  must keep opened URLs, verbatim quotes and dates); the host's chat
+  summarization thresholds never apply to research. The engine keeps a
+  subagent's leading system prompt out of compaction (`_leading_system_messages`
+  in `summarization_middleware.py`); without it a researcher loses its
+  methodology mid-run and the summary trimmer reduces the window to that prompt,
+  discarding the research turns.
 - The graph starts at `rewrite`: the conversation becomes one complete
   `ResearchRequest` (`user_query`, optional `acknowledgement`, at most three
   clarification questions) before planning, mirroring ChatGPT deep research. A
@@ -241,16 +235,15 @@ prompts, engine tools, compaction and budgets all live in the research profile
   acknowledgement. `plan.brief` is the rewritten request.
 
 - Every model-calling node is tunable on its own (`config.NodeSpec`, `nodes:`):
-  rewrite, plan, research, conversion, outline, section, summary, revision and
-  follow_up. `models.model_for` resolves the model (a researcher's own role model,
-  then `nodes.research`; for the fixed roles the node first, then the role),
-  `native.node_of` names the node from role and task, and sampling parameters are
-  applied by `models.with_node` to the execution's private model profile, so the
-  engine's factory applies them and metrics keep the model's real name. Only
-  `rewrite` and `summary` can be disabled. Record `config_node` on every model
-  call: `metrics.breakdown.by_node` (calls, tokens, latency, truncated answers,
-  contract retries) is what tuning is judged by. `json_mode` is optional and only
-  for direct calls; the contract is always requested in prompt text as well.
+  rewrite, plan, research, conversion, outline, section, summary, revision,
+  follow_up. `models.model_for` resolves the model (a researcher's own role
+  model, then `nodes.research`; for fixed roles the node first, then the role),
+  `native.node_of` names the node, and `models.with_node` applies sampling to the
+  execution's private model profile, so the engine's factory applies them and
+  metrics keep the model's real name. Only `rewrite` and `summary` can be
+  disabled. Record `config_node` on every model call: `metrics.breakdown.by_node`
+  is what tuning is judged by. `json_mode` is optional and only for direct calls;
+  the contract is always requested in prompt text as well.
 - Model gateways that only speak Chat Completions are a first-class target:
   never require JSON mode, structured output or the Responses API. For
   `provider: openai` with a non-OpenAI `base_url`, `chat_completions.ChatCompletionsModel`
@@ -295,11 +288,11 @@ prompts, engine tools, compaction and budgets all live in the research profile
   Skill file paths, no stdio MCP servers, no custom model classes and no literal
   credentials in headers or environment. Those belong in the operator's file.
   `profile.masked` hides literal credential values from users who cannot edit.
-- Naming: the intranet deployment (slow gateway model, MCP-only search without
-  originals) is why these features exist, but it is not a variant. No
+- Naming: the intranet deployment (slow gateway model, MCP-only search) is why
+  these features exist, but it is not a variant. No
   deployment-specific folders, templates, identifiers or example values; extend
-  the generic templates (`deepresearch.example.yaml`, `examples/deepresearch/offline/`,
-  `examples/deepresearch/mcp-sources.fragment.yaml`).
+  the generic templates (`deepresearch.example.yaml`,
+  `examples/deepresearch/offline/`, `.../mcp-sources.fragment.yaml`).
 
 Regression commands, from `backend/`:
 
@@ -351,6 +344,15 @@ authentication, local-model quality or end-to-end deployment readiness.
   both conversion references and final report references. It does not parse or
   replace arbitrary MCP business returns. Opaque tools remain supported under
   unrestricted policy; a discovered URL alone never establishes an original read.
+- A publication date and a site icon are only what a source stated about its own
+  page: `extract.published` and `extract.declared_icons` read them wherever the
+  source puts them, through an adapter's wrappers, never from a clock, a URL or
+  text, and an icon counts only on that page's host. An unusable value costs the
+  field, not the evidence; a page carries its date as text, the catalogue being
+  JSON. An icon is never a seen link: `research_icon_hint` keeps it and
+  `favicons.py` fetches it (a private address needs `favicon_private_network`),
+  so no browser asks a cited site. `not_before` is enforced only where provable:
+  dated evidence, all of it too old.
 - `SourceSpec.role` (`search`/`read`/`data`) is operator-declared. `report_policy.citable`
   excludes search result bodies and `observed_source` links unless
   `cite_search_results` is enabled; a raw read-tool envelope is superseded by the
@@ -402,19 +404,18 @@ authentication, local-model quality or end-to-end deployment readiness.
   step allowance — only an opened page is citable, and charging reads left a
   live run with no page read and `NO_EVIDENCE` — only against the run-wide
   ceiling. A stop reply carries the `BUDGET_STOP` artifact (with the allowance
-  it refused) and `research_observations` skips it: it is never evidence. Source
-  tools account for their own calls — the model callback must not reserve them
-  again. Model tokens keep a report reserve (`store.report_reserve`). Each
+  it refused) and `research_observations` skips it: never evidence. Source tools
+  account for their own calls; the model callback must not reserve them twice. Model tokens keep a report reserve (`store.report_reserve`). Each
   research step gets a share of what research may still spend (left ÷ steps
   running now, less a conversion margin) through the native
   `TokenBudgetMiddleware` (`native.model_budget_config`): warned at half, stopped
-  at the share, which strips tool calls so the step ends with its notes. The
+  at the share, which strips tool calls so the step ends on its notes. The
   step's conversion may draw on the report reserve — its research is already
-  paid for. A research call that would still spend the reserve fails with the
-  non-fatal `RESEARCH_BUDGET_SPENT`, the step degrades, supplementation stops
-  (`store.research_spent`: a step already failed to reserve, or less than a
-  turn is left) and the writer still has capacity. Only a batch that failed for
-  other reasons, or a run with no citable evidence at all, still fails.
+  paid for. A research call that would spend the reserve fails with the
+  non-fatal `RESEARCH_BUDGET_SPENT`: the step degrades, supplementation stops
+  (`store.research_spent`: a step failed to reserve, or less than a turn is
+  left) and the writer still has capacity. Only a batch that failed for other
+  reasons, or a run with no citable evidence, still fails.
 - A research-phase model call reserves its input plus `RESEARCH_TURN_OUTPUT`
   (4096), not the whole `max_output_tokens`: a research turn is a tool call or a
   short note, and reserving the full cap made a 120k budget look spent at half of
@@ -502,23 +503,22 @@ authentication, local-model quality or end-to-end deployment readiness.
 - Unit/pool event keys include cycle. New cycles clear the current report and
   limits, but retain historical report messages and versioned exports.
 - Drain in-flight SQLite work before acknowledging cancellation. A persisted
-  cancel request fences new calls and publication. Shutdown serializes with
-  admission and never launches work after its stop flag is set.
+  cancel request fences new calls and publication; shutdown serializes with
+  admission and never launches work after its stop flag.
 - Idempotent create replay precedes capacity checks, but still rechecks live
   access policy. System message IDs cannot be used as client idempotency keys.
   Invalid plan edits must not stop the valid plan's countdown.
 - Budget coordination updates the effective native per-agent token policy, not
-  only the lead-agent `token_budget`. Preserve stricter configured caps and
-  native opt-outs; unbounded acceptance stays explicitly opt-in.
+  only the lead-agent `token_budget`: keep stricter configured caps and native
+  opt-outs; unbounded acceptance stays opt-in.
 
 ### Interrupted callbacks
 
 Close the research callback handler only after native worker drainage, even when
 the native result was already terminal. Keep uncertain model reservations; never
-turn a missing tool callback into successful source evidence. On workflow entry,
-reconcile open descendants of terminal parents with explicit interruption events
-and an atomic tool-activity update; leave live roots alone, keep unknown
-durations null.
+turn a missing tool callback into source evidence. On workflow entry, reconcile
+open descendants of terminal parents with explicit interruption events and an
+atomic tool-activity update; leave live roots alone, keep unknown durations null.
 
 AIO directory listing must execute its exit-bearing script in an isolated child
 shell, use unique temporary files, and have its own remote hard timeout plus a

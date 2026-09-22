@@ -54,13 +54,16 @@ def test_documents_keep_title_address_and_the_longest_text():
     jina = {"code": 200, "data": {"title": "Write-Ahead Logging", "url": "https://sqlite.org/wal.html", "content": "# WAL\n" + "text " * 50}}
     firecrawl = {"success": True, "data": {"markdown": "body " * 40, "metadata": {"title": "Firecrawl page", "sourceURL": "https://f.example"}}}
     openai_fetch = {"id": "doc-1", "title": "Quarterly report", "text": "Revenue grew " * 10, "url": "https://intranet.example/doc-1", "metadata": {"source": "kb"}}
-    assert extract.document(jina) == {"title": "Write-Ahead Logging", "url": "https://sqlite.org/wal.html", "text": jina["data"]["content"], "readable": True}
+    assert extract.document(jina) == {"title": "Write-Ahead Logging", "url": "https://sqlite.org/wal.html", "text": jina["data"]["content"], "readable": True, "published_at": None}
     # A string answer arrives wrapped by the MCP adapter, and is often JSON itself: the page is two levels down.
     assert extract.document({"result": json.dumps(jina)}) == extract.document(jina)
     # No field held the text: the whole answer stands in, and says so.
     assert extract.document({"status": "ok", "rows": [1, 2]})["readable"] is False
     assert extract.document(firecrawl)["title"] == "Firecrawl page" and extract.document(firecrawl)["url"] == "https://f.example"
     assert extract.document(openai_fetch)["text"].startswith("Revenue grew")
+    # A page states its own date wherever the server keeps it, beside the text or under metadata.
+    dated = {"data": {"markdown": "body " * 40, "metadata": {"publishedDate": "2026-03-04T00:00:00Z"}}}
+    assert extract.document(dated)["published_at"] == "2026-03-04T00:00:00Z"
     assert extract.document("# Heading here\n\nParagraph", "https://g.example")["title"] == "Heading here"
     assert extract.document("<html><title>HTML Title</title><body>x</body></html>")["title"] == "HTML Title"
 
@@ -473,3 +476,33 @@ async def test_parallel_searches_in_one_turn_cannot_overrun_the_step_allowance(s
     await store.mutate("r", lambda run: run["budget"].update({"max_tool_calls": 2}))
     assert (await tight.reserve()).reason == "run"
     assert tight.used == 0
+
+
+@pytest.mark.asyncio
+async def test_a_configured_read_source_carries_the_page_date_into_its_evidence(settings, monkeypatch):
+    """A page read through our own source must be dated like one read through a raw MCP tool.
+
+    Both routes end in the same reference list, so a date that survives one and
+    not the other would make the reader's view depend on how the source happens
+    to be wired. The provider states it, the `deerflow.web_page.v1` artifact
+    carries it, and the evidence keeps it.
+    """
+    from deepresearch.observations import NativeExecution, research_observations
+
+    async def fake(provider, request, servers=None, request_secrets=None):
+        page = {"title": "SLA", "url": request.url, "text": "可用性 99.9%。" * 40, "published_at": "Apr 21, 2026"}
+        return providers.Outcome(document=page)
+
+    monkeypatch.setattr(channels, "call", fake)
+    source = SourceSpec(name="reader", tool="web_fetch", role="read", origin="external", providers=[{"id": "reader", "type": "direct"}])
+    tool = channels.build_tool(source, settings, "run-dated")
+    read = await tool.ainvoke({"type": "tool_call", "name": "web_fetch", "args": {"url": "https://docs.example/sla"}, "id": "r1"})
+    assert read.artifact["published_at"] == "2026-04-21T00:00:00+00:00"
+
+    messages = [
+        {"type": "ai", "tool_calls": [{"id": "r1", "name": "web_fetch", "args": {"url": "https://docs.example/sla"}}]},
+        {"type": "tool", "name": "web_fetch", "tool_call_id": "r1", "status": "success", "content": read.content, "artifact": read.artifact},
+    ]
+    evidence, _ = research_observations(NativeExecution("notes", "exec", messages), [source])
+    page = next(item for item in evidence if item.provenance == "fetched_document")
+    assert str(page.published_at)[:10] == "2026-04-21"

@@ -46,25 +46,29 @@ def research_gaps(plan: ResearchPlan, units, findings, pool, results=(), citable
         for origin in original.source_strategy.required_origins:
             if origin not in origins:
                 problems.append(("missing-" + origin, f"缺少 {origin} 的有效证据，不可用另一来源回退替代"))
-        # Native opaque ToolMessages have no mandatory publication-date schema.
-        # The researcher evaluates date constraints and reports uncertainty as
-        # open_questions. Only explicitly supplied document metadata can be
-        # checked mechanically; do not manufacture a date from a tool payload.
-        if original.source_strategy.not_before and evidences and all(e.get("provenance", "document") == "document" for e in evidences):
+        # A date is never manufactured from a tool payload: it is only ever what
+        # a source stated about its own page. So a date requirement is enforced
+        # exactly where it is provable — some evidence is dated and all of it
+        # predates the cutoff. Evidence nobody dated stays the researcher's
+        # judgement, reported as an open question: no supplement can make a
+        # provider send dates it does not have.
+        if original.source_strategy.not_before and evidences:
             cutoff = original.source_strategy.not_before
             if cutoff.tzinfo is None:
                 cutoff = cutoff.replace(tzinfo=UTC)
 
-            def recent_enough(e):
-                if not e["published_at"]:
-                    return False
-                stamp = datetime.fromisoformat(e["published_at"])
-                if stamp.tzinfo is None:
-                    stamp = stamp.replace(tzinfo=UTC)
-                return stamp >= cutoff
+            def stated(e):
+                if not e.get("published_at"):
+                    return None
+                try:
+                    stamp = datetime.fromisoformat(str(e["published_at"]))
+                except ValueError:
+                    return None
+                return stamp if stamp.tzinfo else stamp.replace(tzinfo=UTC)
 
-            if not [e for e in evidences if recent_enough(e)]:
-                problems.append(("date", "缺少满足日期要求的来源；发布日期不明不能算作满足时效"))
+            dates = [stamp for stamp in map(stated, evidences) if stamp]
+            if dates and not [stamp for stamp in dates if stamp >= cutoff]:
+                problems.append(("date", f"已知发布日期的来源都早于 {cutoff.date()}，需要更新的资料；日期不明的来源不能算作满足时效"))
         for code, text in dict(problems).items():
             gaps.append(ResearchGap(gap_id=original.id + "-" + code, unit_id=original.id, code=code, description=text).model_dump())
     return gaps

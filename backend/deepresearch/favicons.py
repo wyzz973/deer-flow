@@ -63,15 +63,26 @@ def declared_icons(page, base):
     return found
 
 
-def _screen(url):
+def _screen(url, **allowance):
     from deerflow.community.url_safety import validate_public_http_url
 
-    return validate_public_http_url(url, action="fetch a site icon")
+    return validate_public_http_url(url, action="fetch a site icon", **allowance)
+
+
+def _same_site(url, domain):
+    """A site may declare an icon for itself, and for nobody else."""
+    from urllib.parse import urlsplit
+
+    host = (urlsplit(url).hostname or "").removeprefix("www.").lower()
+    return bool(host) and host == domain and url.startswith(("https://", "http://"))
 
 
 class Favicons:
-    def __init__(self, store, *, enabled=True, transport=None, validate=None, concurrency=6, wait_seconds=2.0):
+    def __init__(self, store, *, enabled=True, transport=None, validate=None, concurrency=6, wait_seconds=2.0, private_network=False):
         self.store, self.enabled = store, enabled
+        # A site on a private address is only reachable where the operator said
+        # so, and only for an icon that site declared for itself.
+        self._private = private_network
         self._transport, self._validate = transport, validate or _screen
         self._limit = asyncio.Semaphore(concurrency)
         self._wait = wait_seconds
@@ -99,6 +110,10 @@ class Favicons:
         except TimeoutError:
             return {"domain": domain, "body": None, "content_type": None, "pending": True}
 
+    def _screened(self, url, private):
+        """Screen one hop. Private addresses stay refused unless allowed here."""
+        return self._validate(url, allow_private_addresses=True) if private else self._validate(url)
+
     def _settled(self, domain, task):
         self._inflight.pop(domain, None)
         if not task.cancelled() and task.exception() is not None:
@@ -118,11 +133,17 @@ class Favicons:
     async def _fetch(self, domain):
         import httpx
 
+        # What the site itself said its icon is, learned from a source that
+        # cited it. Tried first: an internal wiki often has no /favicon.ico.
+        declared = await self.store.icon_hint(domain)
         labels = domain.split(".")
         # docs.example.com often has no icon of its own; its site does.
         hosts = [domain, ".".join(labels[-2:])] if len(labels) > 2 else [domain]
         headers = {"User-Agent": "Mozilla/5.0 (compatible; DeerFlow-DeepResearch site icons)"}
         async with httpx.AsyncClient(transport=self._transport, headers=headers, timeout=httpx.Timeout(5.0), follow_redirects=False) as client:
+            if declared and _same_site(declared, domain):
+                if icon := await self._image(client, declared, private=self._private):
+                    return icon
             for host in hosts:
                 icon = await self._image(client, f"https://{host}/favicon.ico")
                 if icon:
@@ -137,20 +158,20 @@ class Favicons:
                         return icon
         return None
 
-    async def _image(self, client, url):
-        response = await self._get(client, url)
+    async def _image(self, client, url, *, private=False):
+        response = await self._get(client, url, private=private)
         if response is None:
             return None
         body = response[1]
         kind = image_type(body)
         return (kind, body) if kind else None
 
-    async def _get(self, client, url, *, truncate=False):
+    async def _get(self, client, url, *, truncate=False, private=False):
         """GET with screened redirects and a byte bound; returns (final URL, body)."""
         import httpx
 
         for _ in range(MAX_REDIRECTS + 1):
-            if await asyncio.to_thread(self._validate, url):
+            if await asyncio.to_thread(self._screened, url, private):
                 return None
             try:
                 async with client.stream("GET", url) as response:
