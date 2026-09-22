@@ -1005,5 +1005,6 @@ python3 ../scripts/pnpm.py test    # 1363 passed（新增 32 条：llm-calls / s
 | `README.deepresearch.md`（仓库根） | 安装、配置、使用 |
 | [NATIVE_RUNTIME.md](NATIVE_RUNTIME.md) / [REUSE_AUDIT.md](REUSE_AUDIT.md) | 原生复用专题，仍然有效 |
 | [EXTENDING.md](EXTENDING.md) | 新增研究角度与来源 |
+| [MCP_RESPONSE_FORMAT.md](MCP_RESPONSE_FORMAT.md) | 自建 MCP 该返回什么形状：最小必要格式、会静默丢内容的四条规则、配套的数据源声明 |
 | [STABILITY_AUDIT_2026-09-16.md](STABILITY_AUDIT_2026-09-16.md) | 2026-09-16 稳定性修复与恢复验收 |
 | [DESIGN_BASELINE.md](DESIGN_BASELINE.md) / [RUNTIME.md](RUNTIME.md) / [VERIFICATION.md](VERIFICATION.md) / [COMPUTER_USE_2026-09-15.md](COMPUTER_USE_2026-09-15.md) / [COMPUTER_USE_2026-09-16.md](COMPUTER_USE_2026-09-16.md) | 历史记录；早期设计与“未完成”结论不能覆盖后来的实现与验收 |
