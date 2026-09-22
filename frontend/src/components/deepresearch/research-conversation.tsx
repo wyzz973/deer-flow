@@ -32,6 +32,7 @@ import { ChatProviders } from "@/components/workspace/chats/chat-providers";
 import { ChatSurface } from "@/components/workspace/chats/chat-surface";
 import { MessageList } from "@/components/workspace/messages";
 import { ThreadContext } from "@/components/workspace/messages/context";
+import { renderDiagrams } from "@/core/deepresearch/diagrams";
 import { useResearchConversation } from "@/core/deepresearch/hooks";
 import type { CallStage } from "@/core/deepresearch/llm-calls";
 import {
@@ -337,11 +338,18 @@ function ResearchView({
     [openReader],
   );
   const download = useCallback(
-    (format: "md" | "html" | "docx", version?: number) => {
-      if (runId)
-        void api
-          .download(runId, format, version)
-          .catch((error: unknown) => toast.error(String(error)));
+    (format: "md" | "html" | "docx", report?: Report) => {
+      if (!runId) return;
+      const run = async () => {
+        // Word is the only export that holds pictures, and Mermaid needs a
+        // browser to draw them, so this page draws them for the server.
+        const diagrams =
+          format === "docx" && report?.document
+            ? await renderDiagrams(report.document)
+            : undefined;
+        await api.download(runId, format, report?.version, diagrams);
+      };
+      void run().catch((error: unknown) => toast.error(String(error)));
     },
     [api, runId],
   );
@@ -401,7 +409,7 @@ function ResearchView({
             selectedId={selectedCitation}
             onExpand={() => openReader(record.report!)}
             onCitation={(id) => citation(record.report!, id)}
-            onDownload={(format) => download(format, record.report!.version)}
+            onDownload={(format) => download(format, record.report)}
           />
         );
       return undefined;
@@ -635,7 +643,7 @@ function ResearchView({
                   <span className="flex-1" />
                   <ResearchReportActions
                     report={reading}
-                    onDownload={(format) => download(format, reading.version)}
+                    onDownload={(format) => download(format, reading)}
                   />
                   <button
                     type="button"

@@ -174,7 +174,7 @@ export function ResearchReportActions({
   onExpand,
 }: {
   report: Report;
-  onDownload: (format: "md" | "html" | "docx") => void;
+  onDownload: (format: "md" | "html" | "docx", report: Report) => void;
   onExpand?: () => void;
 }) {
   return (
@@ -207,7 +207,7 @@ export function ResearchReportActions({
             <DropdownMenuItem
               key={format}
               className="h-9 rounded-lg px-3 text-sm"
-              onClick={() => onDownload(format)}
+              onClick={() => onDownload(format, report)}
             >
               导出到{" "}
               {format === "docx"
@@ -244,7 +244,7 @@ export function ResearchReportCard({
   selectedId?: string;
   onExpand: () => void;
   onCitation: (id: string) => void;
-  onDownload: (format: "md" | "html" | "docx") => void;
+  onDownload: (format: "md" | "html" | "docx", report: Report) => void;
 }) {
   const title = reportTitle(report);
   return (

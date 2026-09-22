@@ -7,6 +7,8 @@ import importlib
 import inspect
 import ipaddress
 import json
+from base64 import b64decode
+from binascii import Error as BinasciiError
 from typing import Literal
 from uuid import uuid4
 
@@ -15,6 +17,21 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
 
 from .contracts import TERMINAL, ConversationMessage, CreateResearch, PlanDecision, PlanEdit, ResearchError, RetryResearch, utcnow
+
+DOCX_MEDIA = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+# Diagrams arrive base64-encoded in one request body; a report has a handful.
+MAX_DIAGRAM_PAYLOAD = 24 * 1024 * 1024
+
+
+class ReportDiagrams(BaseModel):
+    """Pictures a browser rendered for this report's Mermaid blocks.
+
+    Each key is the SHA-256 of the block's own source, so a picture can only be
+    placed under the diagram it was drawn from.
+    """
+
+    version: int | None = Field(default=None, ge=1)
+    diagrams: dict[str, str] = Field(default_factory=dict, max_length=60)
 
 
 class SettingsUpdate(BaseModel):
@@ -518,8 +535,7 @@ def build_router(service, *, local_demo=False, demo_origins=None):
         metrics = await service.store.model_call(run["run_id"], call_id) or {}
         return {**metrics, **detail, "openai_request": openai_request(detail)}
 
-    @router.get("/{run_id}/report")
-    async def report(format: Literal["json", "md", "html", "docx"] = "json", version: int | None = Query(default=None, ge=1), run=Depends(owned)):
+    def published_report(run, version):
         # Historical cards export their own immutable report, even while a
         # follow-up is running. Ownership and source ACLs still apply above.
         if version is not None:
@@ -528,25 +544,55 @@ def build_router(service, *, local_demo=False, demo_origins=None):
                 value = run["report"]
             if value is None:
                 raise HTTPException(404, "Report version not found")
+            return value
+        if run["status"] != "COMPLETED" or not run.get("report"):
+            raise HTTPException(409, "Report is not ready")
+        return run["report"]
+
+    def attachment(data, run_id, suffix, media):
+        return Response(data, media_type=media, headers={"Content-Disposition": f'attachment; filename="research-{run_id}.{suffix}"', "Cache-Control": "no-store", "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'"})
+
+    async def word_export(value, diagrams=None):
+        if value.get("format") == "markdown-v2":
+            from .report import docx_document as export
         else:
-            if run["status"] != "COMPLETED" or not run.get("report"):
-                raise HTTPException(409, "Report is not ready")
-            value = run["report"]
+            from .render import docx_report as export  # Historical AST reports; they hold no diagrams.
+
+            diagrams = None
+        return await asyncio.to_thread(export, value, diagrams) if diagrams is not None else await asyncio.to_thread(export, value)
+
+    @router.get("/{run_id}/report")
+    async def report(format: Literal["json", "md", "html", "docx"] = "json", version: int | None = Query(default=None, ge=1), run=Depends(owned)):
+        value = published_report(run, version)
         if format == "json":
             return value
         if format == "docx":
-            if value.get("format") == "markdown-v2":
-                from .report import docx_document as export
-            else:
-                from .render import docx_report as export  # Historical AST reports.
+            return attachment(await word_export(value), run["run_id"], "docx", DOCX_MEDIA)
+        data = value["markdown" if format == "md" else "html"]
+        return attachment(data, run["run_id"], format, "text/markdown" if format == "md" else "text/html")
 
-            data = await asyncio.to_thread(export, value)
-            media = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        else:
-            data = value["markdown" if format == "md" else "html"]
-            media = "text/markdown" if format == "md" else "text/html"
-        return Response(
-            data, media_type=media, headers={"Content-Disposition": f'attachment; filename="research-{run["run_id"]}.{format}"', "Cache-Control": "no-store", "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'"}
-        )
+    @router.post("/{run_id}/report/docx")
+    async def report_with_diagrams(body: ReportDiagrams, run=Depends(owned)):
+        """Word export carrying the diagrams the reader's browser rendered.
+
+        Mermaid needs a browser to draw, and this product must work on an
+        intranet with no rendering service, so the pictures come from the page
+        that already drew them. They are opaque bytes from the client: each one
+        must be a real PNG within its bound before it becomes a picture in a
+        document people publish, and the report itself still comes from the
+        store, never from the request.
+        """
+        value = published_report(run, body.version)
+        total, diagrams = 0, {}
+        for key, encoded in body.diagrams.items():
+            try:
+                data = b64decode(encoded, validate=True)
+            except (BinasciiError, ValueError):
+                continue
+            total += len(data)
+            if total > MAX_DIAGRAM_PAYLOAD:
+                raise HTTPException(413, "Diagram payload is too large")
+            diagrams[key] = data
+        return attachment(await word_export(value, diagrams), run["run_id"], "docx", DOCX_MEDIA)
 
     return router

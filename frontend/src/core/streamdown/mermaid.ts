@@ -40,6 +40,46 @@ function isClosingFence(line: string, fence: string): boolean {
   );
 }
 
+/**
+ * The Mermaid blocks of a document, in order, exactly as it holds them.
+ *
+ * The Word export files each rendered picture under its own source, so this
+ * has to return what the document says, not what we draw: the rewriting in
+ * `normalizeMermaidMarkdown` is a drawing detail and must not change identity.
+ */
+export function mermaidSources(markdown: string): string[] {
+  const lines = markdown.replace(WINDOWS_LINE_ENDING_RE, "\n").split("\n");
+  const sources: string[] = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const openingFence = MERMAID_OPENING_FENCE_RE.exec(lines[index]!)?.[1];
+
+    if (openingFence === undefined) {
+      continue;
+    }
+
+    const codeLines: string[] = [];
+    let cursor = index + 1;
+
+    for (; cursor < lines.length; cursor += 1) {
+      if (isClosingFence(lines[cursor]!, openingFence)) {
+        break;
+      }
+
+      codeLines.push(lines[cursor]!);
+    }
+
+    // An unterminated block is not a diagram the reader saw either.
+    if (cursor < lines.length) {
+      sources.push(codeLines.join("\n"));
+    }
+
+    index = cursor;
+  }
+
+  return sources;
+}
+
 export function normalizeMermaidMarkdown(markdown: string): string {
   const lines = markdown.replace(WINDOWS_LINE_ENDING_RE, "\n").split("\n");
   const normalizedLines: string[] = [];

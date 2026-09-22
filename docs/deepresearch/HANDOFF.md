@@ -16,7 +16,7 @@
 | 更早的基线 | `5fa0299c` `feat(deepresearch): unify native research chat and harden workflow recovery` |
 | 功能状态 | 交互、工作流、报告与前端改造完成；五次真实 DeepSeek 研究端到端完成；配置与 DeerFlow 解耦（研究自己的模型、数据源与供应商故障切换、MCP、角色、提示词、上下文压缩）、请求改写节点、设置页、LLM 调用审计均已完成并真实验收 |
 | 离线开发 | 不联网的本地 Agent 从 [OFFLINE_AGENT_GUIDE.md](OFFLINE_AGENT_GUIDE.md) 开始；配置见 [MODEL_CONFIGURATION.md](MODEL_CONFIGURATION.md)、[DEERFLOW_CONFIGURATION.md](DEERFLOW_CONFIGURATION.md)、[RESEARCH_CONFIGURATION.md](RESEARCH_CONFIGURATION.md)；模板在 `examples/deepresearch/offline/` |
-| 最近一轮 | 2026-09-22：数据源可为自己域名声明站点图标、由网关代取（第 3.12 节）；证据带上来源声明的发布日期，参考文献行显示日期，`not_before` 可机械校验（第 3.11 节）。2026-09-21：研究完成后计划卡折叠可回看（第 3.10 节）；日志记全（工具出入参、MCP 协议层、HTTP 供应商层）、整包导出与保留期清理（第 3.9 节）；直接暴露的 MCP 工具读到的页面可被引用（修复只用 MCP 检索时的 `NO_EVIDENCE`，第 3.7 节）；研究步骤接续调度与编辑计划时保留依赖（第 3.8 节）；运行审计的离线 HTML 页面与两项新分析（第 3.6 节技能部分）。此前 2026-09-19：全模块代码审查与修复、按节点调参、仅 MCP / 无原文研究、模型网关兼容、时间预算收尾，见第 3.6 节与第 4 节末尾 |
+| 最近一轮 | 2026-09-22：Word 导出重做——引用变上标超链接、参考条目带站点与日期、目录页码表头样式、Mermaid 由浏览器渲染成图（第 3.13 节）；数据源可为自己域名声明站点图标、由网关代取（第 3.12 节）；证据带上来源声明的发布日期，参考文献行显示日期，`not_before` 可机械校验（第 3.11 节）。2026-09-21：研究完成后计划卡折叠可回看（第 3.10 节）；日志记全（工具出入参、MCP 协议层、HTTP 供应商层）、整包导出与保留期清理（第 3.9 节）；直接暴露的 MCP 工具读到的页面可被引用（修复只用 MCP 检索时的 `NO_EVIDENCE`，第 3.7 节）；研究步骤接续调度与编辑计划时保留依赖（第 3.8 节）；运行审计的离线 HTML 页面与两项新分析（第 3.6 节技能部分）。此前 2026-09-19：全模块代码审查与修复、按节点调参、仅 MCP / 无原文研究、模型网关兼容、时间预算收尾，见第 3.6 节与第 4 节末尾 |
 | 本次回归 | 见第 6 节 |
 | 未验证 | 干净克隆部署、生产构建、目标环境的 MCP 与 SSO、真实手机视口、报告事实逐条核验；远端 CI 以 GitHub Actions 结果为准 |
 
@@ -576,6 +576,71 @@ units、id、顺序与 depends_on”。用文字提的修改（`revision`）仍�
 - 真实网络验证取图逻辑（qdrant.tech）：声明了图标 → 返回声明的那张 PNG（4977 字节）；没声明 → 退回猜测
   `/favicon.ico`（15086 字节）；声明的是别人家域名 → 忽略，退回猜测。
 
+## 3.13 本轮完成的工作（2026-09-22）：Word 导出按"能发给人看的报告"重做
+
+**起因（用户）**：「导出Word，再优化一下这个Word的具体的格式。引用的链接……而且Mermaid图表也要在Word中显示出来。现在是代码」
+
+**先量了一遍**（真实报告，78 条引用、4 张图）：Markdown 和 HTML 导出其实都不差，Word 是唯一的差生——
+整个 docx 里 `w:hyperlink` 出现 **0 次**；参考条目是 `[1] 标题⏎裸URL`，丢了发布日期（新报告 100% 有）、
+丢了「检索摘录，未读取原文」、丢了站点名；表头不加粗无底纹；没有页码和目录；4 张 Mermaid 全是等宽代码。
+
+**改成**（`report.docx_document`）：
+
+- 正文引用是上标超链接，跳到文末条目的书签；条目标题是真超链接，后面是站点名 · 发布日期，
+  只有检索摘录的标注出来。这几项现在与 Markdown / HTML 一致。
+- 文首可点击目录、表头加粗带底纹并跨页重复、页脚页码、标题样式补 `eastAsia` 中文字体回退、
+  演示模式提示移到文首、表格单元格不再被正则删掉加粗与行内代码。
+- Mermaid 渲染成图片带「图 N」题注。**浏览器出图**：`diagrams.ts` 用页面已有的 mermaid 渲染，
+  转 PNG 随 `POST /{id}/report/docx` 回传（内网无渲染服务、无外网也能用，后端零新增依赖）。
+  图片按**自身源码**归档，只会落在它自己的位置。没有图的块保留题注、源码进附录，
+  `GET ...&format=docx` 走的就是这条降级路径，供脚本与 CLI 用。
+
+**两个只有真跑才会发现的坑**：
+
+1. **canvas 被污染**。Mermaid 默认用 `<foreignObject>` 排标签，这样的 SVG 画进 canvas 后
+   `toDataURL` 直接抛 "Tainted canvases may not be exported"，**3 张图一张都出不来**。
+   改成导出时 `htmlLabels: false` 渲染，完事恢复页面配置。
+2. **图片尺寸只限了宽**。真实的纵向流程图按原比例是 **19.46 英寸高**，Word 一页文字区只有 9 英寸，
+   会在分页处被裁掉。补上按页高等比缩放（图 2 从 5.85×19.46 变成 2.41×8.00）。
+
+还有一个值得记的：key 一开始设计成源码的 SHA-256，写完才想起 `crypto.subtle` **在纯 HTTP 的内网源上不可用**，
+那样会在你们的部署里静默失效。改成用**源码本身**（折叠空白）当 key——同样安全，浏览器零依赖。
+
+**第二轮（对标 ChatGPT 实测后）**：用户反馈"还是没有图"、要求对标 ChatGPT 的 Word 排版。
+
+先用**本机的 Microsoft Word 把 docx 转成 PDF**（AppleScript，`save as ... format PDF`）看真实版面——
+这比任何猜测都快。结论：图**在**（第 13 页），问题是版面：8 英寸高的图把自己挤到下一页，
+前一页留了大半页空白；表格跨页时切开一行，续页表头下只剩"迟低"两个字。
+
+然后用 computer use 登录 ChatGPT，导出一份真实深度研究报告的 Word（报告卡片右上角 →「导出到 Word」；
+ChatGPT Work 文档只能导出 .md）。拆开对比后发现**它比我们更简单**：不设页面尺寸（用 Word 默认）、
+表格 autofit 且没有 cantSplit（照样断行）、没有底纹、没有目录和页码、引用是行内超链接不是上标。
+它唯一明显更好的一点是**三线表**——只有顶线/表头线/底线，没有竖线没有底纹，所以断表时接缝不显眼。
+它的表格也有问题：一列被 autofit 挤成竖排单字。
+
+据此改了四处：
+1. **表格改三线表**（`rules` / `rule_under`），去掉全框线与表头灰底。
+2. 页边距改 1 英寸，正文栏宽 6.0 → **6.5 英寸**。
+3. 每行 `cantSplit` + 固定列宽均分（这两点比 ChatGPT 好，它两样都没有）。
+4. 按页高缩放后宽度不足正文栏 55% 的图**单独起一页**，图与题注 `keep_with_next`。
+
+实测同一份报告：**27 页 → 21 页**，表格续页不再出现孤行，高图独占一页且前页是满的。
+
+**还剩一个物理限制**：一张 1:3.3 的纵向流程图，在竖版页上最多只能 2.7 英寸宽，标签必然小。
+这不是导出能解决的，根因在图的比例，所以 `prompts.py` 加了约束：优先 `flowchart LR`、约八个节点、
+长链拆成两张图。
+
+**验证**：
+- `tests/deepresearch` 334 项通过（新增 25 项：上标链接与书签、条目的链接/站点/日期/摘录标注、
+  渲染与未渲染两条路径、只接受真 PNG、表头样式、单元格强调、目录、页码、中文字体、演示提示位置、
+  老报告无 basis/日期仍可导出、图片不超页宽页高且保持比例、端点鉴权）；`pnpm check` 通过。
+- 真实链路：浏览器（同一个 mermaid 11.12.2）渲染真实报告的 3 张图 → 2416×534 / 562×1868 / 948×1840 的 PNG →
+  `POST /report/docx` 返回 200、342 KB → 成品内嵌 **3 张图片**、281 个超链接、68 个外部链接、201 个上标、
+  无附录（没有降级）、正文无源码。
+- 未走完的一段：React 组件到 `renderDiagrams` 的接线（5 行）只过了 typecheck 与 lint，没在真实页面上点过——
+  本机 3100 端口上是用户自己的 dev server，不能占用，也不能在它运行时跑 `pnpm build` 去搅 `.next`。
+
+
 ## 4. 真实验收
 
 使用 DeepSeek `deepseek-v4-flash`、原生 `web_search` / `web_fetch`（Jina 无 key 模式），非演示 Runner。
@@ -893,7 +958,7 @@ DEEPRESEARCH_E2E_FRONTEND_PORT=3200 DEEPRESEARCH_E2E_REUSE_BACKEND=1 DEEPRESEARC
 从 `backend/`（改动只涉及 `backend/deepresearch`、`tests/deepresearch`、MCP 桩与文档；前端没有改动，未重跑前端）：
 
 ```sh
-uv run --no-sync python -m pytest ../tests/deepresearch -q   # 309 passed（新增：日期进证据与参考文献、九种真实写法的解析、读页日期、证据目录仍是 JSON；另改 test_source_providers.py 的 document() 精确断言与 test_core.py 的 date 缺口）
+uv run --no-sync python -m pytest ../tests/deepresearch -q   # 334 passed（最近新增 test_word_export.py 25 项：Word 的引用链接、参考条目、Mermaid 出图与降级、图片字节校验与尺寸；此前：日期进证据与参考文献、九种真实写法的解析、读页日期、证据目录仍是 JSON）
 uv run --no-sync python -m pytest tests/test_agent_guidance_check.py -q   # 11 passed、1 failed：仍是 subagents/AGENTS.md 41,088 > 40,960 的宿主已有问题
 uv run --no-sync ruff check deepresearch ../tests/deepresearch && uv run --no-sync ruff format --check deepresearch ../tests/deepresearch
 python ../scripts/check_agent_guidance.py   # deepresearch 指导链回到软上限内（新增日期规则后压缩了若干条目）

@@ -26,6 +26,7 @@ Base: `/api/deepresearch`，由 DeerFlow Gateway 扩展路由提供。生产请�
 | GET | `/{id}/metrics/export` | JSONL：首行汇总，其后逐条模型调用、工具调用、子 Agent 与 span 记录 |
 | GET | `/favicon?domain=example.com` | 网站图标：需登录；200 返回图片，404 表示没有图标（缓存 1 天）或仍在获取（`no-store`），422 表示域名无效 |
 | GET | `/{id}/report?format=json\|md\|html\|docx&version=1` | 指定版本报告/下载；省略 version 为当前完成态报告 |
+| POST | `/{id}/report/docx` | Word 导出，随请求携带浏览器渲染好的 Mermaid 图（`{version?, diagrams}`） |
 | GET | `/{id}/trace?after=0&limit=100` | 本地 trace 分页；limit 1–200 |
 | GET | `/{id}/trace/export` | owner/ACL 保护的 JSONL 导出 |
 | GET | `/{id}/llm-calls` | 本次研究的全部模型调用（含指标；`audited: false` 表示早于审计或关闭了内容记录） |
@@ -219,7 +220,27 @@ New report versions have `format: "markdown-v2"` and contain:
 | `stats` | `elapsed_seconds`, `searches`, `pages_read`, `citations` |
 
 `GET /report?format=docx` exports markdown-v2 reports from `document` and older
-StructuredReport versions from their AST. Several evidence records from one page (URL ignoring scheme, `www.` and a trailing slash) share a visible number, so `citation_map` values need not be unique;
+StructuredReport versions from their AST. The Word document carries a linked
+table of contents, superscript citations that jump to the reference list,
+references as real hyperlinks with their site and stated date, marked table
+headers that repeat across pages, and page numbers.
+
+Mermaid needs a browser to draw, and a deployment may have no rendering service
+and no outbound network, so `POST /{id}/report/docx` lets the page that already
+shows the diagrams send its pictures along:
+
+```json
+{"version": 3, "diagrams": {"<the block's own source text>": "<base64 PNG>"}}
+```
+
+Each key is the Mermaid source with its whitespace collapsed, which is how the
+server matches a picture to a block of the document it holds; a picture can
+only ever land under the diagram it was drawn from. The bytes are opaque client
+input: only a real PNG under 4 MB becomes a picture (at most 60 of them, 24 MB
+per request), and it is bounded to the text column and the page height. A block
+with no usable picture keeps its caption and moves its source to an appendix,
+which is also what `GET ...&format=docx` produces — that route stays available
+for exports with no browser, such as scripts and the CLI. Several evidence records from one page (URL ignoring scheme, `www.` and a trailing slash) share a visible number, so `citation_map` values need not be unique;
 each excerpt keeps its `evidence_id` and `document_hash`. Titles fall back to the first real title in the group, then to the URL.
 An externalized native fetch (the host saved a long output under `/mnt/user-data/outputs/.tool-results/`) that the researcher continues with `read_file` is registered as the same page (URL, title, document hash); `browser_get_text` counts as a page read only when the preceding successful `browser_navigate` of that turn identifies the page. Undeclared runtime tool output is never citable on its own. Excerpts in `citations` omit the externalization notice and fetch headers. `display_markdown` and exports escape `$` so prices are not rendered as math.
 Read provenance means a native fetch returned an excerpt, not that every page

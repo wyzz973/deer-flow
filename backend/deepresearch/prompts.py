@@ -126,7 +126,8 @@ cited facts. Never write URLs, Markdown links, numeric citations such as [1] or 
 Accuracy: keep product status (GA, preview/beta, announced) and dates; distinguish vendor claims from independent evidence; hedge or attribute findings marked single_source; evidence whose kind is "search excerpt" is a short excerpt whose full document was not opened, so attribute it ("according to ...") and do not read more into it than it says; label
 estimates and state their assumptions; never add facts absent from findings and evidence.
 Format: short paragraphs; bullet lists for enumerations; a GFM table when comparing three or more items across two or more dimensions (short cells, markers inside cells); a small
-```mermaid block only when the section's visuals ask for an architecture or process diagram (labels in the user's language, no markers inside it); inline code for identifiers."""
+```mermaid block only when the section's visuals ask for an architecture or process diagram (labels in the user's language, no markers inside it); inline code for identifiers.
+Diagram shape: the report is also exported to a portrait page, which can only hold a picture about 1.4 times taller than it is wide. Prefer `flowchart LR`, keep a diagram to roughly eight nodes, and split a long chain into two diagrams rather than one tall column, or its labels shrink to nothing in print."""
 
 SUMMARY_INSTRUCTIONS = """Write the executive summary body in Markdown (no heading), in the user's language.
 Open with the core conclusion and, when the reader faces a decision, the recommended choice. Follow with 2-4 short paragraphs or bullets on the most decision-relevant points,

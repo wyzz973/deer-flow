@@ -155,6 +155,17 @@ well as the button so keyboard submit cannot bypass the unavailable state.
 Citation recognition must accept the native Markdown sanitizer's anchor prefix
 and only bind IDs in the report's citation map. Do not weaken Markdown sanitization.
 Historical report cards export their own version.
+Word export carries the diagrams this browser drew: `core/deepresearch/diagrams.ts`
+renders the document's Mermaid blocks, rasterises each to PNG and POSTs them to
+`/{id}/report/docx`, keyed by the block's own source (whitespace collapsed) so a
+picture can only land under the diagram it came from. Render them with
+`htmlLabels: false` and restore the reading config afterwards: Mermaid's default
+`<foreignObject>` labels taint the canvas, and `toDataURL` then refuses every
+diagram. Never hash the key with Web Crypto — it is unavailable on the
+plain-HTTP intranet origins this has to run on. A diagram that will not draw is
+skipped with a `console.warn`; the server keeps its caption and puts the source
+in an appendix, which is also what the `GET ...&format=docx` route produces for
+callers with no browser. Markdown and HTML exports stay plain reads.
 On mobile, returning from a source to its citation closes the native Sheet before
 showing the report location; desktop retains the side-by-side source panel.
 

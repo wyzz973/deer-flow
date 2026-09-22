@@ -1,6 +1,9 @@
 import { expect, test } from "@rstest/core";
 
-import { normalizeMermaidMarkdown } from "@/core/streamdown/mermaid";
+import {
+  mermaidSources,
+  normalizeMermaidMarkdown,
+} from "@/core/streamdown/mermaid";
 import { preprocessStreamdownMarkdown } from "@/core/streamdown/preprocess";
 
 test("normalizes labelled dotted arrows inside mermaid fences", () => {
@@ -127,4 +130,35 @@ test("preprocesses markdown only when mermaid normalization can apply", () => {
   expect(preprocessStreamdownMarkdown(labelledMermaidMarkdown)).toBe(
     ["```mermaid", 'A -. "sealed memory" .-> F', "```"].join("\n"),
   );
+});
+
+test("reads the mermaid blocks a document holds, in order and verbatim", () => {
+  const markdown = [
+    "# 报告",
+    "",
+    "```mermaid",
+    "flowchart TD",
+    '    A -- "x" -.-> B',
+    "```",
+    "",
+    "```python",
+    "print(1)",
+    "```",
+    "",
+    "~~~mermaid",
+    "sequenceDiagram",
+    "    A->>B: hi",
+    "~~~",
+    "",
+    "```mermaid",
+    "unterminated",
+  ].join("\n");
+
+  // The rendering rewrite (-- "x" -.-> becomes -. "x" .->) must not reach the
+  // key the Word export files a picture under, and an unclosed block is not a
+  // diagram the reader saw either.
+  expect(mermaidSources(markdown)).toEqual([
+    'flowchart TD\n    A -- "x" -.-> B',
+    "sequenceDiagram\n    A->>B: hi",
+  ]);
 });

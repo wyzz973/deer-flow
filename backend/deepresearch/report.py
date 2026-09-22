@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import html
 import re
+import struct
 from io import BytesIO
 from urllib.parse import quote, urlsplit
 
@@ -64,6 +65,10 @@ LABELS = {
         "limitations": "局限",
         "references": "参考资料",
         "demo": "演示模式：以下证据和结论为合成测试数据，不可用于业务决策。",
+        "contents": "目录",
+        "figure": "图",
+        "appendix": "附录：未渲染的图表源码",
+        "unrendered": "本次导出未包含图形，源码见附录",
     },
     "en": {
         "summary": "Executive summary",
@@ -72,6 +77,10 @@ LABELS = {
         "limitations": "Limitations",
         "references": "References",
         "demo": "Demo mode: synthetic evidence and conclusions; not for business decisions.",
+        "contents": "Contents",
+        "figure": "Figure",
+        "appendix": "Appendix: diagram sources that were not rendered",
+        "unrendered": "no picture in this export; the source is in the appendix",
     },
 }
 
@@ -656,22 +665,165 @@ def html_document(document, mapping, pool, lang="zh", demo=False, roles=None):
     )
 
 
-def docx_document(value):
-    """Word export of the same verified Markdown document."""
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+# A diagram becomes a picture in a document people publish, so only real PNG
+# bytes within a bound are embedded, and a report holds a bounded number.
+MAX_DIAGRAM_BYTES = 4 * 1024 * 1024
+MAX_DIAGRAMS = 60
+TEXT_WIDTH_INCHES = 6.5
+# Letter height less the margins, less room for the caption under the picture.
+TEXT_HEIGHT_INCHES = 8.4
+# Below this share of the column a fitted diagram is a ribbon of unreadable
+# labels, and dropping it into the text strands most of the page before it.
+NARROW_DIAGRAM = 0.55
+CODE_FILL = "F5F5F5"
+CITATION_GROUP = re.compile(r"⟦([\d,]+)⟧")
+
+
+def diagram_key(source: str) -> str:
+    """The name a rendered diagram is filed under: its own source text.
+
+    The browser renders the Mermaid blocks of the document it is showing and
+    sends the pictures back for export. Keying by the source rather than by
+    position means a picture can only land under the diagram it was drawn
+    from, and needs nothing from the browser: Web Crypto, which a hash would
+    need, is unavailable on the plain-HTTP intranet origins this has to run on.
+    Whitespace is collapsed because the two sides reach the same source through
+    different parsers, and a diagram that differs only in spacing draws the same.
+    """
+    return " ".join(source.split())
+
+
+def _png_pixels(data):
+    """``(width, height)`` for real PNG bytes within the size bound, else None."""
+    if not isinstance(data, bytes) or len(data) <= 24 or len(data) > MAX_DIAGRAM_BYTES:
+        return None
+    if not data.startswith(PNG_MAGIC) or data[12:16] != b"IHDR":
+        return None
+    width, height = struct.unpack(">II", data[16:24])
+    return (width, height) if 0 < width <= 20000 and 0 < height <= 20000 else None
+
+
+def docx_document(value, diagrams=None):
+    """Word export of the same verified Markdown document.
+
+    ``diagrams`` maps :func:`diagram_key` to the PNG a browser rendered for that
+    Mermaid block. A diagram with no usable picture keeps its caption and moves
+    its source to an appendix rather than printing code in the middle of the
+    prose. Citations become superscript links to the reference list, and every
+    reference carries its site, the date the source states and whether the
+    original was opened, exactly as the Markdown and HTML exports do.
+    """
     from docx import Document
+    from docx.enum.table import WD_TABLE_ALIGNMENT
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.opc.constants import RELATIONSHIP_TYPE as RT
+    from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
-    from docx.shared import Pt
+    from docx.shared import Inches, Pt, RGBColor
 
     lang = value.get("language") or language(value.get("document", ""))
+    labels = LABELS[lang]
     mapping = value["citation_map"]
-    body = _map_lines(value["document"], lambda line: _replace_markers(line, lambda ids: "".join(f"[{number}]" for number in _numbers(ids, mapping))))
+    pictures = {key: data for key, data in (diagrams or {}).items() if _png_pixels(data)}
+    body = _map_lines(value["document"], lambda line: _replace_markers(line, lambda ids: "⟦" + ",".join(str(number) for number in _numbers(ids, mapping)) + "⟧"))
     tokens = _markdown_parser().parse(body)
+
     doc = Document()
+    for section in doc.sections:
+        section.left_margin = section.right_margin = Inches(1.0)
+        section.top_margin = section.bottom_margin = Inches(1.0)
     normal = doc.styles["Normal"]
     normal.font.name = "Calibri"
     normal.font.size = Pt(11)
     normal.paragraph_format.space_after = Pt(6)
-    normal.element.get_or_add_rPr().rFonts.set(qn("w:eastAsia"), "Microsoft YaHei")
+    normal.paragraph_format.line_spacing = 1.2
+    # Latin and Chinese are chosen separately; without the East Asian face a
+    # Chinese heading falls back to whatever Word picks for Calibri.
+    for name in ("Normal", "Title", "Heading 1", "Heading 2", "Heading 3", "Heading 4"):
+        try:
+            style = doc.styles[name]
+        except KeyError:
+            continue
+        style.element.get_or_add_rPr().get_or_add_rFonts().set(qn("w:eastAsia"), "Microsoft YaHei")
+
+    bookmarks = iter(range(1, 1_000_000))
+
+    def bookmark(paragraph, name):
+        ident = str(next(bookmarks))
+        start = OxmlElement("w:bookmarkStart")
+        start.set(qn("w:id"), ident)
+        start.set(qn("w:name"), name)
+        end = OxmlElement("w:bookmarkEnd")
+        end.set(qn("w:id"), ident)
+        paragraph._p.insert(0, start)
+        paragraph._p.append(end)
+
+    def link(paragraph, text, *, url=None, anchor=None, superscript=False):
+        run = paragraph.add_run(text)
+        run.font.color.rgb = RGBColor(0x0B, 0x57, 0xD0)
+        run.font.underline = not superscript
+        if superscript:
+            run.font.superscript = True
+        wrapper = OxmlElement("w:hyperlink")
+        if url:
+            wrapper.set(qn("r:id"), paragraph.part.relate_to(url, RT.HYPERLINK, is_external=True))
+        if anchor:
+            wrapper.set(qn("w:anchor"), anchor)
+        run._r.addprevious(wrapper)
+        wrapper.append(run._r)
+        return run
+
+    def rules(grid):
+        """Three rules and no boxes: the shape a printed report uses.
+
+        A full grid with a shaded header is loud on paper, and where Word has
+        to break the table the boxes make the seam the loudest thing on the page.
+        """
+        borders = OxmlElement("w:tblBorders")
+        for edge, width in (("top", 8), ("bottom", 8), ("insideH", 0), ("insideV", 0), ("left", 0), ("right", 0)):
+            line = OxmlElement(f"w:{edge}")
+            line.set(qn("w:val"), "single" if width else "none")
+            line.set(qn("w:sz"), str(width))
+            line.set(qn("w:color"), "000000")
+            borders.append(line)
+        grid._tbl.tblPr.append(borders)
+
+    def rule_under(row):
+        """The line that separates the header from the body."""
+        for cell in row.cells:
+            borders = OxmlElement("w:tcBorders")
+            line = OxmlElement("w:bottom")
+            line.set(qn("w:val"), "single")
+            line.set(qn("w:sz"), "6")
+            line.set(qn("w:color"), "000000")
+            borders.append(line)
+            cell._tc.get_or_add_tcPr().append(borders)
+
+    def shade(element, fill):
+        shading = OxmlElement("w:shd")
+        shading.set(qn("w:val"), "clear")
+        shading.set(qn("w:color"), "auto")
+        shading.set(qn("w:fill"), fill)
+        element.append(shading)
+
+    def citations_in(paragraph, text, bold, italic, mono):
+        """Write text, turning each citation group into superscript links."""
+        position = 0
+        for match in CITATION_GROUP.finditer(text):
+            if match.start() > position:
+                run = paragraph.add_run(text[position : match.start()])
+                run.bold, run.italic = bold, italic
+                if mono:
+                    run.font.name = "Consolas"
+            for number in match.group(1).split(","):
+                link(paragraph, f"[{number}]", anchor=f"ref-{number}", superscript=True)
+            position = match.end()
+        if position < len(text):
+            run = paragraph.add_run(text[position:])
+            run.bold, run.italic = bold, italic
+            if mono:
+                run.font.name = "Consolas"
 
     def runs(paragraph, inline):
         bold = italic = False
@@ -685,23 +837,84 @@ def docx_document(value):
             elif child.type == "em_close":
                 italic = False
             elif child.type in {"text", "code_inline"}:
-                run = paragraph.add_run(child.content)
-                run.bold, run.italic = bold, italic
-                if child.type == "code_inline":
-                    run.font.name = "Consolas"
+                citations_in(paragraph, child.content, bold, italic, child.type == "code_inline")
             elif child.type in {"softbreak", "hardbreak"}:
                 paragraph.add_run(" " if child.type == "softbreak" else "\n")
 
-    def plain(content):
-        return re.sub(r"\*\*|__|`", "", content)
+    def code_block(content, *, size=9):
+        paragraph = doc.add_paragraph()
+        shade(paragraph._p.get_or_add_pPr(), CODE_FILL)
+        paragraph.paragraph_format.left_indent = Pt(12)
+        paragraph.paragraph_format.space_before = Pt(6)
+        run = paragraph.add_run(content.rstrip())
+        run.font.name = "Consolas"
+        run.font.size = Pt(size)
+        return paragraph
 
+    def caption(text):
+        paragraph = doc.add_paragraph()
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = paragraph.add_run(text)
+        run.italic = True
+        run.font.size = Pt(9)
+        run.font.color.rgb = RGBColor(0x5F, 0x63, 0x68)
+        return paragraph
+
+    def picture(data):
+        width, height = _png_pixels(data)
+        # A top-down flowchart is far taller than it is wide. Fitting only the
+        # column leaves a picture several pages long, which Word clips at the
+        # first page break, so the page height bounds it too.
+        inches = min(TEXT_WIDTH_INCHES, max(width / 96, 0.02), TEXT_HEIGHT_INCHES * width / height)
+        paragraph = doc.add_paragraph()
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        # A diagram the page can only hold as a narrow ribbon would otherwise be
+        # dropped into the prose, pushing itself to the next page and leaving
+        # most of the previous one blank. Starting its own page costs the same
+        # space and reads as a figure rather than as a gap.
+        if inches < TEXT_WIDTH_INCHES * NARROW_DIAGRAM:
+            paragraph.paragraph_format.page_break_before = True
+        # The caption follows in its own paragraph; it must not land alone.
+        paragraph.paragraph_format.keep_with_next = True
+        paragraph.add_run().add_picture(BytesIO(data), width=Inches(inches))
+
+    # Headings are bookmarked before the body is written so the contents list
+    # can link to them; only levels 2 and 3 appear, as in the Markdown outline.
+    outline, anchors, order = [], {}, iter(range(1, 1_000_000))
+    for position, token in enumerate(tokens):
+        if token.type == "heading_open" and token.tag in {"h2", "h3"}:
+            anchor = f"heading-{next(order)}"
+            anchors[position] = anchor
+            outline.append((int(token.tag[1]), visible_text(tokens[position + 1].content).strip(), anchor))
+
+    doc.add_heading(title_of(value.get("document", "")) or value.get("title", ""), 0)
+    stats = value.get("stats") or {}
+    subtitle = " · ".join(part for part in [str(stats.get("citations") or len(value.get("citations") or [])) + (" 条引用" if lang == "zh" else " references")] if part)
+    if subtitle:
+        caption(subtitle)
+    if value.get("demo"):
+        notice = doc.add_paragraph()
+        shade(notice._p.get_or_add_pPr(), "FFF4E5")
+        run = notice.add_run(labels["demo"])
+        run.bold = True
+    if outline:
+        doc.add_heading(labels["contents"], 1)
+        for level, text, anchor in outline:
+            entry = doc.add_paragraph()
+            entry.paragraph_format.left_indent = Pt(0 if level == 2 else 18)
+            entry.paragraph_format.space_after = Pt(2)
+            link(entry, text, anchor=anchor)
+
+    unrendered, figures = [], iter(range(1, 1_000_000))
     lists, table, row, index = [], None, None, 0
     while index < len(tokens):
         token = tokens[index]
         kind = token.type
         if kind == "heading_open":
             level = int(token.tag[1])
-            doc.add_heading(plain(tokens[index + 1].content), 0 if level == 1 else min(level - 1, 3))
+            heading = doc.add_heading(visible_text(tokens[index + 1].content).strip(), 0 if level == 1 else min(level - 1, 3))
+            if index in anchors:
+                bookmark(heading, anchors[index])
             index += 2
         elif kind in {"bullet_list_open", "ordered_list_open"}:
             lists.append("List Number" if kind == "ordered_list_open" else "List Bullet")
@@ -712,36 +925,107 @@ def docx_document(value):
         elif kind == "tr_open":
             row = []
         elif kind in {"th_open", "td_open"}:
-            row.append(plain(tokens[index + 1].content) if tokens[index + 1].type == "inline" else "")
+            row.append(tokens[index + 1] if tokens[index + 1].type == "inline" else None)
         elif kind == "tr_close":
             table.append(row)
         elif kind == "table_close":
-            columns = max((len(r) for r in table), default=0)
+            columns = max((len(entry) for entry in table), default=0)
             if columns:
                 grid = doc.add_table(rows=0, cols=columns)
                 grid.style = "Table Grid"
-                for values in table:
-                    cells = grid.add_row().cells
-                    for cell, text in zip(cells, values + [""] * (columns - len(values)), strict=True):
-                        cell.text = text
+                grid.alignment = WD_TABLE_ALIGNMENT.CENTER
+                # Word's autofit gives one column most of the width and squeezes
+                # the rest into a vertical ribbon of single characters.
+                grid.autofit = False
+                layout = OxmlElement("w:tblLayout")
+                layout.set(qn("w:type"), "fixed")
+                grid._tbl.tblPr.append(layout)
+                rules(grid)
+                share = Inches(TEXT_WIDTH_INCHES / columns)
+                for number, values in enumerate(table):
+                    row = grid.add_row()
+                    # A row Word is allowed to split leaves one line of a cell
+                    # stranded on the next page under the repeated header.
+                    keep = OxmlElement("w:cantSplit")
+                    row._tr.get_or_add_trPr().append(keep)
+                    for cell, inline in zip(row.cells, values + [None] * (columns - len(values)), strict=True):
+                        cell.width = share
+                        paragraph = cell.paragraphs[0]
+                        if inline is not None:
+                            runs(paragraph, inline)
+                        if number == 0:
+                            for run in paragraph.runs:
+                                run.bold = True
+                    if number == 0:
+                        repeat = OxmlElement("w:tblHeader")
+                        repeat.set(qn("w:val"), "true")
+                        row._tr.get_or_add_trPr().append(repeat)
+                        rule_under(row)
             table = None
         elif kind == "inline" and table is None and tokens[index - 1].type == "paragraph_open":
             style = lists[-1] if lists else None
             paragraph = doc.add_paragraph(style=style) if style else doc.add_paragraph()
             runs(paragraph, token)
         elif kind in {"fence", "code_block"}:
-            paragraph = doc.add_paragraph()
-            run = paragraph.add_run(token.content.rstrip())
-            run.font.name = "Consolas"
-            run.font.size = Pt(9)
+            info = (token.info or "").strip().split(" ")[0].lower()
+            if info == "mermaid":
+                source = token.content.strip()
+                number = next(figures)
+                data = pictures.get(diagram_key(source)) if number <= MAX_DIAGRAMS else None
+                if data:
+                    picture(data)
+                    caption(f"{labels['figure']} {number}")
+                else:
+                    caption(f"{labels['figure']} {number}（{labels['unrendered']}）" if lang == "zh" else f"{labels['figure']} {number} ({labels['unrendered']})")
+                    unrendered.append((number, source))
+            else:
+                code_block(token.content)
         index += 1
-    if value.get("demo"):
-        doc.add_paragraph(LABELS[lang]["demo"])
-    doc.add_heading(LABELS[lang]["references"], 1)
-    for ref in value["citations"]:
-        doc.add_paragraph(f"[{ref['number']}] {ref['title']}\n{ref.get('url') or ref.get('canonical_url') or ref.get('source_uri') or ''}")
+
+    doc.add_heading(labels["references"], 1)
+    for ref in value.get("citations") or []:
+        entry = doc.add_paragraph()
+        entry.paragraph_format.space_after = Pt(4)
+        bookmark(entry, f"ref-{ref['number']}")
+        entry.add_run(f"{ref['number']}. ")
+        target = ref.get("url") or ref.get("canonical_url")
+        title = ref.get("title") or target or ""
+        if target:
+            link(entry, title, url=target)
+        else:
+            locator = _locator(ref)
+            entry.add_run(f"{title} — {locator}".rstrip(" —"))
+        trailing = [part for part in (ref.get("domain"), str(ref.get("published_at"))[:10] if ref.get("published_at") else None) if part]
+        if trailing:
+            note = entry.add_run(" · " + " · ".join(trailing))
+            note.font.color.rgb = RGBColor(0x5F, 0x63, 0x68)
+            note.font.size = Pt(9)
+        if ref.get("basis") == "search excerpt":
+            mark = entry.add_run(f"（{BASIS_NOTE[lang]}）" if lang == "zh" else f" ({BASIS_NOTE[lang]})")
+            mark.font.color.rgb = RGBColor(0x5F, 0x63, 0x68)
+            mark.font.size = Pt(9)
+
+    if unrendered:
+        doc.add_heading(labels["appendix"], 1)
+        for number, source in unrendered:
+            caption(f"{labels['figure']} {number}")
+            code_block(source)
+
+    footer = doc.sections[0].footer.paragraphs[0]
+    footer.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = footer.add_run()
+    for kind, content in (("begin", None), (None, " PAGE "), ("end", None)):
+        if kind:
+            element = OxmlElement("w:fldChar")
+            element.set(qn("w:fldCharType"), kind)
+        else:
+            element = OxmlElement("w:instrText")
+            element.set(qn("xml:space"), "preserve")
+            element.text = content
+        run._r.append(element)
+
     doc.core_properties.author = "DeepResearch"
-    doc.core_properties.title = title_of(value["document"])[:255]
+    doc.core_properties.title = title_of(value.get("document", ""))[:255]
     out = BytesIO()
     doc.save(out)
     return out.getvalue()

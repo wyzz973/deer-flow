@@ -192,10 +192,19 @@ export function researchApi(base = "") {
       id: string,
       format: "md" | "html" | "docx",
       version?: number,
+      diagrams?: Record<string, string>,
     ) {
-      const res = await response(
-        `/${encodeURIComponent(id)}/report?format=${format}${version === undefined ? "" : `&version=${version}`}`,
-      );
+      // Word carries the diagrams this browser drew; every other format is a
+      // plain read of what the server already published.
+      const res =
+        format === "docx" && diagrams && Object.keys(diagrams).length > 0
+          ? await response(`/${encodeURIComponent(id)}/report/docx`, {
+              version,
+              diagrams,
+            })
+          : await response(
+              `/${encodeURIComponent(id)}/report?format=${format}${version === undefined ? "" : `&version=${version}`}`,
+            );
       const url = URL.createObjectURL(await res.blob());
       const a = document.createElement("a");
       a.href = url;
