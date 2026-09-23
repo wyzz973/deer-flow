@@ -26,7 +26,7 @@ from . import extract, wire
 from .audit import scrub_text
 from .contracts import ResearchError
 from .evidence import canonical_url, digest
-from .providers import PROVIDER_FAILURES, ProviderError, Request, call
+from .providers import PROVIDER_FAILURES, ProviderError, Request, call, provider_timeout
 from .report_policy import results_citable
 
 MAX_ATTEMPTS = 6
@@ -161,12 +161,13 @@ async def run_providers(source, request, settings, request_secrets=None):
     for provider, _ in order[:MAX_ATTEMPTS]:
         key = HEALTH.key(source, provider)
         started = time.monotonic()
+        limit = provider_timeout(provider, settings.mcp_servers)
         try:
-            outcome = await asyncio.wait_for(call(provider, request, servers=settings.mcp_servers, request_secrets=request_secrets), provider.timeout_seconds + 15)
+            outcome = await asyncio.wait_for(call(provider, request, servers=settings.mcp_servers, request_secrets=request_secrets), limit + 15)
         except ProviderError as error:
             failure = error
         except TimeoutError:
-            failure = ProviderError("timeout", f"No answer within {provider.timeout_seconds:g}s")
+            failure = ProviderError("timeout", f"No answer within {limit:g}s")
         except Exception as error:  # A provider bug must not end the source; it is recorded.
             failure = ProviderError("server", type(error).__name__)
         else:
@@ -398,7 +399,7 @@ async def test_provider(source, provider, settings, *, query=None, url=None):
     request = Request(source.role, query=query or "DeerFlow deep research", url=url or "https://example.com/", max_results=3)
     started = time.monotonic()
     try:
-        outcome = await asyncio.wait_for(call(provider, request, servers=settings.mcp_servers), provider.timeout_seconds + 15)
+        outcome = await asyncio.wait_for(call(provider, request, servers=settings.mcp_servers), provider_timeout(provider, settings.mcp_servers) + 15)
     except ProviderError as error:
         return {"ok": False, "kind": error.kind, "message": _message(error), "ms": round((time.monotonic() - started) * 1000)}
     except TimeoutError:

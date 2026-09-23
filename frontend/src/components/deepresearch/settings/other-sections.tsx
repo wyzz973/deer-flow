@@ -218,12 +218,24 @@ function McpServerCard({
           />
           <NumberField
             label="连接与列出工具超时（秒）"
+            hint="只用于探活和发现工具；服务不可达时应尽快报错"
             value={server.timeout_seconds ?? 60}
             min={1}
             max={3600}
             disabled={disabled}
             onChange={(value) =>
               update((target) => (target.timeout_seconds = value ?? 60))
+            }
+          />
+          <NumberField
+            label="工具响应超时（秒）"
+            hint="一次工具调用等待应答的时限，也会下发给传输层；内网检索动辄几分钟，默认 300"
+            value={server.call_timeout_seconds ?? 300}
+            min={1}
+            max={7200}
+            disabled={disabled}
+            onChange={(value) =>
+              update((target) => (target.call_timeout_seconds = value ?? 300))
             }
           />
           {remote ? (
@@ -523,6 +535,7 @@ export function McpSection({
                     args: [],
                     env: {},
                     timeout_seconds: 60,
+                    call_timeout_seconds: 300,
                     enabled: true,
                     description: "",
                     allowed_tools: null,

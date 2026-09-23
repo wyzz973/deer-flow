@@ -15,6 +15,7 @@ import sqlite3
 import time
 
 from .config import load_settings
+from .providers import provider_timeout
 from .secrets import SECRETS
 
 PROBE_TIMEOUT_SECONDS = 180
@@ -170,6 +171,7 @@ def node_status(settings):
             "timeout_seconds": tuning.timeout_seconds,
             "output_retries": tuning.output_retries if tuning.output_retries is not None else settings.output_retries,
             "json_mode": tuning.json_mode,
+            "thinking": bool(tuning.thinking),
         }
     return status
 
@@ -190,12 +192,19 @@ def configuration_status(settings):
                 "kind": source.kind,
                 "role": source.role,
                 "enabled": source.enabled,
-                "providers": [{"id": item.id, "type": item.type, "enabled": item.enabled, "api_key": SECRETS.status(item.api_key)} for item in source.providers],
+                "providers": [{"id": item.id, "type": item.type, "enabled": item.enabled, "api_key": SECRETS.status(item.api_key), "timeout_seconds": provider_timeout(item, settings.mcp_servers)} for item in source.providers],
             }
             for source in settings.sources
         ],
         "mcp_servers": {
-            name: {"transport": server.transport, "enabled": server.enabled, "allowed_tools": server.allowed_tools, "used_tools": sorted({tool for _, bound, tool in settings.mcp_bindings() if bound == name})}
+            name: {
+                "transport": server.transport,
+                "enabled": server.enabled,
+                "allowed_tools": server.allowed_tools,
+                "timeout_seconds": server.timeout_seconds,
+                "call_timeout_seconds": server.call_timeout_seconds,
+                "used_tools": sorted({tool for _, bound, tool in settings.mcp_bindings() if bound == name}),
+            }
             for name, server in settings.mcp_servers.items()
         },
         "retrieval": retrieval_status(settings),

@@ -260,6 +260,7 @@ describe("node tuning", () => {
       max_tokens: null,
       timeout_seconds: null,
       output_retries: null,
+      thinking: null,
       json_mode: false,
       extra_body: {},
     });

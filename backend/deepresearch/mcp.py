@@ -13,6 +13,7 @@ import asyncio
 import threading
 import time
 from collections import OrderedDict
+from datetime import timedelta
 from uuid import uuid4
 
 from . import wire
@@ -73,7 +74,16 @@ def described(tools):
 
 
 def connection(spec, request=None):
-    """Connection parameters with credentials resolved for this request."""
+    """Connection parameters with credentials resolved for this request.
+
+    The transport keeps deadlines of its own, and its defaults are far shorter
+    than what an internal server may take over a search: 30 seconds for a whole
+    streamable-HTTP request, 5 seconds to open an SSE stream. Left unstated
+    they, not our own wait, are what cuts a slow answer off, so the server's
+    call timeout is passed down here. One set of parameters serves both
+    listing tools and calling them, so listing stays bounded by the shorter
+    wait its caller applies.
+    """
     if spec.transport == "stdio":
         params = {"transport": "stdio", "command": spec.command, "args": list(spec.args)}
         if spec.env:
@@ -82,6 +92,16 @@ def connection(spec, request=None):
     params = {"transport": "http" if spec.transport == "streamable_http" else spec.transport, "url": spec.url}
     if spec.headers:
         params["headers"] = SECRETS.expand(dict(spec.headers), request)
+    if spec.transport == "sse":
+        # SSE splits the two: ``timeout`` opens the stream, ``sse_read_timeout``
+        # waits for the answer to arrive on it. Both take plain seconds.
+        params["timeout"] = spec.timeout_seconds
+        params["sse_read_timeout"] = spec.call_timeout_seconds
+    else:
+        # Streamable HTTP bounds every operation with ``timeout``, so the call
+        # timeout governs it; both take a timedelta.
+        params["timeout"] = timedelta(seconds=spec.call_timeout_seconds)
+        params["sse_read_timeout"] = timedelta(seconds=spec.call_timeout_seconds)
     return params
 
 
@@ -210,7 +230,10 @@ async def source_tool(source, servers, request_secrets=None, budget=None, record
     async def run(**arguments):
         if budget is not None and (stop := await budget.reserve("read" if source.role == "read" else "search")):
             return stop.text, stop.artifact
-        limits = [value for value in (spec.timeout_seconds, budget.call_timeout() if budget is not None else None) if value is not None]
+        # A tool call gets the server's call timeout, not the shorter one that
+        # bounds connecting and listing: the answer is the work, and an
+        # internal service often takes minutes over it.
+        limits = [value for value in (spec.call_timeout_seconds, budget.call_timeout() if budget is not None else None) if value is not None]
         try:
             content, artifact, status = await asyncio.wait_for(MANAGER.call(remote, arguments, server=source.server, source=source.name), min(limits))
         except TimeoutError:

@@ -369,6 +369,7 @@ export const NODE_DEFAULTS: NodeSpec = {
   max_tokens: null,
   timeout_seconds: null,
   output_retries: null,
+  thinking: null,
   json_mode: false,
   extra_body: {},
 };
@@ -489,7 +490,9 @@ export function newProvider(
     server: null,
     tool: null,
     arguments: {},
-    timeout_seconds: 30,
+    // Empty follows the kind: an MCP provider waits as long as its server may
+    // answer, everything else gets the web default.
+    timeout_seconds: null,
     allow_private_network: false,
   };
 }

@@ -108,7 +108,7 @@ nodes:
   research:   {temperature: 0.3, timeout_seconds: 2400}
   conversion: {model: small-strict, temperature: 0, output_retries: 3}
   outline:    {temperature: 0.1}
-  section:    {model: strong-writer, temperature: 0.5, max_tokens: 6000}
+  section:    {model: strong-writer, temperature: 0.5, max_tokens: 6000, thinking: true}
   summary:    {enabled: true}
 ```
 
@@ -120,10 +120,14 @@ nodes:
 | `max_tokens` | 这个节点单次调用的输出上限；不写用全局 `max_output_tokens` |
 | `timeout_seconds` | 这个节点一次执行的超时：研究节点是整个 Agent 循环，`rewrite` / `conversion` 是一次直接调用；不写用角色的 `timeout_seconds` |
 | `output_retries` | 输出没通过契约校验时的修复次数；不写用全局 `output_retries` |
+| `thinking` | 这个节点是否让模型先思考再作答。不写＝继承默认（关）。研究默认不开思考：检索一轮多半是工具调用，计划是个短对象，思考的代价主要是等待；写章节、定大纲这类一次成文的节点可能值得开。只对模型 `supports_thinking: true` 生效，发送的是该模型自己的 `when_thinking_enabled` 开关；节点显式写了 `model` 而那个模型不支持思考时，配置校验会直接报错 |
 | `json_mode` | 向供应商请求 JSON 对象（`response_format`）。只对直接调用的 `rewrite`、`conversion` 生效，且网关要支持；契约始终同时写在提示词里，所以不支持时关掉即可 |
 | `extra_body` | 合并进请求体的额外字段（例如 `repetition_penalty`、网关自己的开关），不会覆盖模型自身的 `extra_body` |
 
 节点参数写在该次执行私有的模型副本上，由引擎自己的模型工厂生效，宿主配置和其他节点都不受影响。
+研究的每一次模型创建都是“引擎思考开关＝关”（原生子 Agent 执行器写死，直接调用也保持一致），
+所以节点的 `thinking: true` 落在引擎在这条路径上真正会发送的字段（`when_thinking_disabled`）里，
+并且是与已经拼好的请求体合并、而不是替换——否则节点的 `extra_body` 和网关会话键会被整体覆盖掉。
 “指标”页签的“按节点”表和 `python -m deepresearch.doctor` 的 `nodes` 段会显示每个节点实际生效的模型与参数、
 调用数、Token、P50/P95 延迟、被截断次数（输出碰到上限，调大该节点 `max_tokens`）和格式重试次数（降低温度或换模型）。
 
@@ -191,6 +195,9 @@ sources:
         type: duckduckgo
 ```
 
+- 每个供应商的 `timeout_seconds` 是它一次调用的时限。留空时按类型取默认：`type: mcp` 跟随所属 MCP 服务的
+  `call_timeout_seconds`（默认 300 秒），其余供应商 30 秒。一轮里并行的工具要等最慢的那个，所以网页搜索、
+  网页读取不要跟着内网 MCP 一起调大。
 - `role` 决定证据能不能被引用：`search` 的结果只用于发现来源（除非 `cite_search_results: true`）；
   `read` 打开的文档正文可以引用；`data` 返回的每条记录都可以单独引用。
 - **没有任何启用的 `role: read` 数据源时**（例如只有内部检索或知识库 MCP 工具，拿不到原文），检索结果本身就是证据：
@@ -240,10 +247,18 @@ mcp_servers:
       Authorization: Bearer ${KB_TOKEN}              # ${环境变量}
       Cookie: sid=${secret:kb-cookie}; lang=zh       # ${secret:名字}
     allowed_tools: [search_docs, search_wiki]        # 工具白名单；null=不限制
-    timeout_seconds: 60          # 连接、列工具和 kind: mcp 数据源单次调用的超时
+    timeout_seconds: 60          # 连接与列工具的超时：服务不可达时应尽快报错
+    call_timeout_seconds: 300    # 一次工具调用等待应答的时限（默认 300）
     enabled: true
     description: 内部知识库
 ```
+
+- **超时分两层，都能在设置页改**：
+  - `timeout_seconds`（默认 60）只用于连接和列出工具。服务宕机、地址写错、凭据过期都应该马上报错，研究还没开始。
+  - `call_timeout_seconds`（默认 300）是一次工具调用等待应答的时限，也是内网检索真正需要的那个值。
+    它同时下发给传输层：MCP 适配器自己的默认值是 streamable HTTP 每次请求 30 秒、SSE 建流 5 秒，
+    不显式设置的话，真正掐断慢应答的是它们而不是我们的等待，配再大的上层超时也没用。
+  - `type: mcp` 的供应商不写 `timeout_seconds` 时跟随所属服务的 `call_timeout_seconds`；其余供应商默认 30 秒。
 
 - `allowed_tools` 是服务器级白名单：数据源（`kind: mcp`）和供应商（`type: mcp`）只能绑定名单里的工具，
   加载配置时检查一次，解析工具时再检查一次；服务器以后新增的工具在写进名单之前研究调不到。
@@ -366,7 +381,7 @@ compaction:
 | `favicon_private_network` | `false` | 布尔 | 允许图标代取访问内网地址（内网站点常没有 `/favicon.ico`）。只对**数据源为自己域名声明的**图标生效；打开意味着数据源可以指定一个网关会去取的地址 |
 | `source_fallback` | `[]` | 来源名列表 | 计划没指定来源时的默认顺序 |
 | `native_tools` | `null` | 工具名列表 | 可选的引擎工具上限（运维字段） |
-| `tool_timeout_seconds`、`tool_retries` | 45、1 | — | 旧版字段，当前不生效；超时在供应商的 `timeout_seconds` 里设置 |
+| `tool_timeout_seconds`、`tool_retries` | 45、1 | — | 旧版字段，当前不生效；超时在供应商的 `timeout_seconds`（留空：MCP 跟随服务的 `call_timeout_seconds`，其余 30 秒）里设置 |
 
 ### 记录了什么，怎么整包取出来
 
@@ -481,4 +496,5 @@ pricing:
 | `max_report_sections` | 4–5 | 减少写作调用次数 |
 | `compaction.trigger_fraction` | 0.5 | 本地模型上下文小，早一点压缩 |
 | `skills.*.timeout_seconds` | 1800 | 本地模型慢 |
+| `mcp_servers.*.call_timeout_seconds` | 300 起，慢的内网服务按实际调 | 内网检索几分钟才回是常态；它同时管住传输层的超时 |
 | `budget_ceiling` | `max_units: 4`、`max_iterations: 1`、`max_elapsed_seconds: 7200`、`max_model_tokens: 2000000` | 控制总时长，本地不按 Token 计费 |

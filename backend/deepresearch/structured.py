@@ -10,7 +10,7 @@ import json
 
 from .contracts import ResearchError, ResearchRequest
 from .evidence import digest
-from .models import complete, engine_config, merged_overrides, model_for, node_output_cap, node_overrides, session_overrides
+from .models import complete, engine_config, merged_overrides, model_for, node_output_cap, node_overrides, node_thinking, private_config, session_overrides, with_thinking
 from .native import execute_role, node_of
 from .output import parse_contract, visible_text
 from .secrets import trace_secrets
@@ -56,9 +56,16 @@ def _create_model(settings, model_name, max_tokens, node=None, session=None):
     from deerflow.models import create_chat_model
 
     app_config = engine_config(get_app_config(), settings)
+    profile = app_config.get_model_config(model_name)
     # The engine replaces whole fields, so dictionary fields are merged with the
     # profile's own here (a node's extra_body keeps the provider's switches).
-    overrides = {"max_tokens": max_tokens, **merged_overrides(app_config.get_model_config(model_name), node_overrides(settings, node), session_overrides(settings, model_name, session))}
+    overrides = {"max_tokens": max_tokens, **merged_overrides(profile, node_overrides(settings, node), session_overrides(settings, model_name, session))}
+    # A direct call asks for a model with thinking off like every other research
+    # call; a node that wants reasoning carries the switch on its own profile,
+    # which is where the factory reads it (see with_thinking).
+    reasoning = with_thinking(profile, node_thinking(settings, node), overrides.get("extra_body"))
+    if reasoning is not profile:
+        app_config = private_config(app_config, models=[reasoning if item.name == model_name else item for item in app_config.models])
     model = create_chat_model(name=model_name, thinking_enabled=False, app_config=app_config, attach_tracing=False, model_overrides=overrides)
     if node and settings.node(node).json_mode:
         # Optional: the contract is always requested in prompt text as well, so

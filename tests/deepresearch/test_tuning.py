@@ -15,11 +15,11 @@ from pydantic import ValidationError
 
 from deepresearch import extract
 from deepresearch.channels import BUDGET_STOP, SearchBudget
-from deepresearch.config import Settings
+from deepresearch.config import PROVIDER_TIMEOUT_SECONDS, McpServerSpec, Settings
 from deepresearch.contracts import CreateResearch, ResearchError, ResearchPlan, ResearchUnit
-from deepresearch.models import engine_model, model_for, node_output_cap, node_overrides, with_node
+from deepresearch.models import engine_model, model_for, node_output_cap, node_overrides, node_thinking, with_node, with_thinking
 from deepresearch.observations import NativeExecution, research_observations
-from deepresearch.providers import Request, _render
+from deepresearch.providers import Request, _render, provider_timeout
 from deepresearch.report_policy import eligible_evidence, results_citable
 from deepresearch.runner import DemoRunner, fit_plan, plain_request
 from deepresearch.secrets import SECRETS, references
@@ -84,6 +84,39 @@ def test_a_gateway_with_a_base_url_still_reports_streamed_usage(monkeypatch, set
     assert engine_model(specs[0]).model_extra["stream_usage"] is True
     assert engine_model(specs[1]).model_extra["stream_usage"] is False
     assert "stream_usage" not in (engine_model(specs[2]).model_extra or {})
+
+
+def test_a_node_can_ask_its_model_to_reason_and_the_engine_still_asks_for_none(monkeypatch, settings):
+    """Every research model is created with the engine's thinking switch off.
+
+    The native subagent executor hardcodes it and the direct calls match it, so
+    a node's own choice has to travel in the field that path actually sends.
+    """
+    monkeypatch.setenv("GATEWAY_KEY", "k-123456789")
+    reasoning = {**MODELS[0], "provider": "deepseek", "supports_thinking": True}
+    tuned = configured(settings, models=[reasoning, MODELS[1]], default_model="fast", nodes={"section": {"thinking": True}, "plan": {"thinking": False}})
+    assert node_thinking(tuned, "section") is True
+    assert node_thinking(tuned, "plan") is False and node_thinking(tuned, "outline") is False
+    profile = engine_model(tuned.models[0])
+    # Off: the profile is untouched and the engine applies its own off-switch.
+    assert with_thinking(profile, False) is profile
+    # On: the model's own switch, folded into the request body the node and the
+    # gateway session already built, so neither is replaced by it.
+    switched = with_thinking(profile, True, {"prompt_cache_key": "dr-abc", "repetition_penalty": 1.05})
+    assert switched.when_thinking_disabled == {"extra_body": {"prompt_cache_key": "dr-abc", "repetition_penalty": 1.05, "thinking": {"type": "enabled"}}}
+    assert profile.when_thinking_enabled == {"extra_body": {"thinking": {"type": "enabled"}}}
+    # A model that never declared reasoning is left exactly as it is.
+    plain = engine_model(tuned.models[1])
+    assert with_thinking(plain, True) is plain
+
+
+def test_a_node_cannot_name_a_model_that_does_not_do_reasoning(monkeypatch, settings):
+    monkeypatch.setenv("GATEWAY_KEY", "k-123456789")
+    with pytest.raises(ValidationError, match="nodes.section.thinking=fast"):
+        configured(settings, models=MODELS, default_model="fast", nodes={"section": {"thinking": True, "model": "fast"}})
+    # A node that inherits its model is not refused: a researcher's model is
+    # chosen per role at runtime and a model that cannot reason is not switched.
+    configured(settings, models=MODELS, default_model="fast", nodes={"section": {"thinking": True}})
 
 
 def test_rewrite_can_be_switched_off_without_losing_a_plan_edit():
@@ -157,6 +190,39 @@ def test_the_mcp_allowlist_is_checked_when_configuration_loads(settings):
     direct = {"name": "internal-wiki", "tool": "wiki", "kind": "mcp", "server": "kb", "mcp_tool": "delete_page", "origin": "internal", "role": "data"}
     with pytest.raises(ValidationError, match="Source internal-wiki uses MCP tool delete_page"):
         mcp_only(settings, sources=[*mcp_only(settings).model_dump(mode="json")["sources"], direct])
+
+
+def test_an_mcp_call_may_take_minutes_and_the_transport_is_told_so(settings):
+    """A self-hosted MCP service answers a search in minutes, not seconds.
+
+    The adapter's own defaults (30 s per streamable-HTTP request, 5 s to open an
+    SSE stream) are what cut a slow answer off, so they are stated from the
+    server's call timeout; only connecting and listing keep the short bound.
+    """
+    from datetime import timedelta
+
+    from deepresearch.mcp import connection
+
+    server = mcp_only(settings).mcp_servers["kb"]
+    assert server.call_timeout_seconds == 300 and server.timeout_seconds == 60
+    params = connection(server)
+    assert params["timeout"] == timedelta(seconds=300) and params["sse_read_timeout"] == timedelta(seconds=300)
+    # SSE splits them: one opens the stream, the other waits for the answer.
+    sse = connection(server.model_copy(update={"transport": "sse", "call_timeout_seconds": 420}))
+    assert sse["timeout"] == 60 and sse["sse_read_timeout"] == 420
+    assert "timeout" not in connection(McpServerSpec(transport="stdio", command="uvx", args=["kb"]))
+
+
+def test_a_provider_without_a_timeout_follows_its_kind(settings):
+    """An MCP provider waits as long as its server may answer; the web does not."""
+    internal = mcp_only(settings, mcp_servers={"kb": {"transport": "http", "url": "http://mcp.internal/mcp", "call_timeout_seconds": 480}})
+    source = next(item for item in internal.sources if item.name == "internal-search")
+    assert source.providers[0].timeout_seconds is None
+    assert provider_timeout(source.providers[0], internal.mcp_servers) == 480
+    # A provider that states its own keeps it, and a web provider is unaffected.
+    assert provider_timeout(source.providers[0].model_copy(update={"timeout_seconds": 90}), internal.mcp_servers) == 90
+    web = next(item for item in settings.sources if item.name == "external-web").providers[0]
+    assert provider_timeout(web, internal.mcp_servers) == PROVIDER_TIMEOUT_SECONDS == 30
 
 
 @pytest.mark.asyncio
@@ -239,6 +305,34 @@ async def test_a_directly_exposed_mcp_tool_is_metered_like_any_source(monkeypatc
     # The refusal says how much of the allowance was gone, on every repeat and not only the first.
     assert message.artifact == {"schema": BUDGET_STOP, "reason": "step", "scope": "step", "used": 2, "limit": 2} and "No more searches" in message.content
     assert [kind for kind, _ in ledger.events] == ["research.search.limited"]
+
+
+@pytest.mark.asyncio
+async def test_a_directly_exposed_mcp_tool_waits_the_servers_call_timeout(monkeypatch, settings):
+    from langchain_core.tools import StructuredTool
+
+    from deepresearch import mcp
+
+    async def remote(query: str):
+        return "answer"
+
+    async def find(name, spec, tool_name, *, request=None):
+        return StructuredTool.from_function(coroutine=remote, name=tool_name, description="Search internal documents")
+
+    waited, original = [], asyncio.wait_for
+
+    async def watched(awaitable, timeout):
+        waited.append(timeout)
+        return await original(awaitable, timeout)
+
+    monkeypatch.setattr(mcp.MANAGER, "tool", find)
+    monkeypatch.setattr(mcp.asyncio, "wait_for", watched)
+    internal = mcp_only(settings, mcp_servers={"kb": {"transport": "http", "url": "http://mcp.internal/mcp", "timeout_seconds": 20, "call_timeout_seconds": 420}})
+    source = types.SimpleNamespace(name="internal-wiki", tool="wiki", server="kb", mcp_tool="search_docs", role="data", description="")
+    tool = await mcp.source_tool(source, internal.mcp_servers, None, None)
+    await tool.ainvoke({"type": "tool_call", "name": "wiki", "args": {"query": "a"}, "id": "c1"})
+    # The answer is the work; the 20 s only bounds connecting and listing tools.
+    assert waited == [420]
 
 
 @pytest.mark.asyncio

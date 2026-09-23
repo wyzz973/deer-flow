@@ -19,6 +19,7 @@ from urllib.parse import quote
 
 from . import extract, wire
 from .audit import scrub_text
+from .config import PROVIDER_TIMEOUT_SECONDS
 from .secrets import SECRETS
 
 # Failures that say something about the provider (cool it down) versus about
@@ -584,8 +585,26 @@ CALLS = {
 }
 
 
+def provider_timeout(spec, servers):
+    """Seconds one call of this provider may take.
+
+    A provider that states no timeout takes the default for its kind. An MCP
+    provider follows its server's call timeout: an internal MCP service is
+    routinely far slower than a web API, and the operator already said on the
+    server how long one of its calls may take, so the chain of a source that
+    mixes both does not have to repeat it on every provider.
+    """
+    if spec.timeout_seconds is not None:
+        return spec.timeout_seconds
+    server = (servers or {}).get(spec.server or "") if spec.type == "mcp" else None
+    return server.call_timeout_seconds if server is not None else PROVIDER_TIMEOUT_SECONDS
+
+
 async def call(spec, request, *, servers=None, request_secrets=None):
     """Run one provider. ``request_secrets`` are this request's own credentials."""
+    # Every backend below reads spec.timeout_seconds, so the effective value is
+    # resolved once here rather than defaulted again in each of them.
+    spec = spec.model_copy(update={"timeout_seconds": provider_timeout(spec, servers)})
     if spec.type == "mcp":
         return await mcp(spec, request, servers=servers or {}, request_secrets=request_secrets)
     if spec.type == "http":

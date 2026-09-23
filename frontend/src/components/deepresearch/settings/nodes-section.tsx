@@ -57,6 +57,12 @@ function NodeCard({
       label: firstText(model.display_name, model.name),
     })),
   ];
+  // Only a model that declares supports_thinking has a switch to send. The
+  // node may inherit its model, so this is a warning, never a block.
+  const reasoning = draft.models.filter((model) => model.supports_thinking);
+  const thinkable = node.model
+    ? reasoning.some((model) => model.name === node.model)
+    : reasoning.length > 0;
   return (
     <FieldScope.Provider value={`节点 ${info.label}`}>
       <section
@@ -198,6 +204,34 @@ function NodeCard({
               update((target) => (target.output_retries = value))
             }
           />
+          <SelectField
+            label="模型思考"
+            hint={
+              thinkable
+                ? "开启后这个节点会带上模型自己的思考开关；思考会显著拉长一次调用，检索类节点通常不值得"
+                : "所选模型没有勾选“支持思考”，开启后不会发送思考开关"
+            }
+            value={
+              node.thinking === null || node.thinking === undefined
+                ? "__inherit"
+                : node.thinking
+                  ? "on"
+                  : "off"
+            }
+            options={[
+              { value: "__inherit", label: "继承（默认关闭）" },
+              { value: "on", label: "开启思考" },
+              { value: "off", label: "关闭思考" },
+            ]}
+            disabled={disabled}
+            onChange={(value) =>
+              update(
+                (target) =>
+                  (target.thinking =
+                    value === "__inherit" ? null : value === "on"),
+              )
+            }
+          />
         </div>
         {jsonMode && (
           <SwitchField
@@ -267,6 +301,9 @@ export function NodesSection({
           输出 JSON 的节点（改写、计划、笔记整理、大纲、追问分流）建议温度
           0–0.3；JSON
           模式只对直接调用的两个节点（请求改写、笔记整理）有效。只有请求改写和执行摘要可以关闭。
+        </p>
+        <p>
+          研究默认不开思考：检索一轮多半是工具调用，计划是个短对象，思考的代价主要是等待。写章节、定大纲这类一次成文的节点可以单独开。开关只对在“模型”里勾了“支持思考”的模型生效。
         </p>
       </div>
       {catalog.map((info) => (

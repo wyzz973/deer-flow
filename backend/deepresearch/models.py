@@ -191,6 +191,50 @@ def node_output_cap(settings, node):
     return (spec.max_tokens if spec and spec.max_tokens else None) or settings.max_output_tokens
 
 
+def node_thinking(settings, node):
+    """Whether this node asks its model to reason before it answers."""
+    spec = settings.node(node) if node else None
+    return bool(spec.thinking) if spec is not None else False
+
+
+def thinking_switch(profile):
+    """The request fields that switch this model's reasoning on, or None.
+
+    Research reads them itself instead of letting the engine apply them: the
+    engine's switch is off on every research path, and it replaces whole
+    request fields when it applies either switch, which would drop the node's
+    own body and the gateway's session key.
+    """
+    if not profile.supports_thinking:
+        return None
+    switch = dict(profile.when_thinking_enabled or {})
+    if profile.thinking:
+        switch["thinking"] = {**(switch.get("thinking") or {}), **profile.thinking}
+    return switch or None
+
+
+def with_thinking(profile, on, body=None):
+    """A profile copy whose reasoning follows the node instead of the engine.
+
+    Every research model is created with the engine's thinking switch off — the
+    native subagent executor hardcodes it and the direct calls match it — and
+    on that path the factory sends ``when_thinking_disabled`` verbatim, ahead of
+    everything else. That makes it the one field a node's own choice can reach,
+    so a node asking for reasoning puts the model's "on" switch there. Whole
+    request fields are replaced from it, so the switch is folded into the
+    finished request body (``body``, else the profile's own) rather than
+    replacing the node's parameters and the gateway's session key.
+    """
+    switch = thinking_switch(profile) if on and profile is not None else None
+    if not switch:
+        return profile
+    disabled = {**(profile.when_thinking_disabled or {}), **switch}
+    current = body if body is not None else (profile.model_extra or {}).get("extra_body")
+    if isinstance(current, dict):
+        disabled["extra_body"] = {**current, **(disabled.get("extra_body") or {})}
+    return profile.model_copy(update={"when_thinking_disabled": disabled})
+
+
 # Request fields that are dictionaries: an override adds keys to the profile's
 # own instead of replacing them (for example the provider's thinking switch).
 MERGED_FIELDS = ("extra_body", "default_headers")

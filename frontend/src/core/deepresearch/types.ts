@@ -726,7 +726,9 @@ export type ProviderSpec = {
   server?: string | null;
   tool?: string | null;
   arguments?: Record<string, unknown>;
-  timeout_seconds?: number;
+  /** Seconds one call may take; null takes the default for the kind (an MCP
+   * provider follows its server's call timeout, the rest get 30 s). */
+  timeout_seconds?: number | null;
   allow_private_network?: boolean;
 };
 export type SourceSpec = {
@@ -753,7 +755,10 @@ export type McpServerSpec = {
   env?: Record<string, string>;
   url?: string | null;
   headers?: Record<string, string>;
+  /** Connecting and listing tools; a server that is down should fail fast. */
   timeout_seconds?: number;
+  /** One tool call's answer — the deadline an internal service actually needs. */
+  call_timeout_seconds?: number;
   enabled?: boolean;
   description?: string;
   /** Tools research may call on this server; null allows any tool a source names. */
@@ -790,6 +795,9 @@ export type NodeSpec = {
   max_tokens: number | null;
   timeout_seconds: number | null;
   output_retries: number | null;
+  /** Whether this node's model reasons before answering; null inherits (off).
+   * Only a model with supports_thinking can be switched on. */
+  thinking: boolean | null;
   json_mode: boolean;
   extra_body: Record<string, unknown>;
 };

@@ -43,9 +43,12 @@ nodes: {}
 #   research:   {temperature: 0.3, timeout_seconds: 1200}     # a researcher's own skills.<role>.model wins over this model
 #   conversion: {temperature: 0, output_retries: 3, json_mode: false}   # json_mode: response_format on gateways that support it
 #   outline:    {temperature: 0.1}
-#   section:    {temperature: 0.5, max_tokens: 6000}
+#   section:    {temperature: 0.5, max_tokens: 6000, thinking: true}   # thinking: on a model with supports_thinking
 #   summary:    {enabled: true}                                # false: the outline's key conclusions open the report
-#   fields: enabled, model, temperature, top_p, max_tokens, timeout_seconds, output_retries, json_mode, extra_body
+#   fields: enabled, model, temperature, top_p, max_tokens, timeout_seconds, output_retries, thinking, json_mode, extra_body
+# Research runs without reasoning unless a node asks for it: a research turn is
+# mostly tool calls and a plan is a short object, so the hidden tokens mostly buy
+# latency. thinking: true sends the model's own switch (needs supports_thinking).
 
 # Research roles. deepresearch (planner) and report-synthesis (writer) are fixed;
 # every other entry is a researcher the planner can assign. Methodology comes from
@@ -125,6 +128,8 @@ mcp_servers: {}
 #       Authorization: Bearer ${KB_TOKEN}
 #       Cookie: sid=${secret:kb-cookie}; lang=zh
 #     allowed_tools: [search]      # allowlist; null allows every tool a source or provider names
+#     timeout_seconds: 60          # connecting and listing tools; a server that is down fails fast
+#     call_timeout_seconds: 300    # one tool call's answer, also sent to the transport
 # MCP sources in full: examples/deepresearch/mcp-sources.fragment.yaml
 
 # Engine tools roles may use besides sources. read_file continues long results the engine

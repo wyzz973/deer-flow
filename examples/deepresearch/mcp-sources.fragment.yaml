@@ -15,7 +15,12 @@ mcp_servers:
     # checked when the configuration loads and again when a tool is resolved. A tool
     # the server adds later is unreachable until it is listed. null: no restriction.
     allowed_tools: [search, tickets.search]
+    # Connecting and listing tools: an unreachable server should say so quickly.
     timeout_seconds: 60
+    # One tool call's answer. It is also passed to the transport, whose own
+    # defaults (30 s per streamable-HTTP request, 5 s to open an SSE stream) are
+    # what would otherwise cut a slow internal search off.
+    call_timeout_seconds: 300
     description: Internal knowledge base
 
 sources:

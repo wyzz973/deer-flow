@@ -249,12 +249,19 @@ function ProviderCard({
             )}
           <NumberField
             label="超时（秒）"
+            hint={
+              provider.type === "mcp"
+                ? "留空跟随所属 MCP 服务的“工具响应超时”"
+                : "留空使用默认的 30 秒"
+            }
             value={provider.timeout_seconds}
             min={1}
-            max={600}
+            max={7200}
+            nullable
+            placeholder={provider.type === "mcp" ? "跟随 MCP 服务" : "30"}
             disabled={disabled}
             onChange={(value) =>
-              update((target) => (target.timeout_seconds = value ?? 30))
+              update((target) => (target.timeout_seconds = value))
             }
           />
         </div>

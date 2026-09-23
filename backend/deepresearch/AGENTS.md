@@ -244,6 +244,14 @@ prompts, engine tools, compaction and budgets all live in the research profile
   disabled. Record `config_node` on every model call: `metrics.breakdown.by_node`
   is what tuning is judged by. `json_mode` is optional and only for direct calls;
   the contract is always requested in prompt text as well.
+- Reasoning is per node (`NodeSpec.thinking`, default off). Every research model
+  is created with the engine's thinking switch off (the native executor
+  hardcodes it, `structured._create_model` matches it), and that path sends
+  `when_thinking_disabled` verbatim and first, so `models.with_thinking` puts
+  the model's own `when_thinking_enabled` there — folded into the finished
+  request body, because whole fields are replaced from that field and the
+  node's `extra_body` and the gateway session key would be dropped. A model
+  without `supports_thinking` is untouched; a node naming one is refused at load.
 - Model gateways that only speak Chat Completions are a first-class target:
   never require JSON mode, structured output or the Responses API. For
   `provider: openai` with a non-OpenAI `base_url`, `chat_completions.ChatCompletionsModel`
@@ -267,6 +275,14 @@ prompts, engine tools, compaction and budgets all live in the research profile
   unwraps the client's exception group into auth/timeout/network/server without
   echoing transport text. Header and environment values may interpolate
   `${ENV}` and `${secret:NAME}`; interpolated values are redacted like whole references.
+  A server has two deadlines: `timeout_seconds` (60) for connecting and listing
+  tools, so an unreachable one fails fast, and `call_timeout_seconds` (300) for
+  one tool call's answer. The call timeout also goes into the transport
+  (`mcp.connection`): the adapter's defaults (30 s per streamable-HTTP request,
+  5 s to open an SSE stream) are what really cut a slow internal search off,
+  whatever our own wait says. A `type: mcp` provider without its own
+  `timeout_seconds` follows it; others take `config.PROVIDER_TIMEOUT_SECONDS`
+  (30). Resolved once, in `providers.provider_timeout`.
 - Time is a budget that winds research down (`store.research_seconds_left`,
   `report_time_reserve`): a step gets a tool-stop time and a hard timeout
   (`research.unit.deadline`), source calls are bounded by the time left, a step

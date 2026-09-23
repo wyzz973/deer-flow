@@ -38,6 +38,7 @@
 | `nodes.summary.enabled: false` | 不单独写执行摘要，用大纲的核心结论代替（省一次长输出） |
 | `nodes.rewrite.enabled: false` | 不改写请求 |
 | `nodes.<节点>.max_tokens` | 单次输出上限。太小会截断（更贵的返工），按底稿里该节点的平均输出留 1.5–2 倍余量 |
+| `nodes.<节点>.thinking` | 该节点是否开模型思考。默认全关：检索一轮多半是工具调用，思考的代价主要是等待和 reasoning token。只在底稿显示某个节点质量不够（章节反复修复、大纲结构差）时单独开，且模型要 `supports_thinking: true` |
 
 ## 上下文与缓存
 
@@ -49,11 +50,12 @@
 ## 检索
 
 - 底稿第 5 节按供应商的表：`attempts` 多而 `answered` 为 0 的供应商要么修好凭据，要么从该数据源的 `providers` 里移除；顺序就是尝试顺序，坏的排在前面等于每次调用先白等一轮。
-- 超时在**供应商**上设：`sources[].providers[].timeout_seconds`（默认 30；DuckDuckGo 实现里还会多等约 5 秒，所以失败的搜索是 35 秒一次）。旧字段 `tool_timeout_seconds`、`tool_retries` 已不生效。一轮里并行的工具要等最慢的那个，一次超时就拖住整轮；底稿的“失败的工具调用耗时”给出总代价。
+- 超时在**供应商**上设：`sources[].providers[].timeout_seconds`（留空时按类型取默认：`type: mcp` 跟随所属服务的 `mcp_servers.<名>.call_timeout_seconds`，默认 300；其余供应商 30。DuckDuckGo 实现里还会多等约 5 秒，所以失败的搜索是 35 秒一次）。旧字段 `tool_timeout_seconds`、`tool_retries` 已不生效。一轮里并行的工具要等最慢的那个，一次超时就拖住整轮；底稿的“失败的工具调用耗时”给出总代价。
 - 失败的搜索同样计入每步的 `max_searches_per_unit`：供应商不稳时，步骤“用完搜索次数”有一部分是超时造成的，先修供应商再考虑调大次数。
 - 失败几次的供应商会进入冷却被跳过，它自身耗时不大；代价是流量全落到兜底供应商上。
 - 错误类型 `HTTP 429/432`、`quota`：配 key 或降并发；`failing_domains` 里反复失败的站点可以在来源策略里排除。
 - 只用内部 MCP：`sources` 里只保留 `kind: mcp` 的数据源，MCP 的 `allowed_tools` 做白名单；没有能打开原文的工具时研究会自动改用“记录即证据”的提示词。
+- MCP 的超时分两层：`mcp_servers.<名>.timeout_seconds`（默认 60）只管连接和列工具，`call_timeout_seconds`（默认 300）管一次工具调用的应答，并且会下发给传输层（适配器自己的默认值是 streamable HTTP 30 秒、SSE 建流 5 秒，不设就是它们在掐断慢应答）。内网服务慢就调 `call_timeout_seconds`，不要动前者。
 
 ## 返工
 

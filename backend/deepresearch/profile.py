@@ -16,7 +16,7 @@ import re
 
 from pydantic import ValidationError
 
-from .config import McpServerSpec, Settings
+from .config import PROVIDER_TIMEOUT_SECONDS, McpServerSpec, Settings
 from .evidence import digest
 
 logger = logging.getLogger("deepresearch.audit")
@@ -125,6 +125,12 @@ def fingerprint(settings: Settings, bodies: dict[str, str]) -> str:
         for key, default in LATER_SOURCE_DEFAULTS.items():
             if key in source and source[key] == default:
                 source.pop(key)
+        for provider in source.get("providers") or []:
+            # A provider's timeout became optional (an MCP provider follows its
+            # server). It used to be dumped as the web default, so an unchanged
+            # operator file keeps that shape and its fingerprint with it.
+            if provider.get("timeout_seconds") is None:
+                provider["timeout_seconds"] = PROVIDER_TIMEOUT_SECONDS
     return digest([data, bodies])
 
 

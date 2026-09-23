@@ -900,7 +900,7 @@ def findings(facts):
                 "failed-tool-time",
                 f"{row['tool']} 失败的 {row['calls']} 次调用花了 {row['seconds']} 秒（平均 {row['avg_seconds']} 秒/次）",
                 json.dumps(row["error_types"], ensure_ascii=False) + "；同一轮并行的其他工具即使早回来，也要等它。失败的搜索同样计入每步的 max_searches_per_unit。" + lost_on_the_clock(facts),
-                "平均耗时接近超时值说明是超时：在该数据源对应的供应商上设 timeout_seconds（sources[].providers[].timeout_seconds，默认 30；旧字段 tool_timeout_seconds 已不生效），并把更可靠的供应商排在前面。",
+                "平均耗时接近超时值说明是超时：在该数据源对应的供应商上设 timeout_seconds（sources[].providers[].timeout_seconds；留空时 type: mcp 跟随所属服务的 call_timeout_seconds（默认 300），其余供应商 30；旧字段 tool_timeout_seconds 已不生效），并把更可靠的供应商排在前面。",
             )
     dead = [row for row in tools.get("by_provider") or [] if row.get("attempts", 0) >= 3 and not row.get("answered")]
     if dead:

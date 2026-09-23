@@ -15,7 +15,7 @@ from uuid import uuid4
 from .config import ENGINE_TOOLS, FIXED_ROLES
 from .contracts import ResearchError, utcnow
 from .evidence import digest
-from .models import compaction_config, engine_config, model_for, node_output_cap, node_overrides, private_config, session_overrides, with_node
+from .models import compaction_config, engine_config, model_for, node_output_cap, node_overrides, node_thinking, private_config, session_overrides, with_node, with_thinking
 from .observations import NativeExecution, derived_receipts
 from .prompts import PromptSet
 from .secrets import trace_secrets
@@ -31,7 +31,7 @@ def native_thread_id(run, skill_name, unit_id):
     return validate_thread_id("dr-" + digest(identity)[:48])
 
 
-def model_budget_config(app_config, role, max_output_tokens, *, run=None, researcher=False, settings=None, concurrency=None, overrides=None, session=None):
+def model_budget_config(app_config, role, max_output_tokens, *, run=None, researcher=False, settings=None, concurrency=None, overrides=None, session=None, thinking=False):
     """Apply the research output ceiling and compaction policy to a private config.
 
     The native executor still creates the provider through its normal factory.
@@ -57,6 +57,10 @@ def model_budget_config(app_config, role, max_output_tokens, *, run=None, resear
     # The node's sampling parameters live on the same private profile, so the
     # engine's own factory applies them and metrics keep the model's real name.
     bounded = with_node(profile.model_copy(update=updates), overrides, session_overrides(settings, name, session) if settings is not None else None)
+    # Reasoning follows the node, not the executor, which always asks the
+    # factory for a model with thinking off. The switch goes on last so it can
+    # carry the finished request body (see with_thinking).
+    bounded = with_thinking(bounded, thinking)
     config_updates = {"models": [bounded if item.name == name else item for item in app_config.models]}
     if settings is not None:
         # Research owns when a role's context is compacted and what the summary keeps.
@@ -199,6 +203,7 @@ async def execute_role(settings, store, run, skill_name, payload, tools, agent, 
         settings=settings,
         concurrency=settings.max_concurrency,
         overrides=node_overrides(settings, node),
+        thinking=node_thinking(settings, node),
         # The native thread is the conversation a gateway may pin to one replica.
         session=child_thread,
     )

@@ -115,7 +115,15 @@ class McpServerSpec(Contract):
     env: dict[str, str] = Field(default_factory=dict)
     url: str | None = None
     headers: dict[str, str] = Field(default_factory=dict)
+    # Connecting to the server and listing its tools. A server that is down,
+    # unreachable or refusing our credentials should say so quickly: nothing
+    # has been asked of it yet, and research cannot start until it answers.
     timeout_seconds: float = Field(default=60, gt=0, le=3600)
+    # One tool call's answer. An internal MCP service that searches a document
+    # store, queries a database or fans out behind a gateway routinely needs
+    # minutes, and a step that loses an answer to a premature timeout has to
+    # ask for it again, so this is deliberately far longer than the web default.
+    call_timeout_seconds: float = Field(default=300, gt=0, le=7200)
     enabled: bool = True
     description: str = Field(default="", max_length=2000)
     # Tools of this server research may call. None allows every tool a source or
@@ -132,6 +140,13 @@ class McpServerSpec(Contract):
             raise ValueError("A remote MCP server needs a url")
         return self
 
+
+# Seconds one call of a web provider may take when it states no timeout of its
+# own. A search API or page reader that stops answering has to fail long before
+# the research step does: the tools a turn calls run in parallel, so the turn
+# waits for the slowest one. An MCP provider does not use this default; it
+# follows its server's own call timeout instead.
+PROVIDER_TIMEOUT_SECONDS = 30.0
 
 # Provider types by research role. "http" is a custom HTTP API and "mcp" calls a
 # tool of a configured MCP server; the others are built-in API presets.
@@ -163,7 +178,11 @@ class ProviderSpec(Contract):
     server: str | None = None
     tool: str | None = None
     arguments: dict[str, Any] = Field(default_factory=dict)
-    timeout_seconds: float = Field(default=30, gt=0, le=600)
+    # Seconds one call may take. Empty takes the default for the kind: an MCP
+    # provider waits as long as its server may answer
+    # (``mcp_servers.<name>.call_timeout_seconds``), every other provider gets
+    # PROVIDER_TIMEOUT_SECONDS.
+    timeout_seconds: float | None = Field(default=None, gt=0, le=7200)
     # A private-network endpoint for direct page reads (intranet documents).
     allow_private_network: bool = False
 
@@ -364,6 +383,13 @@ class NodeSpec(Contract):
     timeout_seconds: int | None = Field(default=None, ge=5, le=14400)
     # Bounded repair attempts when the answer misses its contract; empty uses output_retries.
     output_retries: int | None = Field(default=None, ge=0, le=4)
+    # Whether this node's model reasons before it answers. Empty inherits the
+    # research default, which is off: a researcher's turn is mostly tool calls
+    # and a plan is a short object, so on a slow self-hosted model the hidden
+    # tokens mostly buy latency. Writing a section or judging a gap can be
+    # worth them. Only a model with ``supports_thinking`` can be switched on;
+    # the model's own switch (``when_thinking_enabled``) is what gets sent.
+    thinking: bool | None = None
     # Ask the provider for a JSON object (``response_format``). Only direct
     # calls (rewrite, conversion) can use it, and only on gateways that support it.
     json_mode: bool = False
@@ -527,6 +553,13 @@ class Settings(Contract):
             unknown = {field: value for field, value in references.items() if value and value not in models}
             if unknown:
                 raise ValueError("Unknown research model: " + ", ".join(f"{field}={value}" for field, value in unknown.items()))
+            # A node that names its own model is checked here; one that inherits
+            # is not, because a researcher's model is chosen per role at runtime
+            # and the switch is simply not sent to a model that cannot take it.
+            capable = {model.name for model in self.models if model.supports_thinking}
+            unable = {f"nodes.{name}.thinking": spec.model for name, spec in self.nodes.items() if spec.thinking and spec.model and spec.model not in capable}
+            if unable:
+                raise ValueError("Thinking needs a model with supports_thinking: " + ", ".join(f"{field}={value}" for field, value in unable.items()))
         required = [name for name, spec in self.nodes.items() if not spec.enabled and name not in OPTIONAL_NODES]
         if required:
             raise ValueError("Only the rewrite and summary nodes can be disabled: " + ", ".join(required))

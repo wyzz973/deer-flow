@@ -437,6 +437,25 @@ describe("ResearchSettings: node tuning", () => {
       json_mode: false,
     });
   });
+
+  it("switches one node's reasoning on and warns when the model has none", async () => {
+    open();
+    await screen.findByRole("heading", { name: "模型" });
+    fireEvent.click(screen.getByRole("button", { name: "节点调参" }));
+    const section = await screen.findByLabelText("节点 章节写作");
+    // The fixture's model never declared reasoning, so the switch says so.
+    expect(
+      within(section).getByText(/没有勾选“支持思考”/, { exact: false }),
+    ).toBeTruthy();
+    const control = within(section).getByLabelText("模型思考");
+    fireEvent.keyDown(control, { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "开启思考" }));
+    expect(await within(section).findByText("已调整")).toBeTruthy();
+    const saved = await save();
+    expect(saved.settings.nodes.section).toMatchObject({ thinking: true });
+    // Every other node stays on full inheritance rather than a written false.
+    expect(Object.keys(saved.settings.nodes)).toEqual(["section"]);
+  });
 });
 
 describe("ResearchSettings: sources and MCP servers", () => {
@@ -523,6 +542,27 @@ describe("ResearchSettings: sources and MCP servers", () => {
       "search_docs",
       "delete_doc",
     ]);
+  });
+
+  it("edits how long an MCP tool may take to answer, apart from connecting", async () => {
+    open(withMcpServer());
+    await screen.findByRole("heading", { name: "模型" });
+    fireEvent.click(screen.getByRole("button", { name: "MCP 服务" }));
+    const server = await screen.findByLabelText("MCP 服务 kb");
+    // An unstated timeout shows the default the server actually runs with.
+    expect(
+      within(server).getByLabelText<HTMLInputElement>("工具响应超时（秒）")
+        .value,
+    ).toBe("300");
+    fireEvent.change(within(server).getByLabelText("工具响应超时（秒）"), {
+      target: { value: "600" },
+    });
+    const saved = await save();
+    expect(saved.settings.mcp_servers.kb).toMatchObject({
+      call_timeout_seconds: 600,
+    });
+    // An MCP provider states no timeout of its own; it follows the server.
+    expect(saved.settings.sources[0]!.providers[0]!.timeout_seconds).toBeNull();
   });
 
   it("says why the MCP server could not be reached", async () => {
